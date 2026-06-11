@@ -5,20 +5,8 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
-    "types": [
-      "vite/client",
-      "./.minion/types/client"
-    ],
-    "lib": [
-      "ES2022",
-      "DOM",
-      "DOM.Iterable",
-      "ESNext.Disposable"
-    ]
+    "types": ["vite/client", "./.minion/types/client"],
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "ESNext.Disposable"]
   },
-  "include": [
-    "src/client.ts",
-    "src/shared/**/*.ts",
-    ".minion/types/**/*.d.ts"
-  ]
+  "include": ["src/client.ts", "src/shared/**/*.ts", ".minion/types/**/*.d.ts"]
 }
