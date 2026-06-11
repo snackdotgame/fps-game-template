@@ -60,7 +60,7 @@ const TEAM_COLORS_CSS = ["#e8743a", "#3a7be8"];
 // Renderer / scene.
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
-renderer.setPixelRatio(Math.min(2, window.devicePixelRatio));
+renderer.setPixelRatio(Math.min(1.5, window.devicePixelRatio));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -590,6 +590,7 @@ async function readDatagrams(): Promise<void> {
 }
 
 function handleSnapshot(snap: Snapshot, receivedAt: number): void {
+  const tSnap0 = performance.now();
   snapshotsSeen++;
   if (lastSnapAtMs > 0 && receivedAt - lastSnapAtMs > 1500) needHardAdopt = true;
   lastSnapAtMs = receivedAt;
@@ -688,6 +689,8 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
   errOffset.y += dy;
   errOffset.z += dz;
   if (errOffset.length() > 3) errOffset.set(0, 0, 0);
+  perf.snapMs += performance.now() - tSnap0;
+  perf.snapCalls++;
 }
 
 function syncGhosts(snap: Snapshot): void {
@@ -730,14 +733,123 @@ function syncGrenades(snap: Snapshot): void {
   }
 }
 
+// Local closest-hit ray that skips our own capsule (mirror-world query).
+function castLocal(
+  origin: readonly number[],
+  dir: readonly number[],
+  length: number,
+): [number, number, number] | null {
+  if (!gw || !selfBody) return null;
+  let ox = origin[0];
+  let oy = origin[1];
+  let oz = origin[2];
+  let remaining = length;
+  for (let hop = 0; hop < 3; hop++) {
+    const hit = gw.world.castRay(
+      [ox, oy, oz],
+      [dir[0] * remaining, dir[1] * remaining, dir[2] * remaining],
+    );
+    if (!hit || !hit.body) return null;
+    const px = ox + dir[0] * remaining * hit.fraction;
+    const py = oy + dir[1] * remaining * hit.fraction;
+    const pz = oz + dir[2] * remaining * hit.fraction;
+    if (hit.body !== selfBody) return [px, py, pz];
+    const step = remaining * hit.fraction + 0.45;
+    ox += dir[0] * step;
+    oy += dir[1] * step;
+    oz += dir[2] * step;
+    remaining -= step;
+    if (remaining <= 0) return null;
+  }
+  return null;
+}
+
 // --- Prediction loop.
 
 let connected = false;
 let tickAccum = 0;
 let lastFrameAt = performance.now();
 
+// Rolling perf counters (exposed via __fps.perf and the netinfo line).
+const perf = {
+  frames: 0,
+  frameMs: 0,
+  predictMs: 0,
+  predictCalls: 0,
+  snapMs: 0,
+  snapCalls: 0,
+  renderMs: 0,
+  worstFrameMs: 0,
+  windowStart: performance.now(),
+  fps: 0,
+  avgFrameMs: 0,
+  avgPredictMs: 0,
+  avgSnapMs: 0,
+  avgRenderMs: 0,
+  maxFrameMs: 0,
+  drawCalls: 0,
+  triangles: 0,
+};
+
+function rollPerfWindow(now: number): void {
+  const span = now - perf.windowStart;
+  if (span < 2000) return;
+  perf.fps = (perf.frames / span) * 1000;
+  perf.avgFrameMs = perf.frames > 0 ? perf.frameMs / perf.frames : 0;
+  perf.avgPredictMs = perf.predictCalls > 0 ? perf.predictMs / perf.predictCalls : 0;
+  perf.avgSnapMs = perf.snapCalls > 0 ? perf.snapMs / perf.snapCalls : 0;
+  perf.avgRenderMs = perf.frames > 0 ? perf.renderMs / perf.frames : 0;
+  perf.maxFrameMs = perf.worstFrameMs;
+  perf.drawCalls = renderer.info.render.calls;
+  perf.triangles = renderer.info.render.triangles;
+  perf.frames = 0;
+  perf.frameMs = 0;
+  perf.predictMs = 0;
+  perf.predictCalls = 0;
+  perf.snapMs = 0;
+  perf.snapCalls = 0;
+  perf.renderMs = 0;
+  perf.worstFrameMs = 0;
+  perf.windowStart = now;
+}
+
+// Where the eye was after the previous tick, for render interpolation.
+let prevEyeX = 0;
+let prevEyeY = 0;
+let prevEyeZ = 0;
+let lastTickAt = 0;
+
+// Runs on a steady timer, NOT inside requestAnimationFrame: when rendering
+// drops below the tick rate, inputs must still flow to the server at a smooth
+// 30/s or the input buffer whipsaws between dry and flooded — every dry tick
+// is a guaranteed misprediction (this showed up as 24% rollback rates under
+// rAF throttling).
+function predictionPump(): void {
+  const now = performance.now();
+  const dtMs = Math.min(250, now - lastPumpAt);
+  lastPumpAt = now;
+  const rate = 1 + Math.max(-0.06, Math.min(0.06, (TARGET_DEPTH - depthEma) * 0.025));
+  tickAccum += dtMs * rate;
+  let steps = 0;
+  while (tickAccum >= TICK_MS && steps < 4) {
+    tickAccum -= TICK_MS;
+    predictionTick();
+    steps++;
+  }
+  if (steps === 4) tickAccum = 0; // tab slept: don't spiral
+}
+let lastPumpAt = performance.now();
+setInterval(predictionPump, 8);
+
 function predictionTick(): void {
   if (!connected || needHardAdopt || !predState || !gw || !selfBody) return;
+  const t0 = performance.now();
+  if (predState) {
+    prevEyeX = predState.x;
+    prevEyeY = predState.y;
+    prevEyeZ = predState.z;
+  }
+  lastTickAt = t0;
   seq++;
   const cmd = sampleInput(seq);
   const dead = (selfStatus & SS_DEAD) !== 0 || phase !== "playing";
@@ -746,9 +858,19 @@ function predictionTick(): void {
   const reloadBefore = predState.reloadTicks;
   stepPlayerController(gw, selfBody, predState, cmd, {
     locked: dead,
-    onFire: () => {
+    onFire: (eye, dir) => {
       sounds.shot();
       recoil = Math.min(1, recoil + 0.4);
+      // Predicted tracer from a local raycast — instant feedback; the
+      // server's events remain authoritative for hits and damage.
+      if (gw && selfBody) {
+        const from = new THREE.Vector3(eye[0], eye[1] - 0.05, eye[2]);
+        const hit = castLocal(eye, dir, 90);
+        const end = hit
+          ? new THREE.Vector3(hit[0], hit[1], hit[2])
+          : new THREE.Vector3(eye[0] + dir[0] * 90, eye[1] + dir[1] * 90, eye[2] + dir[2] * 90);
+        spawnTracer(from, end);
+      }
     },
     onMelee: () => {
       sounds.melee();
@@ -767,6 +889,8 @@ function predictionTick(): void {
   if (history.length > 240) history.shift();
   const tail = history.slice(-INPUT_REDUNDANCY).map((h) => h.cmd);
   void client.datagrams.send(encodeInputs(tail)).catch(() => {});
+  perf.predictMs += performance.now() - t0;
+  perf.predictCalls++;
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,8 +1135,10 @@ function processEvents(list: GameEvent[]): void {
     const at = new THREE.Vector3(e.x, e.y, e.z);
     switch (e.kind) {
       case EV_TRACER: {
-        const from = eyeOf(e.a);
-        if (from) spawnTracer(from, at);
+        if (e.a !== selfIdx) {
+          const from = eyeOf(e.a);
+          if (from) spawnTracer(from, at);
+        }
         if (e.a === selfIdx) lastSelfTracerSeq = e.seq;
         if (e.a !== selfIdx && predState) {
           const d = at.distanceTo(new THREE.Vector3(predState.x, predState.y, predState.z));
@@ -1097,32 +1223,27 @@ function frame(): void {
   lastFrameAt = now;
   if (dt > 0.25) dt = 0.25;
 
-  const rate = 1 + Math.max(-0.06, Math.min(0.06, (TARGET_DEPTH - depthEma) * 0.025));
-  tickAccum += dt * 1000 * rate;
-  let steps = 0;
-  while (tickAccum >= TICK_MS && steps < 6) {
-    tickAccum -= TICK_MS;
-    predictionTick();
-    steps++;
-  }
-  if (steps === 6) tickAccum = 0;
-
   errOffset.multiplyScalar(Math.exp(-dt * 12));
   recoil *= Math.exp(-dt * 10);
   shake *= Math.exp(-dt * 5);
   if (meleeSwing > 0) meleeSwing = Math.max(0, meleeSwing - dt * 4);
 
-  // Camera at the predicted eye.
+  // Camera at the predicted eye, interpolated between the last two ticks so
+  // 30 Hz simulation renders smoothly at any frame rate.
   if (predState) {
     const dead = (selfStatus & SS_DEAD) !== 0;
+    const alpha = lastTickAt > 0 ? Math.min(1, (now - lastTickAt) / TICK_MS) : 1;
+    const ix = prevEyeX + (predState.x - prevEyeX) * alpha;
+    const iy = prevEyeY + (predState.y - prevEyeY) * alpha;
+    const iz = prevEyeZ + (predState.z - prevEyeZ) * alpha;
     camera.position.set(
-      predState.x + errOffset.x + (Math.random() - 0.5) * shake * 0.12,
-      predState.y + errOffset.y + (dead ? 0.4 : EYE_HEIGHT) + (Math.random() - 0.5) * shake * 0.1,
-      predState.z + errOffset.z,
+      ix + errOffset.x + (Math.random() - 0.5) * shake * 0.12,
+      iy + errOffset.y + (dead ? 0.4 : EYE_HEIGHT) + (Math.random() - 0.5) * shake * 0.1,
+      iz + errOffset.z,
     );
     camera.rotation.order = "YXZ";
     camera.rotation.y = yaw + Math.PI;
-    camera.rotation.x = -pitch + recoil * 0.045;
+    camera.rotation.x = pitch + recoil * 0.045;
     camera.rotation.z = 0;
   }
   viewModel.position.set(
@@ -1191,7 +1312,15 @@ function frame(): void {
 
   stepEffects(dt);
   updateHud();
+  const tr0 = performance.now();
   renderer.render(scene, camera);
+  const tEnd = performance.now();
+  perf.renderMs += tEnd - tr0;
+  perf.frames++;
+  const frameTotal = tEnd - now;
+  perf.frameMs += frameTotal;
+  if (frameTotal > perf.worstFrameMs) perf.worstFrameMs = frameTotal;
+  rollPerfWindow(tEnd);
 }
 
 function shortestArc(a: number, b: number): number {
@@ -1250,7 +1379,9 @@ function updateHud(): void {
   }
 
   const rtt = client.net.rtt;
-  el.netinfo.textContent = `rtt ${rtt === null ? "—" : Math.round(rtt)}ms · rollbacks ${rollbacks}`;
+  el.netinfo.textContent = `rtt ${rtt === null ? "—" : Math.round(rtt)}ms · rollbacks ${rollbacks} · ${perf.fps.toFixed(
+    0,
+  )}fps · ${perf.avgFrameMs.toFixed(1)}ms`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,6 +1424,7 @@ declare global {
       ammo(): number;
       panelCount(): number;
       destroyedCount(): number;
+      perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
       drive(over: Partial<Omit<InputCmd, "seq">>, ticks: number): void;
       stopDrive(): void;
@@ -1314,6 +1446,17 @@ window.__fps = {
   ammo: () => (predState ? predState.ammo : 0),
   panelCount: () => panelMeshes.size,
   destroyedCount: () => destroyedSet.size,
+  perf: () => ({
+    fps: perf.fps,
+    avgFrameMs: perf.avgFrameMs,
+    maxFrameMs: perf.maxFrameMs,
+    avgPredictMs: perf.avgPredictMs,
+    avgSnapMs: perf.avgSnapMs,
+    avgRenderMs: perf.avgRenderMs,
+    drawCalls: perf.drawCalls,
+    triangles: perf.triangles,
+    pixelRatio: renderer.getPixelRatio(),
+  }),
   look: (yawV, pitchV) => {
     yaw = yawV;
     pitch = pitchV;
