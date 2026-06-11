@@ -6,6 +6,7 @@ import { client } from "minion:client";
 import * as THREE from "three";
 import { INPUT_REDUNDANCY, MAX_HP, TEAM_NAMES, TICK_MS, TICK_RATE } from "./shared/constants.js";
 import { MAP, type PanelDef, panelExtents } from "./shared/map.js";
+import { PANEL_HP, RUBBLE_HEIGHT } from "./shared/constants.js";
 import { parseServerMsg, type PlayerInfo } from "./shared/messages.js";
 import {
   decodeSnapshot,
@@ -26,6 +27,7 @@ import {
 } from "./shared/netCodec.js";
 import {
   addPanelBody,
+  addRubbleBody,
   type Body,
   buildPlacement,
   type CharState,
@@ -142,6 +144,71 @@ function addBuiltPanelVisual(p: PanelDef): void {
   const mesh = panelMesh(p, true);
   mapGroup.add(mesh);
   panelMeshes.set(p.id, mesh);
+}
+
+const RUBBLE_MAT = new THREE.MeshLambertMaterial({ color: 0x6e6a62 });
+
+function tintPanelDamage(id: number, hp: number): void {
+  const mesh = panelMeshes.get(id);
+  if (!mesh) return;
+  if (!mesh.userData.ownMat) {
+    mesh.material = (mesh.material as THREE.MeshLambertMaterial).clone();
+    mesh.userData.ownMat = true;
+    mesh.userData.baseColor = (mesh.material as THREE.MeshLambertMaterial).color.getHex();
+  }
+  const mat = mesh.material as THREE.MeshLambertMaterial;
+  const damage = 1 - Math.max(0, Math.min(1, hp / PANEL_HP));
+  mat.color.setHex(mesh.userData.baseColor as number);
+  mat.color.multiplyScalar(1 - damage * 0.55); // chip toward charcoal
+}
+
+function addRubbleVisual(buildingId: number): void {
+  const b = MAP.buildings[buildingId];
+  if (!b) return;
+  const mesh = new THREE.Mesh(
+    new THREE.BoxGeometry(b.w + 0.6, RUBBLE_HEIGHT, b.d + 0.6),
+    RUBBLE_MAT,
+  );
+  mesh.position.set(b.cx, RUBBLE_HEIGHT / 2, b.cz);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  mapGroup.add(mesh);
+}
+
+// The full BattleBit moment: dust, a debris shower across the footprint, a
+// long rumble, and a hard shake if you're close.
+function collapseFx(buildingId: number): void {
+  const b = MAP.buildings[buildingId];
+  if (!b) return;
+  for (let i = 0; i < 5; i++) {
+    const dust = new THREE.Mesh(
+      new THREE.SphereGeometry(1.2, 10, 8),
+      new THREE.MeshBasicMaterial({ color: 0x9a948a, transparent: true, opacity: 0.55 }),
+    );
+    dust.position.set(
+      b.cx + (Math.random() - 0.5) * b.w,
+      0.8 + Math.random() * 1.5,
+      b.cz + (Math.random() - 0.5) * b.d,
+    );
+    dust.userData.grow = true;
+    addEffect(dust, 900 + Math.random() * 500);
+  }
+  for (let i = 0; i < 4; i++) {
+    spawnDebris(
+      new THREE.Vector3(
+        b.cx + (Math.random() - 0.5) * b.w,
+        1.5,
+        b.cz + (Math.random() - 0.5) * b.d,
+      ),
+      8,
+    );
+  }
+  noiseBurst(0.9, 0.5, true);
+  blip(45, 0.8, 0.3, "sine");
+  if (predState) {
+    const d = Math.hypot(predState.x - b.cx, predState.z - b.cz);
+    if (d < 30) shake = Math.min(1.6, shake + (1.4 - d / 30));
+  }
 }
 
 function removePanelVisual(id: number, withDebris: boolean): void {
@@ -418,6 +485,9 @@ const errOffset = new THREE.Vector3();
 let lastEventSeq = 0;
 let destroyedSet = new Set<number>();
 let builtList: PanelDef[] = [];
+let collapsedList: number[] = [];
+let welcomeHp: Array<[number, number]> = [];
+let collapsedCount = 0;
 
 // Input-rate servo (see snack-dash): hold the server buffer at a small depth.
 const TARGET_DEPTH = 3;
@@ -523,6 +593,12 @@ async function buildWorlds(): Promise<void> {
     removePanelBody(gw, id);
     removePanelVisual(id, false);
   }
+  for (const buildingId of collapsedList) {
+    addRubbleVisual(buildingId);
+    addRubbleBody(gw, MAP.buildings[buildingId], RUBBLE_HEIGHT);
+  }
+  for (const [id, hp] of welcomeHp) tintPanelDamage(id, hp);
+  welcomeHp = [];
 }
 
 // --- Streams.
@@ -560,6 +636,8 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       mapEpoch = msg.mapEpoch;
       destroyedSet = new Set(msg.destroyed);
       builtList = [...msg.built];
+      collapsedList = [...msg.collapsed];
+      welcomeHp = [...msg.panelHp];
       lastAckTick = msg.serverTick;
       void buildWorlds();
       break;
@@ -586,6 +664,18 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       bumpKd(msg.victim, "d");
       if (msg.victim === selfIdx) sounds.death();
       if (msg.killer === selfIdx && msg.victim !== selfIdx) sounds.hitmarker();
+      break;
+    }
+    case "panelhp": {
+      for (const [id, hp] of msg.updates) tintPanelDamage(id, hp);
+      break;
+    }
+    case "collapse": {
+      collapsedCount++;
+      collapseFx(msg.buildingId);
+      addRubbleVisual(msg.buildingId);
+      if (gw) addRubbleBody(gw, MAP.buildings[msg.buildingId], RUBBLE_HEIGHT);
+      collapsedList.push(msg.buildingId);
       break;
     }
     case "destroy": {
@@ -616,6 +706,7 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
         mapEpoch = msg.mapEpoch;
         destroyedSet.clear();
         builtList = [];
+        collapsedList = [];
         kd.clear();
         void buildWorlds();
       }
@@ -1533,6 +1624,7 @@ declare global {
       dbgEvents(): [number, number, number];
       remotePos(idx: number): [number, number, number] | null;
       destroyedCount(): number;
+      collapsedCount(): number;
       perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
       drive(over: Partial<Omit<InputCmd, "seq">> & { trackIdx?: number }, ticks: number): void;
@@ -1572,6 +1664,7 @@ window.__fps = {
     return [g.x, g.y, g.z];
   },
   destroyedCount: () => destroyedSet.size,
+  collapsedCount: () => collapsedCount,
   perf: () => ({
     fps: perf.fps,
     avgFrameMs: perf.avgFrameMs,

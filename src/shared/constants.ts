@@ -59,6 +59,15 @@ export const BUILD_RANGE = 3.0;
 export const BUILD_COOLDOWN_TICKS = 12;
 
 export const PANEL_HP = 100;
+// A building collapses entirely once this fraction of its wall panels is
+// gone (BattleBit's critical-health 'levolution' moment). One well-placed
+// grenade on a small house corner gets close; two finish the job.
+export const COLLAPSE_WALL_FRACTION = 0.4;
+// Explosions delete panels inside EXPLOSION_PANEL_RADIUS and chip panels in
+// an outer falloff ring.
+export const EXPLOSION_PANEL_OUTER_RADIUS = 5.2;
+export const EXPLOSION_PANEL_OUTER_DAMAGE = 55;
+export const RUBBLE_HEIGHT = 0.55;
 
 export type Team = 0 | 1;
 export const TEAM_NAMES = ["Orange", "Blue"];

@@ -197,7 +197,7 @@ async function main(): Promise<void> {
       prevVy = vel.y;
     }
     const end = body.translation();
-    check("grenade travels", end.x > -14, `x=${end.x}`);
+    check("grenade travels", end.x > -15, `x=${end.x}`);
     check("grenade bounces", bounced, `minY=${minY}`);
     destroyGameWorld(gw);
   }
@@ -277,6 +277,36 @@ async function main(): Promise<void> {
     const err = Math.hypot(r.s.x - end.x, r.s.y - end.y, r.s.z - end.z);
     check("restore+replay converges (<2cm/100 ticks)", err < 0.02, `err=${err}`);
     destroyGameWorld(r.gw);
+  }
+
+  // --- Building integrity data (drives the collapse system). ---
+  {
+    let ok = MAP.buildings.length === 5;
+    for (const b of MAP.buildings) {
+      ok &&= b.wallPanelIds.length >= 20 && b.roofPanelIds.length >= 6;
+      ok &&= b.wallPanelIds.every((id) => MAP.panels.find((p) => p.id === id)?.buildingId === b.id);
+    }
+    check(
+      "buildings group their panels",
+      ok,
+      JSON.stringify(MAP.buildings.map((b) => b.wallPanelIds.length)),
+    );
+  }
+
+  // --- Grenades settle near where they land (corner-bombing works). ---
+  {
+    const gw = await createGameWorld();
+    // Head-on lob at the house's south wall (z=-17) from 4m out.
+    const body = createGrenadeBody(gw, 1, [14, 1.5, -21], [0, -1, 8]);
+    for (let t = 0; t < GRENADE_FUSE_TICKS; t++) gw.world.step(DT);
+    const end = body.translation();
+    const drift = Math.hypot(end.x - 14, end.z - -17);
+    check(
+      "grenade settles near the wall it hit",
+      drift < 3,
+      `drift=${drift.toFixed(1)} at (${end.x.toFixed(1)},${end.z.toFixed(1)})`,
+    );
+    destroyGameWorld(gw);
   }
 
   console.log(`\nmap: ${MAP.panels.length} destructible panels, ${MAP.statics.length} statics`);

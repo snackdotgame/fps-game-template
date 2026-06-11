@@ -23,11 +23,15 @@ export type ServerMsg =
       mapEpoch: number; // bumps every round restart (map fully restored)
       destroyed: number[]; // panel ids gone this round
       built: PanelDef[]; // deployed cover panels alive this round
+      collapsed: number[]; // building ids that crumbled this round
+      panelHp: Array<[number, number]>; // damaged-but-alive panels
     }
   | { type: "join"; player: PlayerInfo }
   | { type: "leave"; idx: number }
   | { type: "kill"; killer: number; victim: number; weapon: "rifle" | "grenade" | "melee" }
   | { type: "destroy"; panelIds: number[] }
+  | { type: "panelhp"; updates: Array<[number, number]> } // [panelId, hp]
+  | { type: "collapse"; buildingId: number }
   | { type: "build"; panel: PanelDef; byIdx: number }
   | { type: "score"; scores: [number, number] }
   | {

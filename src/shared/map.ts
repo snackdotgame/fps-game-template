@@ -22,6 +22,19 @@ export interface PanelDef {
   y: number;
   z: number;
   orient: PanelOrient;
+  // Panels belonging to a building share its id; enough wall damage brings
+  // the whole structure down (BattleBit-style critical health).
+  buildingId?: number;
+}
+
+export interface BuildingDef {
+  id: number;
+  cx: number;
+  cz: number;
+  w: number;
+  d: number;
+  wallPanelIds: number[];
+  roofPanelIds: number[];
 }
 
 // Panel dimensions by orientation (full extents).
@@ -39,6 +52,7 @@ export interface MapDef {
   size: number; // arena is size x size, centered on origin
   statics: StaticBox[];
   panels: PanelDef[];
+  buildings: BuildingDef[];
   // Spawn zone centers per team (players fan out around them).
   spawns: [[number, number, number], [number, number, number]];
 }
@@ -47,6 +61,7 @@ export interface MapDef {
 // Authoring helpers.
 
 let nextPanelId = 1;
+let currentBuildingId: number | undefined;
 
 function wallX(
   panels: PanelDef[],
@@ -59,7 +74,7 @@ function wallX(
   let i = 0;
   for (let x = x0 + PANEL_W / 2; x <= x1 - PANEL_W / 2 + 0.01; x += PANEL_W, i++) {
     if (skip.has(i)) continue;
-    panels.push({ id: nextPanelId++, x, y, z, orient: "x" });
+    panels.push({ id: nextPanelId++, x, y, z, orient: "x", buildingId: currentBuildingId });
   }
 }
 
@@ -74,29 +89,34 @@ function wallZ(
   let i = 0;
   for (let z = z0 + PANEL_W / 2; z <= z1 - PANEL_W / 2 + 0.01; z += PANEL_W, i++) {
     if (skip.has(i)) continue;
-    panels.push({ id: nextPanelId++, x, y, z, orient: "z" });
+    panels.push({ id: nextPanelId++, x, y, z, orient: "z", buildingId: currentBuildingId });
   }
 }
 
 function roof(panels: PanelDef[], x0: number, x1: number, z0: number, z1: number, y: number): void {
   for (let x = x0 + PANEL_W / 2; x <= x1 - PANEL_W / 2 + 0.01; x += PANEL_W) {
     for (let z = z0 + PANEL_W / 2; z <= z1 - PANEL_W / 2 + 0.01; z += PANEL_W) {
-      panels.push({ id: nextPanelId++, x, y, z, orient: "flat" });
+      panels.push({ id: nextPanelId++, x, y, z, orient: "flat", buildingId: currentBuildingId });
     }
   }
 }
 
 // A simple rectangular building: two panel rows per wall, a door gap in the
 // front, a window gap (top row only) on a side, and a flat destructible roof.
+let nextBuildingId = 0;
+
 function building(
   statics: StaticBox[],
   panels: PanelDef[],
+  buildings: BuildingDef[],
   cx: number,
   cz: number,
   w: number,
   d: number,
   doorSide: 0 | 1 | 2 | 3, // 0 +z, 1 -z, 2 +x, 3 -x
 ): void {
+  const firstPanel = nextPanelId;
+  currentBuildingId = nextBuildingId++;
   const x0 = cx - w / 2;
   const x1 = cx + w / 2;
   const z0 = cz - d / 2;
@@ -123,6 +143,17 @@ function building(
   ]) {
     statics.push({ x: px, y: PANEL_H, z: pz, w: 0.3, h: PANEL_H * 2, d: 0.3, kind: "wall" });
   }
+  const mine = panels.filter((p) => p.id >= firstPanel);
+  buildings.push({
+    id: currentBuildingId!,
+    cx,
+    cz,
+    w,
+    d,
+    wallPanelIds: mine.filter((p) => p.orient !== "flat").map((p) => p.id),
+    roofPanelIds: mine.filter((p) => p.orient === "flat").map((p) => p.id),
+  });
+  currentBuildingId = undefined;
 }
 
 function crate(statics: StaticBox[], x: number, z: number, s = 1.4): void {
@@ -133,9 +164,11 @@ function crate(statics: StaticBox[], x: number, z: number, s = 1.4): void {
 
 function buildMap(): MapDef {
   nextPanelId = 1;
+  nextBuildingId = 0;
   const size = 56;
   const statics: StaticBox[] = [];
   const panels: PanelDef[] = [];
+  const buildings: BuildingDef[] = [];
 
   // Ground and perimeter (indestructible).
   statics.push({ x: 0, y: -0.5, z: 0, w: size, h: 1, d: size, kind: "ground" });
@@ -146,11 +179,11 @@ function buildMap(): MapDef {
   statics.push({ x: half, y: 1.5, z: 0, w: 1, h: 3, d: size, kind: "wall" });
 
   // Buildings: a contested center block and four flanking houses.
-  building(statics, panels, 0, 0, 10, 8, 0);
-  building(statics, panels, -15, -12, 8, 8, 2);
-  building(statics, panels, 15, 12, 8, 8, 3);
-  building(statics, panels, 16, -14, 8, 6, 0);
-  building(statics, panels, -16, 14, 8, 6, 1);
+  building(statics, panels, buildings, 0, 0, 10, 8, 0);
+  building(statics, panels, buildings, -15, -12, 8, 8, 2);
+  building(statics, panels, buildings, 15, 12, 8, 8, 3);
+  building(statics, panels, buildings, 16, -14, 8, 6, 0);
+  building(statics, panels, buildings, -16, 14, 8, 6, 1);
 
   // Freestanding cover walls (destructible) along the midline flanks.
   wallX(panels, -10, -2, PANEL_H / 2, 10);
@@ -172,6 +205,7 @@ function buildMap(): MapDef {
     size,
     statics,
     panels,
+    buildings,
     spawns: [
       [0, 0.1, -23],
       [0, 0.1, 23],

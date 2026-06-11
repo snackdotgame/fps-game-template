@@ -26,7 +26,7 @@ import {
   RIFLE_MAG,
   TICK_RATE,
 } from "./constants.js";
-import { MAP, type PanelDef, type PanelOrient, panelExtents } from "./map.js";
+import { type BuildingDef, MAP, type PanelDef, type PanelOrient, panelExtents } from "./map.js";
 
 export type { Body } from "jolt-ts";
 
@@ -199,6 +199,20 @@ export function addPanelBody(gw: GameWorld, p: PanelDef): Body {
   return body;
 }
 
+// A collapsed building leaves a low rubble mound over its footprint —
+// indestructible cover that reads as wreckage. Deterministic from map data,
+// so client and server create identical bodies on the collapse event.
+export function addRubbleBody(gw: GameWorld, b: BuildingDef, rubbleHeight: number): Body {
+  return gw.world.createBody({
+    type: "static",
+    shape: Shape.box({ halfExtents: [b.w / 2 + 0.3, rubbleHeight / 2, b.d / 2 + 0.3] }),
+    position: [b.cx, rubbleHeight / 2, b.cz],
+    layer: "static",
+    friction: 0.8,
+    userData: { static: true } satisfies BodyTag,
+  });
+}
+
 export function removePanelBody(gw: GameWorld, panelId: number): void {
   const body = gw.panels.get(panelId);
   if (body) {
@@ -249,10 +263,10 @@ export function createGrenadeBody(
     shape: Shape.sphere(GRENADE_RADIUS),
     position: [pos[0], pos[1], pos[2]],
     layer: "moving",
-    friction: 0.5,
-    restitution: 0.42,
-    linearDamping: 0.1,
-    angularDamping: 0.2,
+    friction: 0.95,
+    restitution: 0.22,
+    linearDamping: 0.3,
+    angularDamping: 2.2,
     allowSleeping: false,
     motionQuality: "linearCast",
     linearVelocity: [vel[0], vel[1], vel[2]],
