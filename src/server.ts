@@ -8,6 +8,7 @@
 
 import { type Connection, server } from "minion:server";
 import {
+  BOT_FILL,
   EXPLOSION_IMPULSE,
   EXPLOSION_MAX_DAMAGE,
   EXPLOSION_MIN_DAMAGE,
@@ -57,11 +58,13 @@ import {
 } from "./shared/netCodec.js";
 import {
   addPanelBody,
+  aimDirection,
   type Body,
   createGameWorld,
   createGrenadeBody,
   createPlayerBody,
   destroyGameWorld,
+  eyePosition,
   type GameWorld,
   type InputCmd,
   joltModule,
@@ -82,8 +85,27 @@ const MAX_BUFFERED_INPUTS = 90;
 const EVENT_RING = 12;
 const PARK_TTL_MS = 5 * 60 * 1000;
 
+// A bot's standing decisions; null for humans.
+interface BotBrain {
+  wanderX: number;
+  wanderZ: number;
+  repathAtTick: number;
+  targetIdx: number; // -1 when no enemy in sight
+  burstUntil: number;
+  pauseUntil: number;
+  aimYaw: number;
+  aimPitch: number;
+  strafeSign: number;
+  strafeFlipAt: number;
+  stuckX: number;
+  stuckZ: number;
+  stuckCheckAt: number;
+  grenadeReadyAt: number;
+}
+
 interface Player {
-  conn: Connection;
+  conn: Connection | null; // null = bot
+  bot: BotBrain | null;
   idx: number;
   userId: string;
   name: string;
@@ -126,8 +148,10 @@ let phase: "playing" | "results" = "playing";
 let phaseEndTick = 0;
 let mapEpoch = 1;
 
-const players = new Map<string, Player>();
+const players = new Map<string, Player>(); // by connection id, or "bot:<n>"
 const parked = new Map<string, Parked>();
+let nextBotSerial = 0;
+const BOT_NAMES = ["Ash", "Brick", "Castle", "Dune", "Echo", "Flint", "Gravel", "Hatch"];
 const scores: [number, number] = [0, 0];
 
 const panelHp = new Map<number, number>(); // damaged panels only
@@ -195,8 +219,10 @@ function syncConnections(): void {
     if (!players.has(conn.id)) addPlayer(conn);
   }
   for (const [connId, p] of players) {
+    if (!p.conn) continue; // bots aren't reaped here
     if (!live.has(connId)) removePlayer(connId, p);
   }
+  syncBots();
   if (parked.size > 0) {
     const now = server.elapsedMs();
     for (const [userId, park] of parked) {
@@ -215,16 +241,258 @@ function teamCounts(): [number, number] {
   return [a, b];
 }
 
+// --- Bots: fill the lobby, leave one-for-one as humans join. -------------------
+
+function syncBots(): void {
+  let humans = 0;
+  let bots = 0;
+  for (const p of players.values()) {
+    if (p.bot) bots++;
+    else humans++;
+  }
+  const desired = Math.max(0, Math.min(BOT_FILL - humans, MAX_PLAYERS - humans));
+  while (bots < desired) {
+    addBot();
+    bots++;
+  }
+  while (bots > desired) {
+    // Trim from the larger team to keep the match balanced.
+    const [a, b] = teamCounts();
+    const fromTeam = a >= b ? 0 : 1;
+    const entry =
+      [...players.entries()].find(([, q]) => q.bot && q.team === fromTeam) ??
+      [...players.entries()].find(([, q]) => q.bot);
+    if (!entry) break;
+    removeBot(entry[0]);
+    bots--;
+  }
+}
+
+function addBot(): void {
+  const usedIdx = new Set([...players.values()].map((p) => p.idx));
+  let idx = 0;
+  while (usedIdx.has(idx)) idx++;
+  const [a, b] = teamCounts();
+  const team = a <= b ? 0 : 1;
+  const serial = nextBotSerial++;
+  const name = `BOT ${BOT_NAMES[serial % BOT_NAMES.length]}`;
+  const spawn = spawnPoint(team, idx);
+  const p: Player = {
+    conn: null,
+    bot: {
+      wanderX: 0,
+      wanderZ: 0,
+      repathAtTick: 0,
+      targetIdx: -1,
+      burstUntil: 0,
+      pauseUntil: 0,
+      aimYaw: 0,
+      aimPitch: 0,
+      strafeSign: 1,
+      strafeFlipAt: 0,
+      stuckX: spawn[0],
+      stuckZ: spawn[2],
+      stuckCheckAt: tick + 45,
+      grenadeReadyAt: tick + 300,
+    },
+    idx,
+    userId: `bot:${serial}`,
+    name,
+    team,
+    body: createPlayerBody(gw, idx, spawn),
+    state: makeChar(spawn),
+    pending: new Map(),
+    lastCmd: { seq: 0, ...ZERO_INPUT },
+    lastSeq: 0,
+    lastSeqTick: tick,
+    lastDepth: 0,
+    hp: MAX_HP,
+    dead: false,
+    respawnAtTick: 0,
+    protectUntilTick: tick + PROTECT_TICKS,
+    lastDamageTick: 0,
+    kills: 0,
+    deaths: 0,
+  };
+  players.set(`bot:${serial}`, p);
+  broadcast({ type: "join", player: { idx: p.idx, name: p.name, team: p.team } });
+}
+
+function removeBot(key: string): void {
+  const p = players.get(key);
+  if (!p) return;
+  players.delete(key);
+  removePlayerBody(gw, p.idx);
+  broadcast({ type: "leave", idx: p.idx });
+}
+
+// One decision pass per tick. Bots play through the same controller and
+// weapon hooks as humans — their shots, grenades, and wall-breaching are the
+// real thing, just driven by a synthetic InputCmd.
+function botThink(p: Player, b: BotBrain): InputCmd {
+  readChar(p.body, p.state);
+  const s = p.state;
+  const eye = eyePosition(s);
+
+  // --- Acquire / validate a target (LoS checked with a real raycast). ---
+  if (tick % 5 === 0 || b.targetIdx >= 0) {
+    const current = b.targetIdx >= 0 ? playerByIdx(b.targetIdx) : undefined;
+    if (!current || current.dead || !hasLineOfSight(p, current)) {
+      b.targetIdx = -1;
+      if (tick % 5 === 0) {
+        let bestDist = 42;
+        for (const q of players.values()) {
+          if (q.team === p.team || q.dead) continue;
+          readChar(q.body, q.state);
+          const d = Math.hypot(q.state.x - s.x, q.state.z - s.z);
+          if (d < bestDist && hasLineOfSight(p, q)) {
+            bestDist = d;
+            b.targetIdx = q.idx;
+          }
+        }
+      }
+    }
+  }
+
+  let moveX = 0;
+  let moveZ = 0;
+  let fire = false;
+  let melee = false;
+  let jump = false;
+  let grenade = false;
+  let reload = false;
+  let sprint = false;
+  let desiredYaw = b.aimYaw;
+  let desiredPitch = 0;
+
+  const target = b.targetIdx >= 0 ? playerByIdx(b.targetIdx) : undefined;
+  if (target && !target.dead) {
+    const dx = target.state.x - s.x;
+    const dz = target.state.z - s.z;
+    const dist = Math.hypot(dx, dz);
+    // Aim at the chest with distance-scaled wobble.
+    const wobble = 0.012 + dist * 0.0011;
+    desiredYaw = Math.atan2(dx, dz) + (rng() - 0.5) * 2 * wobble;
+    desiredPitch = Math.atan2(target.state.y + 1.0 - eye[1], dist) + (rng() - 0.5) * wobble;
+    // Burst fire when roughly on target.
+    if (tick >= b.pauseUntil && b.burstUntil <= tick) {
+      b.burstUntil = tick + 6 + Math.floor(rng() * 8);
+      b.pauseUntil = b.burstUntil + 5 + Math.floor(rng() * 10);
+    }
+    const aligned = Math.abs(shortestArc(b.aimYaw, desiredYaw)) < 0.07;
+    fire = aligned && tick < b.burstUntil;
+    // Strafe around the target, keeping medium range.
+    if (tick >= b.strafeFlipAt) {
+      b.strafeSign = rng() < 0.5 ? -1 : 1;
+      b.strafeFlipAt = tick + 25 + Math.floor(rng() * 40);
+    }
+    const nx = dx / (dist || 1);
+    const nz = dz / (dist || 1);
+    moveX = -nz * b.strafeSign;
+    moveZ = nx * b.strafeSign;
+    if (dist > 22) {
+      moveX += nx * 0.8;
+      moveZ += nz * 0.8;
+    } else if (dist < 7) {
+      moveX -= nx * 0.8;
+      moveZ -= nz * 0.8;
+    }
+    if (rng() < 0.008) jump = true;
+    if (dist > 9 && dist < 26 && tick >= b.grenadeReadyAt && s.grenades > 0 && rng() < 0.02) {
+      grenade = true;
+      b.grenadeReadyAt = tick + 450;
+    }
+  } else {
+    // Wander between random points; sprint there; reload while safe.
+    const toX = b.wanderX - s.x;
+    const toZ = b.wanderZ - s.z;
+    if (tick >= b.repathAtTick || Math.hypot(toX, toZ) < 2) {
+      const half = MAP.size / 2 - 6;
+      b.wanderX = (rng() * 2 - 1) * half;
+      b.wanderZ = (rng() * 2 - 1) * half;
+      b.repathAtTick = tick + 240 + Math.floor(rng() * 240);
+    }
+    const len = Math.hypot(toX, toZ) || 1;
+    moveX = toX / len;
+    moveZ = toZ / len;
+    desiredYaw = Math.atan2(moveX, moveZ);
+    sprint = true;
+    if (s.ammo < 12) reload = true;
+  }
+
+  // --- Stuck? Sledge through whatever wall is in the way, BattleBit style. ---
+  if (tick >= b.stuckCheckAt) {
+    const moved = Math.hypot(s.x - b.stuckX, s.z - b.stuckZ);
+    if (moved < 0.5 && !p.dead && (moveX !== 0 || moveZ !== 0)) {
+      const dir = aimDirection(b.aimYaw, 0);
+      const ahead = gw.world.castRay(
+        [eye[0], eye[1] - 0.5, eye[2]],
+        [dir[0] * 1.8, 0, dir[2] * 1.8],
+      );
+      const tag = (ahead?.body?.userData ?? {}) as { panelId?: number };
+      if (tag.panelId !== undefined) melee = true;
+      else jump = true;
+      if (rng() < 0.3) b.repathAtTick = 0; // sometimes just go somewhere else
+    }
+    b.stuckX = s.x;
+    b.stuckZ = s.z;
+    b.stuckCheckAt = tick + 45;
+  }
+
+  // Turn toward the desired view at a finite speed so bots feel human-ish.
+  const turn = 0.22; // rad/tick (~6.6 rad/s)
+  b.aimYaw += Math.max(-turn, Math.min(turn, shortestArc(b.aimYaw, desiredYaw)));
+  b.aimPitch += Math.max(-turn, Math.min(turn, desiredPitch - b.aimPitch));
+
+  return {
+    seq: p.lastSeq + 1,
+    moveX,
+    moveZ,
+    yaw: b.aimYaw,
+    pitch: b.aimPitch,
+    jump,
+    sprint,
+    fire,
+    reload,
+    grenade,
+    melee,
+    build: false,
+  };
+}
+
+function hasLineOfSight(from: Player, to: Player): boolean {
+  readChar(to.body, to.state);
+  const eye = eyePosition(from.state);
+  const tx = to.state.x - eye[0];
+  const ty = to.state.y + 1.0 - eye[1];
+  const tz = to.state.z - eye[2];
+  const dist = Math.hypot(tx, ty, tz);
+  if (dist < 0.5) return true;
+  const hit = castIgnoring(eye, [tx / dist, ty / dist, tz / dist], dist + 0.5, from.body);
+  return hit !== null && hit.body === to.body;
+}
+
+function shortestArc(a: number, b: number): number {
+  let d = b - a;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
 function addPlayer(conn: Connection): void {
   for (const [connId, p] of players) {
-    if (p.userId === conn.userId) {
+    if (p.conn && p.userId === conn.userId) {
       p.conn.close("signed in from another connection");
       removePlayer(connId, p);
     }
   }
   if (players.size >= MAX_PLAYERS) {
-    conn.close("game is full");
-    return;
+    const bot = [...players.entries()].find(([, q]) => q.bot);
+    if (bot) removeBot(bot[0]);
+    else {
+      conn.close("game is full");
+      return;
+    }
   }
   const usedIdx = new Set([...players.values()].map((p) => p.idx));
   let idx = 0;
@@ -238,6 +506,7 @@ function addPlayer(conn: Connection): void {
   const spawn = spawnPoint(team, idx);
   const p: Player = {
     conn,
+    bot: null,
     idx,
     userId: conn.userId,
     name: conn.userName,
@@ -272,7 +541,7 @@ function addPlayer(conn: Connection): void {
     destroyed: [...destroyedPanels],
     built: [...builtPanels.values()],
   });
-  broadcast({ type: "join", player: info }, p.conn.id);
+  broadcast({ type: "join", player: info }, p.conn?.id);
 }
 
 function removePlayer(connId: string, p: Player): void {
@@ -305,6 +574,27 @@ function drainInputs(): void {
 
 function applyPlayerInput(p: Player): void {
   let cmd: InputCmd;
+  if (p.bot) {
+    cmd = botThink(p, p.bot);
+    p.lastSeq++;
+    p.lastSeqTick = tick;
+    p.lastCmd = cmd;
+    stepPlayerController(gw, p.body, p.state, cmd, {
+      locked: p.dead || phase !== "playing",
+      onFire: (eye, dir) => resolveShot(p, eye, dir),
+      onMelee: (eye, dir) => resolveMelee(p, eye, dir),
+      onGrenade: (origin, vel) => {
+        const id = allocGrenadeId();
+        grenades.push({
+          id,
+          ownerIdx: p.idx,
+          fuseLeft: GRENADE_FUSE_TICKS,
+          body: createGrenadeBody(gw, id, origin, vel),
+        });
+      },
+    });
+    return;
+  }
   p.lastDepth = p.pending.size;
   if (p.pending.size > 0) {
     const seqs = [...p.pending.keys()].sort((a, b) => a - b);
@@ -655,6 +945,7 @@ function broadcast(msg: ServerMsg, exceptConnId?: string): void {
 }
 
 function sendTo(p: Player, msg: ServerMsg): void {
+  if (!p.conn) return;
   server.streams.send(p.conn.id, JSON.stringify(msg));
 }
 
@@ -679,6 +970,7 @@ function broadcastSnapshots(): void {
   });
 
   for (const p of all) {
+    if (!p.conn) continue; // bots don't receive snapshots
     const remotes: RemoteSnap[] = [];
     for (const q of all) {
       if (q === p) continue;

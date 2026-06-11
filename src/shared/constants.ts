@@ -62,3 +62,8 @@ export const PANEL_HP = 100;
 
 export type Team = 0 | 1;
 export const TEAM_NAMES = ["Orange", "Blue"];
+
+// Bots fill the server up to this many participants so there's always
+// something to fight; each joining human replaces one bot (and bots return
+// as humans leave).
+export const BOT_FILL = 6;

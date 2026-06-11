@@ -20,6 +20,12 @@ grenades blow buildings open — and you can deploy fresh cover of your own.
   preview). Deployed cover is destructible like everything else.
 - Health regen after 6s, 3s respawns with brief spawn protection, kill feed, Tab
   scoreboard.
+- **Bots** fill the server to 6 combatants, so there's a war on from the first click.
+  Each joining human replaces a bot (and a bot returns when a human leaves). Bots play
+  through the exact same controller and weapon hooks as humans — they patrol, acquire
+  targets with real line-of-sight raycasts, strafe and burst-fire with distance-scaled
+  aim wobble, lob grenades, and **sledgehammer through walls when a building is in their
+  way**.
 
 Controls: click to lock the mouse, WASD + shift sprint + space jump, LMB fire,
 R reload, G grenade, F sledge, Q build, Tab scores.
@@ -77,7 +83,7 @@ npm run dev
 ```
 
 Open the Minion host shell at `http://127.0.0.1:3030/`. Each tab is its own guest, so
-two tabs are a 1v1. (Ports: `MINION_DEV_PORT` / `MINION_CLIENT_PORT`; `npm run dev` goes
+two tabs are a 1v1 — plus the bots, who hold the rest of the line. (Ports: `MINION_DEV_PORT` / `MINION_CLIENT_PORT`; `npm run dev` goes
 through turbo which strips env vars — run `npx vite` and `npx minion dev` directly for
 custom ports.)
 
