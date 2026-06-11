@@ -9,6 +9,8 @@ import { quantizeAngle, quantizeMove } from "../src/shared/netCodec.js";
 import {
   type Body,
   buildPlacement,
+  castWallDistance,
+  rayVsCapsule,
   type CharState,
   createGameWorld,
   createGrenadeBody,
@@ -197,6 +199,31 @@ async function main(): Promise<void> {
     const end = body.translation();
     check("grenade travels", end.x > -14, `x=${end.x}`);
     check("grenade bounces", bounced, `minY=${minY}`);
+    destroyGameWorld(gw);
+  }
+
+  // --- Hit registration math: ray vs capsule, wall occlusion. ---
+  {
+    const gw = await createGameWorld();
+    const feet = [24, 0, 0]; // east lane, open ground
+    createPlayerBody(gw, 1, feet);
+    const eye: [number, number, number] = [24, 1.45, -12];
+    // Dead-on shot at the chest from 12m.
+    const dir: [number, number, number] = [0, -0.05, 0.9987];
+    const t = rayVsCapsule(eye, dir, 90, feet);
+    check("exact aim hits the capsule", t !== null && Math.abs(t - 12) < 0.6, `t=${t}`);
+    // 0.5m lateral miss at 12m.
+    const off = Math.atan2(0.8, 12);
+    const dirMiss: [number, number, number] = [Math.sin(off), -0.05, Math.cos(off)];
+    check("0.8m off-axis misses", rayVsCapsule(eye, dirMiss, 90, feet) === null, "");
+    // Wall occlusion: hop over player bodies, stop at panels.
+    const wall = castWallDistance(gw, [0.2, 0.6, -8], [0, 0, 1], 90);
+    const tag = (wall.body?.userData ?? {}) as { panelId?: number };
+    check(
+      "wall distance finds the building wall",
+      wall.dist < 6 && tag.panelId !== undefined,
+      `dist=${wall.dist}`,
+    );
     destroyGameWorld(gw);
   }
 

@@ -142,11 +142,17 @@ const panels0 = await a.fps("panelCount");
 const dBuild0 = await a.fps("destroyedCount");
 await a.fps("look", Math.PI, 0); // face back toward open ground
 await a.page.waitForTimeout(200);
-await a.fps("drive", { build: true }, 3);
-await a.page.waitForTimeout(900);
+let netBuilt = 0;
+for (let attempt = 0; attempt < 4 && netBuilt < 1; attempt++) {
+  await a.fps("drive", { build: true }, 3);
+  for (let i = 0; i < 6 && netBuilt < 1; i++) {
+    await a.page.waitForTimeout(400);
+    const panelsNow = await a.fps("panelCount");
+    const dNow = await a.fps("destroyedCount");
+    netBuilt = panelsNow - (panels0 - (dNow - dBuild0));
+  }
+}
 const panelsA = await a.fps("panelCount");
-const dBuild1 = await a.fps("destroyedCount");
-const netBuilt = panelsA - (panels0 - (dBuild1 - dBuild0));
 check("built cover appears for A", netBuilt >= 1, `net=${netBuilt} (${panels0} -> ${panelsA})`);
 const panelsB = await b.fps("panelCount");
 check("built cover appears for B", Math.abs(panelsB - panelsA) <= 1, `B=${panelsB} A=${panelsA}`);
@@ -160,6 +166,15 @@ await goTo(b, 24, 22);
 const okB = await goTo(b, 24, 14);
 check("both reached the duel lane", okA && okB, `A=${okA} B=${okB}`);
 const scores0 = await a.fps("scores");
+// B's idx as seen from A: the human idx with a remote view (you aren't your
+// own remote, so A's own idx returns null).
+const humanIdxs = (await a.fps("roster"))
+  .filter((p) => !p.name.startsWith("BOT"))
+  .map((p) => p.idx);
+let bPlayerIdx = humanIdxs[0];
+for (const idx of humanIdxs) {
+  if ((await a.fps("remotePos", idx)) !== null) bPlayerIdx = idx;
+}
 let killed = false;
 for (let round = 0; round < 25 && !killed; round++) {
   // Bots roam the arena too: if either duelist is down, wait out the respawn
@@ -173,13 +188,8 @@ for (let round = 0; round < 25 && !killed; round++) {
     killed = true; // a bot finished the job — B still died under fire
     break;
   }
-  const [ax, ay, az] = await a.fps("playerPosition");
-  const [bx, by, bz] = await b.fps("playerPosition");
-  const yaw = Math.atan2(bx - ax, bz - az);
-  const dist = Math.hypot(bx - ax, bz - az);
-  const pitch = Math.atan2(by + 1.0 - (ay + 1.45), dist);
-  await a.fps("look", yaw, pitch);
-  await a.fps("drive", { fire: true }, 14);
+  // Track B every prediction tick — the human-tracking equivalent.
+  await a.fps("drive", { fire: true, trackIdx: bPlayerIdx }, 14);
   await a.page.waitForTimeout(550);
   if ((await a.fps("ammo")) < 4) {
     await a.fps("drive", { reload: true }, 4);

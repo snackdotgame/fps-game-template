@@ -69,7 +69,9 @@ import {
   type InputCmd,
   joltModule,
   makeChar,
+  castWallDistance,
   PLAYER_HALF_HEIGHT,
+  rayVsCapsule,
   readChar,
   removeGrenadeBody,
   removePanelBody,
@@ -122,6 +124,10 @@ interface Player {
   lastDepth: number;
   hp: number;
   dead: boolean;
+  // Feet positions for the last few ticks (ring, newest last) — hit
+  // registration rewinds against these so shots land where shooters SAW
+  // their targets, not where targets are now.
+  history: Array<[number, number, number]>;
   respawnAtTick: number;
   protectUntilTick: number;
   lastDamageTick: number;
@@ -343,6 +349,7 @@ function addBot(): void {
     lastDepth: 0,
     hp: MAX_HP,
     dead: false,
+    history: [],
     respawnAtTick: 0,
     protectUntilTick: tick + PROTECT_TICKS,
     lastDamageTick: 0,
@@ -555,6 +562,7 @@ function addPlayer(conn: Connection): void {
     lastDepth: 0,
     hp: MAX_HP,
     dead: false,
+    history: [],
     respawnAtTick: 0,
     protectUntilTick: tick + PROTECT_TICKS,
     lastDamageTick: 0,
@@ -695,6 +703,51 @@ function castIgnoring(
   return null;
 }
 
+// Where this player's capsule was LAG_COMP_TICKS ago (or as far back as we
+// know) — the position the shooter actually saw.
+function rewoundFeet(q: Player): readonly number[] | null {
+  if (q.history.length === 0) return null;
+  const back = Math.min(LAG_COMP_TICKS, q.history.length);
+  return q.history[q.history.length - back];
+}
+
+interface AttackHit {
+  victim: Player | null;
+  panelBody: Body | null;
+  point: [number, number, number];
+}
+
+// Shared lag-compensated hitscan: present-day walls occlude, but player
+// capsules are tested at their rewound positions.
+function resolveAttack(
+  p: Player,
+  eye: [number, number, number],
+  d: [number, number, number],
+  range: number,
+): AttackHit {
+  const wall = castWallDistance(gw, eye, d, range);
+  let bestT = wall.dist;
+  let victim: Player | null = null;
+  for (const q of players.values()) {
+    if (q === p || q.dead || q.team === p.team) continue;
+    const feet = rewoundFeet(q);
+    if (!feet) continue;
+    const t = rayVsCapsule(eye, d, bestT, feet);
+    if (t !== null && t < bestT) {
+      bestT = t;
+      victim = q;
+    }
+  }
+  if (victim) {
+    return {
+      victim,
+      panelBody: null,
+      point: [eye[0] + d[0] * bestT, eye[1] + d[1] * bestT, eye[2] + d[2] * bestT],
+    };
+  }
+  return { victim: null, panelBody: wall.dist < range ? wall.body : null, point: wall.point };
+}
+
 function resolveShot(
   p: Player,
   eye: [number, number, number],
@@ -705,23 +758,17 @@ function resolveShot(
   const spread = spreadFor(p.state);
   const d = perturb(dir, (rng() - 0.5) * 2 * spread, (rng() - 0.5) * 2 * spread);
 
-  const hit = castIgnoring(eye, d, RIFLE_RANGE, p.body);
-  const end: [number, number, number] = hit
-    ? hit.point
-    : [eye[0] + d[0] * RIFLE_RANGE, eye[1] + d[1] * RIFLE_RANGE, eye[2] + d[2] * RIFLE_RANGE];
-  pushEvent(EV_TRACER, p.idx, end);
-
-  if (!hit) return;
-  const tag = hit.body.userData as { playerIdx?: number; panelId?: number };
-  if (tag.playerIdx !== undefined) {
-    const victim = playerByIdx(tag.playerIdx);
-    if (victim && victim.team !== p.team) {
-      damagePlayer(victim, RIFLE_DAMAGE, p, "rifle");
-      pushEvent(EV_HIT_PLAYER, tag.playerIdx, hit.point);
+  const hit = resolveAttack(p, eye, d, RIFLE_RANGE);
+  pushEvent(EV_TRACER, p.idx, hit.point);
+  if (hit.victim) {
+    damagePlayer(hit.victim, RIFLE_DAMAGE, p, "rifle");
+    pushEvent(EV_HIT_PLAYER, hit.victim.idx, hit.point);
+  } else if (hit.panelBody) {
+    const tag = hit.panelBody.userData as { panelId?: number };
+    if (tag.panelId !== undefined) {
+      damagePanel(tag.panelId, RIFLE_PANEL_DAMAGE);
+      pushEvent(EV_PANEL_HIT, 0, hit.point);
     }
-  } else if (tag.panelId !== undefined) {
-    damagePanel(tag.panelId, RIFLE_PANEL_DAMAGE);
-    pushEvent(EV_PANEL_HIT, 0, hit.point);
   }
 }
 
@@ -730,18 +777,13 @@ function resolveMelee(
   eye: [number, number, number],
   dir: [number, number, number],
 ): void {
-  const hit = castIgnoring(eye, dir, MELEE_RANGE, p.body);
-  const point: [number, number, number] = hit
-    ? hit.point
-    : [eye[0] + dir[0] * MELEE_RANGE, eye[1] + dir[1] * MELEE_RANGE, eye[2] + dir[2] * MELEE_RANGE];
-  pushEvent(EV_MELEE, p.idx, point);
-  if (!hit) return;
-  const tag = hit.body.userData as { playerIdx?: number; panelId?: number };
-  if (tag.playerIdx !== undefined) {
-    const victim = playerByIdx(tag.playerIdx);
-    if (victim && victim.team !== p.team) damagePlayer(victim, MELEE_DAMAGE, p, "melee");
-  } else if (tag.panelId !== undefined) {
-    damagePanel(tag.panelId, MELEE_PANEL_DAMAGE);
+  const hit = resolveAttack(p, eye, dir, MELEE_RANGE);
+  pushEvent(EV_MELEE, p.idx, hit.point);
+  if (hit.victim) {
+    damagePlayer(hit.victim, MELEE_DAMAGE, p, "melee");
+  } else if (hit.panelBody) {
+    const tag = hit.panelBody.userData as { panelId?: number };
+    if (tag.panelId !== undefined) damagePanel(tag.panelId, MELEE_PANEL_DAMAGE);
   }
 }
 
@@ -896,8 +938,20 @@ function explode(at: [number, number, number], ownerIdx: number): void {
 
 // --- Lifecycle ------------------------------------------------------------------------
 
+const HISTORY_TICKS = 10;
+// How far back shots rewind. The shooter saw the world REMOTE_DELAY_MS
+// (~3.6 ticks) in the past, and their input then sat in the server's input
+// buffer (~3 ticks at the servo target) before being applied — so the world
+// they aimed at is about 7 ticks old by the time the shot resolves.
+const LAG_COMP_TICKS = 7;
+
 function stepLifecycles(): void {
   for (const p of players.values()) {
+    readChar(p.body, p.state);
+    p.history.push([p.state.x, p.state.y, p.state.z]);
+    if (p.history.length > HISTORY_TICKS) p.history.shift();
+    if (p.dead) p.history.length = 0; // don't rewind into a corpse
+
     if (p.dead && tick >= p.respawnAtTick && phase === "playing") {
       const spawn = spawnPoint(p.team, p.idx);
       p.state = makeChar(spawn);
