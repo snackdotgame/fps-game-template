@@ -278,7 +278,7 @@ const sounds = {
     noiseBurst(0.5, 0.4, true);
     blip(60, 0.45, 0.25, "sine");
   },
-  hitmarker: () => blip(1300, 0.05, 0.12),
+  hitmarker: () => blip(1450, 0.07, 0.2),
   hurt: () => blip(170, 0.12, 0.16, "sawtooth"),
   reload: () => blip(700, 0.06, 0.08),
   build: () => blip(240, 0.1, 0.14, "square"),
@@ -329,13 +329,27 @@ window.addEventListener("blur", () => {
   fireHeld = false;
 });
 
-// Test hook: scripted input overrides everything for N ticks.
-let driven: (Omit<InputCmd, "seq"> & { ticks: number }) | null = null;
+// Test hook: scripted input overrides everything for N ticks. trackIdx
+// re-aims at that player's rendered position every tick (human-like tracking).
+let driven: (Omit<InputCmd, "seq"> & { ticks: number; trackIdx?: number }) | null = null;
 
 function sampleInput(seq: number): InputCmd {
   if (driven && driven.ticks > 0) {
     driven.ticks--;
-    const { ticks: _ticks, ...rest } = driven;
+    if (driven.trackIdx !== undefined && predState) {
+      const rp = remotes.get(driven.trackIdx);
+      if (rp) {
+        const g = rp.group.position;
+        const dx = g.x - predState.x;
+        const dz = g.z - predState.z;
+        const dist = Math.hypot(dx, dz) || 1;
+        yaw = Math.atan2(dx, dz);
+        pitch = Math.atan2(g.y + 0.9 - (predState.y + 1.45), dist);
+        driven.yaw = quantizeAngle(yaw);
+        driven.pitch = quantizeAngle(pitch);
+      }
+    }
+    const { ticks: _ticks, trackIdx: _trackIdx, ...rest } = driven;
     return { seq, ...rest };
   }
   let fwd = 0;
@@ -957,6 +971,25 @@ function makeSoldier(team: number, name: string): THREE.Group {
   return g;
 }
 
+// Flash a soldier red for a beat — damage must read on the target, not just
+// the crosshair.
+function flashRemote(idx: number): void {
+  const rp = remotes.get(idx);
+  if (!rp) return;
+  rp.group.traverse((o) => {
+    if (o instanceof THREE.Mesh && o.material instanceof THREE.MeshLambertMaterial) {
+      o.material.emissive.setHex(0xa01010);
+    }
+  });
+  setTimeout(() => {
+    rp.group.traverse((o) => {
+      if (o instanceof THREE.Mesh && o.material instanceof THREE.MeshLambertMaterial) {
+        o.material.emissive.setHex(0x000000);
+      }
+    });
+  }, 130);
+}
+
 function dropRemote(idx: number): void {
   const rp = remotes.get(idx);
   if (rp) scene.remove(rp.group);
@@ -1126,12 +1159,17 @@ function stepEffects(dt: number): void {
 // --- Transient event processing (from the snapshot ring). ---
 
 let lastSelfTracerSeq = -1;
+let myHits = 0;
+let dbgMyTracers = 0;
+let dbgHitEvents = 0;
+let dbgEvents = 0;
 
 function processEvents(list: GameEvent[]): void {
   for (const e of list) {
     const delta = (e.seq - lastEventSeq + 0x10000) % 0x10000;
     if (delta === 0 || delta > 0x8000) continue; // old or duplicate
     lastEventSeq = e.seq;
+    dbgEvents++;
     const at = new THREE.Vector3(e.x, e.y, e.z);
     switch (e.kind) {
       case EV_TRACER: {
@@ -1139,7 +1177,10 @@ function processEvents(list: GameEvent[]): void {
           const from = eyeOf(e.a);
           if (from) spawnTracer(from, at);
         }
-        if (e.a === selfIdx) lastSelfTracerSeq = e.seq;
+        if (e.a === selfIdx) {
+          lastSelfTracerSeq = e.seq;
+          dbgMyTracers++;
+        }
         if (e.a !== selfIdx && predState) {
           const d = at.distanceTo(new THREE.Vector3(predState.x, predState.y, predState.z));
           sounds.shotFar(d);
@@ -1147,7 +1188,9 @@ function processEvents(list: GameEvent[]): void {
         break;
       }
       case EV_HIT_PLAYER: {
+        dbgHitEvents++;
         spawnSpark(at, 0xff4a3a);
+        flashRemote(e.a); // the victim visibly flinches red
         if (e.a === selfIdx) {
           el.vignette.style.opacity = "1";
           setTimeout(() => (el.vignette.style.opacity = "0"), 180);
@@ -1156,9 +1199,15 @@ function processEvents(list: GameEvent[]): void {
           lastSelfTracerSeq >= 0 &&
           (e.seq - lastSelfTracerSeq + 0x10000) % 0x10000 === 1
         ) {
-          // Our tracer's companion hit event: confirmed hit.
+          // Our tracer's companion hit event: confirmed hit. Make it LOUD —
+          // weak hit feedback reads as "my shots do nothing".
+          myHits++;
           el.hitmark.style.opacity = "1";
-          setTimeout(() => (el.hitmark.style.opacity = "0"), 140);
+          el.hitmark.style.transform = "translate(-50%,-50%) rotate(45deg) scale(1.6)";
+          setTimeout(() => {
+            el.hitmark.style.opacity = "0";
+            el.hitmark.style.transform = "translate(-50%,-50%) rotate(45deg) scale(1)";
+          }, 240);
           sounds.hitmarker();
         }
         break;
@@ -1423,10 +1472,13 @@ declare global {
       selfStatus(): number;
       ammo(): number;
       panelCount(): number;
+      myHits(): number;
+      dbgEvents(): [number, number, number];
+      remotePos(idx: number): [number, number, number] | null;
       destroyedCount(): number;
       perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
-      drive(over: Partial<Omit<InputCmd, "seq">>, ticks: number): void;
+      drive(over: Partial<Omit<InputCmd, "seq">> & { trackIdx?: number }, ticks: number): void;
       stopDrive(): void;
     };
   }
@@ -1445,6 +1497,14 @@ window.__fps = {
   selfStatus: () => selfStatus,
   ammo: () => (predState ? predState.ammo : 0),
   panelCount: () => panelMeshes.size,
+  myHits: () => myHits,
+  dbgEvents: () => [dbgEvents, dbgMyTracers, dbgHitEvents] as [number, number, number],
+  remotePos: (idx) => {
+    const rp = remotes.get(idx);
+    if (!rp) return null;
+    const g = rp.group.position;
+    return [g.x, g.y, g.z];
+  },
   destroyedCount: () => destroyedSet.size,
   perf: () => ({
     fps: perf.fps,

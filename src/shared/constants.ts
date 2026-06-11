@@ -33,8 +33,8 @@ export const RIFLE_MAG = 30;
 export const RELOAD_TICKS = 54; // 1.8s
 // Spread (radians): base when still+grounded, worse moving / airborne.
 export const SPREAD_BASE = 0.004;
-export const SPREAD_MOVE = 0.022;
-export const SPREAD_AIR = 0.05;
+export const SPREAD_MOVE = 0.011; // added at full stride
+export const SPREAD_AIR = 0.045; // added while airborne
 
 // Grenades.
 export const GRENADE_COUNT = 2;

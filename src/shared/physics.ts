@@ -12,6 +12,9 @@ import initJolt from "jolt-ts/native/jolt/dist/jolt-physics.wasm-compat.js";
 import { type Body, Shape, World } from "jolt-ts";
 import {
   BUILD_COOLDOWN_TICKS,
+  SPREAD_AIR,
+  SPREAD_BASE,
+  SPREAD_MOVE,
   BUILD_RANGE,
   BUILD_SUPPLY,
   GRENADE_COUNT,
@@ -468,10 +471,99 @@ function approach(v: number, target: number, step: number): number {
   return v;
 }
 
+// Distance along the ray to the first WALL (panels/statics), hopping over
+// every player capsule — player hits are decided by the rewound test below.
+export function castWallDistance(
+  gw: GameWorld,
+  origin: readonly number[],
+  dir: readonly number[],
+  length: number,
+): { dist: number; body: Body | null; point: [number, number, number] } {
+  let ox = origin[0];
+  let oy = origin[1];
+  let oz = origin[2];
+  let traveled = 0;
+  for (let hop = 0; hop < 6; hop++) {
+    const remaining = length - traveled;
+    if (remaining <= 0) break;
+    const hit = gw.world.castRay(
+      [ox, oy, oz],
+      [dir[0] * remaining, dir[1] * remaining, dir[2] * remaining],
+    );
+    if (!hit || !hit.body) break;
+    const hitDist = traveled + remaining * hit.fraction;
+    const tag = hit.body.userData as { playerIdx?: number };
+    if (tag.playerIdx === undefined) {
+      return {
+        dist: hitDist,
+        body: hit.body,
+        point: [
+          origin[0] + dir[0] * hitDist,
+          origin[1] + dir[1] * hitDist,
+          origin[2] + dir[2] * hitDist,
+        ],
+      };
+    }
+    traveled = hitDist + 0.45;
+    ox = origin[0] + dir[0] * traveled;
+    oy = origin[1] + dir[1] * traveled;
+    oz = origin[2] + dir[2] * traveled;
+  }
+  return {
+    dist: length,
+    body: null,
+    point: [origin[0] + dir[0] * length, origin[1] + dir[1] * length, origin[2] + dir[2] * length],
+  };
+}
+
+// Ray vs a vertical capsule at `feet` — returns the ray distance of the
+// closest approach if within the capsule radius, else null.
+export function rayVsCapsule(
+  origin: readonly number[],
+  dir: readonly number[],
+  maxDist: number,
+  feet: readonly number[],
+): number | null {
+  const a: [number, number, number] = [feet[0], feet[1] + PLAYER_RADIUS, feet[2]];
+  const segY = PLAYER_HEIGHT - 2 * PLAYER_RADIUS; // capsule core segment
+  // Closest approach between ray (origin + t*dir) and vertical segment
+  // (a + u*[0,segY,0], u in 0..1).
+  const rx = origin[0] - a[0];
+  const ry = origin[1] - a[1];
+  const rz = origin[2] - a[2];
+  const dDotD = 1; // dir is unit
+  const eDotE = segY * segY;
+  const dDotE = dir[1] * segY;
+  const rDotD = rx * dir[0] + ry * dir[1] + rz * dir[2];
+  const rDotE = ry * segY;
+  const denom = dDotD * eDotE - dDotE * dDotE;
+  let t: number;
+  let u: number;
+  if (Math.abs(denom) > 1e-9) {
+    u = (dDotE * -rDotD + dDotD * rDotE) / denom;
+    u = Math.max(0, Math.min(1, u));
+    t = u * dDotE - rDotD;
+  } else {
+    u = 0;
+    t = -rDotD;
+  }
+  t = Math.max(0, Math.min(maxDist, t));
+  // Re-clamp u for the clamped t.
+  u = Math.max(0, Math.min(1, (origin[1] + dir[1] * t - a[1]) / (segY || 1)));
+  const cx = a[0];
+  const cy = a[1] + u * segY;
+  const cz = a[2];
+  const px = origin[0] + dir[0] * t;
+  const py = origin[1] + dir[1] * t;
+  const pz = origin[2] + dir[2] * t;
+  const distSq = (px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2;
+  return distSq <= PLAYER_RADIUS * PLAYER_RADIUS ? t : null;
+}
+
 // Current rifle spread (radians) — worse while moving or airborne.
 export function spreadFor(s: CharState): number {
   const moveFactor = Math.min(1, Math.hypot(s.vx, s.vz) / WALK_SPEED);
-  let spread = 0.004 + moveFactor * 0.018;
-  if (!s.onGround) spread += 0.045;
+  let spread = SPREAD_BASE + moveFactor * SPREAD_MOVE;
+  if (!s.onGround) spread += SPREAD_AIR;
   return spread;
 }
