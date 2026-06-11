@@ -4,14 +4,7 @@
 
 import { client } from "minion:client";
 import * as THREE from "three";
-import {
-  INPUT_REDUNDANCY,
-  MAX_HP,
-  REMOTE_DELAY_MS,
-  TEAM_NAMES,
-  TICK_MS,
-  TICK_RATE,
-} from "./shared/constants.js";
+import { INPUT_REDUNDANCY, MAX_HP, TEAM_NAMES, TICK_MS, TICK_RATE } from "./shared/constants.js";
 import { MAP, type PanelDef, panelExtents } from "./shared/map.js";
 import { parseServerMsg, type PlayerInfo } from "./shared/messages.js";
 import {
@@ -334,6 +327,7 @@ window.addEventListener("blur", () => {
 let driven: (Omit<InputCmd, "seq"> & { ticks: number; trackIdx?: number }) | null = null;
 
 function sampleInput(seq: number): InputCmd {
+  const viewTick = renderedWorldTick(performance.now()) & 0xffff;
   if (driven && driven.ticks > 0) {
     driven.ticks--;
     if (driven.trackIdx !== undefined && predState) {
@@ -350,7 +344,7 @@ function sampleInput(seq: number): InputCmd {
       }
     }
     const { ticks: _ticks, trackIdx: _trackIdx, ...rest } = driven;
-    return { seq, ...rest };
+    return { seq, ...rest, viewTick };
   }
   let fwd = 0;
   let side = 0;
@@ -373,6 +367,7 @@ function sampleInput(seq: number): InputCmd {
     grenade: keys.has("KeyG"),
     melee: keys.has("KeyF"),
     build: keys.has("KeyQ"),
+    viewTick,
   };
 }
 
@@ -429,6 +424,57 @@ const TARGET_DEPTH = 3;
 let depthEma = TARGET_DEPTH;
 let serverTickRefTick = 0;
 let serverTickRefAtMs = 0;
+
+// --- Adaptive interpolation delay (Source-style, jitter-driven). ---
+// The buffer must always hold two snapshots to interpolate between, so the
+// delay is sized from MEASURED inter-arrival gaps (jitter + loss), not ping:
+// worst observed gap in the window plus one tick of slack, smoothly adjusted.
+const INTERP_MIN_MS = 2 * TICK_MS;
+const INTERP_MAX_MS = 250;
+let interpDelayMs = 4 * TICK_MS;
+let lastArrivalMs = 0;
+let gapWindowMax = 0;
+let gapWindowStart = 0;
+let prevGapWindowMax = TICK_MS;
+// Arrival log for mapping render time -> server tick of the rendered world.
+const arrivals: Array<{ t: number; tick: number }> = [];
+
+function noteArrival(receivedAt: number, serverTick: number): void {
+  if (lastArrivalMs > 0) {
+    gapWindowMax = Math.max(gapWindowMax, receivedAt - lastArrivalMs);
+  }
+  lastArrivalMs = receivedAt;
+  if (receivedAt - gapWindowStart > 2000) {
+    prevGapWindowMax = gapWindowMax;
+    gapWindowMax = 0;
+    gapWindowStart = receivedAt;
+  }
+  arrivals.push({ t: receivedAt, tick: serverTick });
+  if (arrivals.length > 90) arrivals.splice(0, arrivals.length - 90);
+}
+
+function targetInterpDelayMs(): number {
+  const worstGap = Math.max(gapWindowMax, prevGapWindowMax);
+  return Math.max(INTERP_MIN_MS, Math.min(INTERP_MAX_MS, worstGap + TICK_MS));
+}
+
+// The server tick of the world being rendered right now (for viewTick).
+function renderedWorldTick(now: number): number {
+  const renderT = now - interpDelayMs;
+  if (arrivals.length === 0) return Math.max(0, Math.floor(estServerTick()));
+  let a = arrivals[0];
+  let b = arrivals[arrivals.length - 1];
+  for (let i = arrivals.length - 1; i >= 0; i--) {
+    if (arrivals[i].t <= renderT) {
+      a = arrivals[i];
+      b = arrivals[Math.min(i + 1, arrivals.length - 1)];
+      break;
+    }
+  }
+  const span = Math.max(1, b.t - a.t);
+  const u = Math.max(0, Math.min(1, (renderT - a.t) / span));
+  return Math.round(a.tick + (b.tick - a.tick) * u);
+}
 
 function estimatedServerTickNow(): number {
   if (serverTickRefAtMs === 0) return 0;
@@ -609,6 +655,7 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
   if (lastSnapAtMs > 0 && receivedAt - lastSnapAtMs > 1500) needHardAdopt = true;
   lastSnapAtMs = receivedAt;
 
+  noteArrival(receivedAt, snap.serverTick);
   selfStatus = snap.self.status;
   selfHp = snap.self.hp;
   respawnTicks = snap.self.respawnTicks;
@@ -752,7 +799,7 @@ function castLocal(
   origin: readonly number[],
   dir: readonly number[],
   length: number,
-): [number, number, number] | null {
+): { point: [number, number, number]; body: Body } | null {
   if (!gw || !selfBody) return null;
   let ox = origin[0];
   let oy = origin[1];
@@ -767,7 +814,7 @@ function castLocal(
     const px = ox + dir[0] * remaining * hit.fraction;
     const py = oy + dir[1] * remaining * hit.fraction;
     const pz = oz + dir[2] * remaining * hit.fraction;
-    if (hit.body !== selfBody) return [px, py, pz];
+    if (hit.body !== selfBody) return { point: [px, py, pz], body: hit.body };
     const step = remaining * hit.fraction + 0.45;
     ox += dir[0] * step;
     oy += dir[1] * step;
@@ -881,7 +928,7 @@ function predictionTick(): void {
         const from = new THREE.Vector3(eye[0], eye[1] - 0.05, eye[2]);
         const hit = castLocal(eye, dir, 90);
         const end = hit
-          ? new THREE.Vector3(hit[0], hit[1], hit[2])
+          ? new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])
           : new THREE.Vector3(eye[0] + dir[0] * 90, eye[1] + dir[1] * 90, eye[2] + dir[2] * 90);
         spawnTracer(from, end);
       }
@@ -1314,8 +1361,17 @@ function frame(): void {
     buildPreview.visible = false;
   }
 
+  // Ease the interpolation delay toward its jitter-derived target (fast to
+  // grow when the network degrades, slow to shrink so it doesn't oscillate).
+  const interpTarget = targetInterpDelayMs();
+  if (interpTarget > interpDelayMs) {
+    interpDelayMs = Math.min(interpTarget, interpDelayMs + dt * 200);
+  } else {
+    interpDelayMs = Math.max(interpTarget, interpDelayMs - dt * 15);
+  }
+
   // Remotes (interpolated in the past).
-  const renderT = now - REMOTE_DELAY_MS;
+  const renderT = now - interpDelayMs;
   for (const rp of remotes.values()) {
     if (rp.buffer.length === 0) continue;
     const buf = rp.buffer;
@@ -1473,6 +1529,7 @@ declare global {
       ammo(): number;
       panelCount(): number;
       myHits(): number;
+      aimPanel(): number | null;
       dbgEvents(): [number, number, number];
       remotePos(idx: number): [number, number, number] | null;
       destroyedCount(): number;
@@ -1498,6 +1555,15 @@ window.__fps = {
   ammo: () => (predState ? predState.ammo : 0),
   panelCount: () => panelMeshes.size,
   myHits: () => myHits,
+  // What the mirror world says is under the crosshair (panel id, or null).
+  aimPanel: () => {
+    if (!predState || !gw || !selfBody) return null;
+    const dir = [Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
+    const eye = [predState.x, predState.y + EYE_HEIGHT, predState.z];
+    const hit = castLocal(eye, dir, 30);
+    const tag = (hit?.body.userData ?? {}) as { panelId?: number };
+    return tag.panelId ?? null;
+  },
   dbgEvents: () => [dbgEvents, dbgMyTracers, dbgHitEvents] as [number, number, number],
   remotePos: (idx) => {
     const rp = remotes.get(idx);
@@ -1516,6 +1582,7 @@ window.__fps = {
     drawCalls: perf.drawCalls,
     triangles: perf.triangles,
     pixelRatio: renderer.getPixelRatio(),
+    interpDelayMs,
   }),
   look: (yawV, pitchV) => {
     yaw = yawV;

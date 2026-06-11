@@ -45,6 +45,9 @@ export interface InputCmd {
   grenade: boolean;
   melee: boolean;
   build: boolean;
+  // Low 16 bits of the server tick of the world the client was rendering
+  // when this input was sampled. Lag compensation rewinds hit tests to it.
+  viewTick: number;
 }
 
 export const ZERO_INPUT: Omit<InputCmd, "seq"> = {
@@ -59,6 +62,7 @@ export const ZERO_INPUT: Omit<InputCmd, "seq"> = {
   grenade: false,
   melee: false,
   build: false,
+  viewTick: 0,
 };
 
 // Body pose + deterministic controller/weapon state. This is what crosses the

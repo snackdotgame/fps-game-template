@@ -24,7 +24,9 @@ export function quantizeAngle(v: number): number {
 
 // --- Input packets -----------------------------------------------------------
 // [u8 type][u8 count] then per input:
-// [u32 seq][i8 mx][i8 mz][i16 yaw][i16 pitch][u8 buttons]  (11 bytes)
+// [u32 seq][i8 mx][i8 mz][i16 yaw][i16 pitch][u8 buttons][u16 viewTick]
+// (13 bytes). viewTick is the low 16 bits of the server tick of the world the
+// client was RENDERING at sample time — the server rewinds hit tests to it.
 
 const BTN_JUMP = 1;
 const BTN_SPRINT = 2;
@@ -35,7 +37,7 @@ const BTN_MELEE = 32;
 const BTN_BUILD = 64;
 
 export function encodeInputs(cmds: readonly InputCmd[]): Uint8Array {
-  const buf = new ArrayBuffer(2 + cmds.length * 11);
+  const buf = new ArrayBuffer(2 + cmds.length * 13);
   const dv = new DataView(buf);
   dv.setUint8(0, PKT_INPUT);
   dv.setUint8(1, cmds.length);
@@ -56,7 +58,8 @@ export function encodeInputs(cmds: readonly InputCmd[]): Uint8Array {
         (c.melee ? BTN_MELEE : 0) |
         (c.build ? BTN_BUILD : 0),
     );
-    o += 11;
+    dv.setUint16(o + 11, c.viewTick & 0xffff);
+    o += 13;
   }
   return new Uint8Array(buf);
 }
@@ -64,7 +67,7 @@ export function encodeInputs(cmds: readonly InputCmd[]): Uint8Array {
 export function decodeInputs(bytes: Uint8Array): InputCmd[] | null {
   if (bytes.length < 2 || bytes[0] !== PKT_INPUT) return null;
   const count = bytes[1];
-  if (bytes.length < 2 + count * 11) return null;
+  if (bytes.length < 2 + count * 13) return null;
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const out: InputCmd[] = [];
   let o = 2;
@@ -83,10 +86,20 @@ export function decodeInputs(bytes: Uint8Array): InputCmd[] | null {
       grenade: (b & BTN_GRENADE) !== 0,
       melee: (b & BTN_MELEE) !== 0,
       build: (b & BTN_BUILD) !== 0,
+      viewTick: dv.getUint16(o + 11),
     });
-    o += 11;
+    o += 13;
   }
   return out;
+}
+
+// Reconstruct a wrapped u16 viewTick to the full tick nearest (and not
+// after) `currentTick`.
+export function unwrapViewTick(raw: number, currentTick: number): number {
+  let v = (currentTick & ~0xffff) | (raw & 0xffff);
+  if (v > currentTick) v -= 0x10000;
+  if (currentTick - v > 0x8000) v += 0x10000;
+  return Math.min(v, currentTick);
 }
 
 // --- Snapshot packets --------------------------------------------------------

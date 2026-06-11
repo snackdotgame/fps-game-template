@@ -39,6 +39,7 @@ import { type PlayerInfo, type ServerMsg } from "./shared/messages.js";
 import {
   decodeInputs,
   encodeSnapshot,
+  unwrapViewTick,
   type EntitySnap,
   EV_EXPLOSION,
   EV_HIT_PLAYER,
@@ -490,6 +491,7 @@ function botThink(p: Player, b: BotBrain): InputCmd {
     seq: p.lastSeq + 1,
     moveX,
     moveZ,
+    viewTick: tick & 0xffff, // bots see the live world
     yaw: b.aimYaw,
     pitch: b.aimPitch,
     jump,
@@ -703,11 +705,11 @@ function castIgnoring(
   return null;
 }
 
-// Where this player's capsule was LAG_COMP_TICKS ago (or as far back as we
-// know) — the position the shooter actually saw.
-function rewoundFeet(q: Player): readonly number[] | null {
+// Where this player's capsule was `rewindTicks` ago (clamped to what we
+// know) — the position the shooter actually saw on their screen.
+function rewoundFeet(q: Player, rewindTicks: number): readonly number[] | null {
   if (q.history.length === 0) return null;
-  const back = Math.min(LAG_COMP_TICKS, q.history.length);
+  const back = Math.max(1, Math.min(rewindTicks, q.history.length));
   return q.history[q.history.length - back];
 }
 
@@ -718,19 +720,22 @@ interface AttackHit {
 }
 
 // Shared lag-compensated hitscan: present-day walls occlude, but player
-// capsules are tested at their rewound positions.
+// capsules are tested where the shooter SAW them — their input carries the
+// server tick of the world they were rendering (Source-style: rewind =
+// client latency + client interpolation, measured exactly, not assumed).
 function resolveAttack(
   p: Player,
   eye: [number, number, number],
   d: [number, number, number],
   range: number,
+  rewindTicks: number,
 ): AttackHit {
   const wall = castWallDistance(gw, eye, d, range);
   let bestT = wall.dist;
   let victim: Player | null = null;
   for (const q of players.values()) {
     if (q === p || q.dead || q.team === p.team) continue;
-    const feet = rewoundFeet(q);
+    const feet = rewoundFeet(q, rewindTicks);
     if (!feet) continue;
     const t = rayVsCapsule(eye, d, bestT, feet);
     if (t !== null && t < bestT) {
@@ -748,6 +753,13 @@ function resolveAttack(
   return { victim: null, panelBody: wall.dist < range ? wall.body : null, point: wall.point };
 }
 
+function rewindFor(p: Player): number {
+  // Bots aim at the live world; humans report what they were rendering.
+  if (p.bot) return 1;
+  const viewTick = unwrapViewTick(p.lastCmd.viewTick, tick);
+  return Math.max(1, Math.min(HISTORY_TICKS, tick - viewTick));
+}
+
 function resolveShot(
   p: Player,
   eye: [number, number, number],
@@ -758,7 +770,7 @@ function resolveShot(
   const spread = spreadFor(p.state);
   const d = perturb(dir, (rng() - 0.5) * 2 * spread, (rng() - 0.5) * 2 * spread);
 
-  const hit = resolveAttack(p, eye, d, RIFLE_RANGE);
+  const hit = resolveAttack(p, eye, d, RIFLE_RANGE, rewindFor(p));
   pushEvent(EV_TRACER, p.idx, hit.point);
   if (hit.victim) {
     damagePlayer(hit.victim, RIFLE_DAMAGE, p, "rifle");
@@ -777,7 +789,7 @@ function resolveMelee(
   eye: [number, number, number],
   dir: [number, number, number],
 ): void {
-  const hit = resolveAttack(p, eye, dir, MELEE_RANGE);
+  const hit = resolveAttack(p, eye, dir, MELEE_RANGE, rewindFor(p));
   pushEvent(EV_MELEE, p.idx, hit.point);
   if (hit.victim) {
     damagePlayer(hit.victim, MELEE_DAMAGE, p, "melee");
@@ -867,7 +879,7 @@ function allocGrenadeId(): number {
 }
 
 function stepGrenades(): void {
-  for (const g of [...grenades]) {
+  for (const g of grenades.slice()) {
     g.fuseLeft--;
     if (g.fuseLeft > 0) continue;
     const pos = g.body.translation();
@@ -914,7 +926,7 @@ function explode(at: [number, number, number], ownerIdx: number): void {
       destroyPanel(p.id);
     }
   }
-  for (const [id, p] of [...builtPanels]) {
+  for (const [id, p] of builtPanels) {
     if (Math.hypot(p.x - at[0], p.y - at[1], p.z - at[2]) <= EXPLOSION_PANEL_RADIUS) {
       destroyPanel(id);
     }
@@ -938,12 +950,9 @@ function explode(at: [number, number, number], ownerIdx: number): void {
 
 // --- Lifecycle ------------------------------------------------------------------------
 
-const HISTORY_TICKS = 10;
-// How far back shots rewind. The shooter saw the world REMOTE_DELAY_MS
-// (~3.6 ticks) in the past, and their input then sat in the server's input
-// buffer (~3 ticks at the servo target) before being applied — so the world
-// they aimed at is about 7 ticks old by the time the shot resolves.
-const LAG_COMP_TICKS = 7;
+// Position history depth = the deepest rewind we honor (~400ms). Beyond
+// that, favoring the shooter punishes the target too much.
+const HISTORY_TICKS = 12;
 
 function stepLifecycles(): void {
   for (const p of players.values()) {

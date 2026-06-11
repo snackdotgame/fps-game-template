@@ -65,15 +65,26 @@ Same three-way split as the sibling snack-dash template, tuned for an FPS:
   snapshot, so a lost datagram doesn't lose the tracer: the next snapshot still carries
   it, and the client dedupes by event seq. Latest-wins, no retransmission; the client
   restores its mirror world from each snapshot and replays pending inputs.
+- **Adaptive interpolation delay**: remotes render in the past behind a jitter buffer
+  sized from MEASURED snapshot inter-arrival gaps (Source-style: a multiple of the
+  snapshot interval, not ping) — worst observed gap plus a tick of slack, clamped to
+  66-250ms, growing fast when the network degrades and shrinking slowly. The live value
+  shows as "lerp" in the HUD's corner readout.
 - **Inputs (30 Hz)**: redundant 8-tail with view angles per input; the client's
-  production rate is servo'd to the server-reported buffer depth.
+  production rate is servo'd to the server-reported buffer depth. Each input also
+  carries `viewTick` — the server tick of the world the client was _rendering_ when it
+  sampled.
 - **Destruction and construction** ride QUIC reliable streams (exactly-once, ordered —
   they change collision, so they can't be fire-and-forget), as do roster, kills, scores,
   and round flow. Late joiners get the full destroyed/built lists in the welcome.
 
-Hit detection is server-side at input-application time, with no lag compensation —
-fine at the latencies this template targets; a rewind buffer is the documented next
-step if you need favor-the-shooter behavior.
+Hit detection is **server-side with exact favor-the-shooter lag compensation**: the
+server keeps a short position history per player and rewinds rifle/sledge hit tests to
+each shot's reported `viewTick` — the world the shooter was actually seeing, which
+automatically accounts for their interpolation delay, transit time, and input
+buffering, whatever their ping. Present-day walls still occlude (no shooting through
+cover that just went up), and rewind is capped at ~400ms so high-ping shooters can't
+punish targets too far into the past.
 
 ## Develop
 
