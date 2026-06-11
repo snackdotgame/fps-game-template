@@ -81,6 +81,9 @@ import {
   type CharState,
 } from "./shared/physics.js";
 
+// The Minion runtime provides console/performance; the DOM-less lib doesn't type them.
+declare const console: { log(...args: unknown[]): void };
+
 const MAX_BUFFERED_INPUTS = 90;
 const EVENT_RING = 12;
 const PARK_TTL_MS = 5 * 60 * 1000;
@@ -195,19 +198,51 @@ export async function main() {
   }
 }
 
+let perfInputMs = 0;
+let perfStepMs = 0;
+let perfSnapMs = 0;
+let perfTotalMs = 0;
+let perfWorstMs = 0;
+let perfTicks = 0;
+
 async function stepServer(): Promise<void> {
+  const t0 = server.elapsedMs();
   tick++;
   syncConnections();
   drainInputs();
 
   for (const p of players.values()) applyPlayerInput(p);
+  const t1 = server.elapsedMs();
 
   stepGrenades();
   gw.world.step(1 / TICK_RATE);
+  const t2 = server.elapsedMs();
+
   stepLifecycles();
   flushDestroys();
   await stepPhase();
   broadcastSnapshots();
+  const t3 = server.elapsedMs();
+
+  perfInputMs += t1 - t0;
+  perfStepMs += t2 - t1;
+  perfSnapMs += t3 - t2;
+  perfTotalMs += t3 - t0;
+  if (t3 - t0 > perfWorstMs) perfWorstMs = t3 - t0;
+  perfTicks++;
+  if (perfTicks >= 300) {
+    // Stay silent while healthy; speak up when the tick budget is threatened.
+    const avg = perfTotalMs / perfTicks;
+    if (avg > 5 || perfWorstMs > 25) {
+      console.log(
+        `[perf] tick avg=${(perfTotalMs / perfTicks).toFixed(2)}ms worst=${perfWorstMs.toFixed(1)}ms ` +
+          `(input+bots=${(perfInputMs / perfTicks).toFixed(2)} physics=${(perfStepMs / perfTicks).toFixed(2)} ` +
+          `out=${(perfSnapMs / perfTicks).toFixed(2)}) players=${players.size}`,
+      );
+    }
+    perfInputMs = perfStepMs = perfSnapMs = perfTotalMs = perfWorstMs = 0;
+    perfTicks = 0;
+  }
 }
 
 // --- Connections ---------------------------------------------------------------
