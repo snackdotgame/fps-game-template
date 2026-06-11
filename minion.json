@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "assets": {
+    "directory": "assets"
+  },
+  "server": {
+    "entry": "src/server.ts"
+  },
+  "client": {
+    "entry": "src/client.ts"
+  },
+  "game": {
+    "maxPlayers": 16,
+    "name": "Breachpoint",
+    "visibility": "private"
+  }
+}
