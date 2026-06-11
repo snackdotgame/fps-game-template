@@ -1,0 +1,21 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noEmit": true,
+    "types": [
+      "./.minion/types/server"
+    ],
+    "lib": [
+      "ES2022",
+      "ESNext.Disposable"
+    ]
+  },
+  "include": [
+    "src/server.ts",
+    "src/shared/**/*.ts",
+    ".minion/types/**/*.d.ts"
+  ]
+}

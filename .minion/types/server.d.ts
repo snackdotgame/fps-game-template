@@ -1,0 +1,107 @@
+declare module "minion:server" {
+  export type NetworkMessage =
+    | string
+    | number
+    | boolean
+    | null
+    | NetworkMessage[]
+    | { [key: string]: NetworkMessage };
+
+  export type DatagramPayload =
+    | NetworkMessage
+    | Uint8Array
+    | ArrayBuffer
+    | ArrayBufferView
+    | string;
+
+  export type StreamPayload = DatagramPayload;
+
+  export interface BroadcastOptions {
+    only?: readonly string[];
+    except?: readonly string[];
+  }
+
+  export interface NetStats {
+    readonly rtt: number | null;
+    readonly latestRtt: number | null;
+    readonly jitter: number | null;
+  }
+
+  export interface NetworkEvent {
+    readonly connection: Connection;
+    readonly bytes: Uint8Array;
+    readonly receivedAt: number;
+    json<T = unknown>(): T;
+    text(): string;
+  }
+
+  export interface DatagramEvent extends NetworkEvent {
+    readonly type: "datagram";
+  }
+
+  export interface StreamEvent extends NetworkEvent {
+    readonly type: "stream";
+  }
+
+  export interface ServerDatagrams extends AsyncIterable<DatagramEvent> {
+    readonly maxSize: number;
+    drain(): DatagramEvent[];
+    drainInto(target: DatagramEvent[]): number;
+    recv(): Promise<DatagramEvent>;
+    send(connectionId: string, payload: DatagramPayload): void;
+    broadcast(payload: DatagramPayload, options?: BroadcastOptions): void;
+  }
+
+  export interface ConnectionDatagrams extends AsyncIterable<DatagramEvent> {
+    readonly maxSize: number;
+    drain(): DatagramEvent[];
+    drainInto(target: DatagramEvent[]): number;
+    recv(): Promise<DatagramEvent>;
+    send(payload: DatagramPayload): void;
+  }
+
+  export interface ServerStreams extends AsyncIterable<StreamEvent> {
+    readonly maxSize: number;
+    drain(): StreamEvent[];
+    drainInto(target: StreamEvent[]): number;
+    recv(): Promise<StreamEvent>;
+    send(connectionId: string, payload: StreamPayload): void;
+    broadcast(payload: StreamPayload, options?: BroadcastOptions): void;
+  }
+
+  export interface ConnectionStreams extends AsyncIterable<StreamEvent> {
+    readonly maxSize: number;
+    drain(): StreamEvent[];
+    drainInto(target: StreamEvent[]): number;
+    recv(): Promise<StreamEvent>;
+    send(payload: StreamPayload): void;
+  }
+
+  export interface Connection {
+    readonly id: string;
+    readonly userId: string;
+    readonly userName: string;
+    readonly isGuest: boolean;
+    readonly connectedAt: number;
+    readonly net: NetStats;
+    readonly datagrams: ConnectionDatagrams;
+    readonly streams: ConnectionStreams;
+    close(reason?: string): void;
+  }
+
+  export interface Server {
+    readonly running: boolean;
+    readonly connections: readonly Connection[];
+    readonly datagrams: ServerDatagrams;
+    readonly streams: ServerStreams;
+    end(): void;
+    elapsedMs(): number;
+    sleep(ms: number): Promise<void>;
+  }
+
+  export const server: Server;
+}
+
+declare module "@minion/server" {
+  export * from "minion:server";
+}

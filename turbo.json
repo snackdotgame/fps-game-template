@@ -1,0 +1,31 @@
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "dev:client": {
+      "cache": false,
+      "persistent": true
+    },
+    "dev:server": {
+      "cache": false,
+      "persistent": true
+    },
+    "tc": {
+      "cache": false
+    },
+    "typecheck": {
+      "cache": false
+    },
+    "lint": {
+      "cache": false
+    },
+    "check": {
+      "cache": false
+    },
+    "build:client": {
+      "outputs": ["dist/client/**"]
+    },
+    "build:server": {
+      "outputs": ["dist/server/**", "dist/minion.json"]
+    }
+  }
+}
