@@ -11,6 +11,12 @@ grenades blow buildings open — and you can deploy fresh cover of your own.
 
 - **Team deathmatch**, two teams, auto-balanced. First to 40 kills or best score after
   5 minutes; short results screen, then the map fully restores and a new round starts.
+- **Buildings collapse** (BattleBit's critical-health 'levolution'): every building
+  tracks structural integrity, and once 40% of its wall panels are gone the whole
+  structure crumbles — remaining walls and roof fall, dust and debris fly, the ground
+  shakes, and a low rubble mound is left as cover. Panels also show damage (darkening
+  as they're chipped), and explosions delete panels up close while cracking them in an
+  outer falloff ring.
 - **Rifle** — full-auto hitscan, 30-round mag, server-side spread that worsens while
   moving or airborne. R reloads (auto on empty).
 - **Grenades (G)** — real physics projectiles (they bounce); the blast damages players
@@ -80,11 +86,12 @@ Same three-way split as the sibling snack-dash template, tuned for an FPS:
 
 Hit detection is **server-side with exact favor-the-shooter lag compensation**: the
 server keeps a short position history per player and rewinds rifle/sledge hit tests to
-each shot's reported `viewTick` — the world the shooter was actually seeing, which
-automatically accounts for their interpolation delay, transit time, and input
-buffering, whatever their ping. Present-day walls still occlude (no shooting through
-cover that just went up), and rewind is capped at ~400ms so high-ping shooters can't
-punish targets too far into the past.
+each shot's reported `viewTick` — the world the shooter was actually seeing. Present-day
+walls still occlude (no shooting through cover that just went up). The
+**client-attributable rewind (interpolation + transit) is capped at 120ms** so high-ping
+shooters can't punish targets deep into the past; the server's own input-buffer wait is
+honored on top of the cap, since that delay is the server's, not the shooter's ping —
+it exists even on LAN.
 
 ## Develop
 

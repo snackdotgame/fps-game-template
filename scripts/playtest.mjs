@@ -71,6 +71,11 @@ const a = await openClient("A");
 const b = await openClient("B");
 await a.page.waitForTimeout(1500);
 
+// Bots may have just ended a round; movement is locked during results.
+for (let i = 0; i < 40 && (await a.fps("phase")) !== "playing"; i++) {
+  await a.page.waitForTimeout(500);
+}
+
 // --- Roster, teams, and bot fill (bots leave one-for-one as humans join). ---
 const rosterA = await a.fps("roster");
 const botCount = (r) => r.filter((p) => p.name.startsWith("BOT")).length;

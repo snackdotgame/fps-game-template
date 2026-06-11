@@ -35,6 +35,12 @@ import {
   TICK_RATE,
 } from "./shared/constants.js";
 import { BUILT_PANEL_ID_BASE, MAP, type PanelDef, spawnPoint } from "./shared/map.js";
+import {
+  COLLAPSE_WALL_FRACTION,
+  EXPLOSION_PANEL_OUTER_DAMAGE,
+  EXPLOSION_PANEL_OUTER_RADIUS,
+  RUBBLE_HEIGHT,
+} from "./shared/constants.js";
 import { type PlayerInfo, type ServerMsg } from "./shared/messages.js";
 import {
   decodeInputs,
@@ -59,6 +65,7 @@ import {
 } from "./shared/netCodec.js";
 import {
   addPanelBody,
+  addRubbleBody,
   aimDirection,
   type Body,
   createGameWorld,
@@ -119,9 +126,11 @@ interface Player {
   body: Body;
   state: CharState;
   pending: Map<number, InputCmd>;
+  arrivalTicks: Map<number, number>; // seq -> tick the input arrived
   lastCmd: InputCmd;
   lastSeq: number;
   lastSeqTick: number;
+  lastArrivalTick: number; // when the applied input ARRIVED (buffer wait = apply - arrival)
   lastDepth: number;
   hp: number;
   dead: boolean;
@@ -165,6 +174,8 @@ const BOT_NAMES = ["Ash", "Brick", "Castle", "Dune", "Echo", "Flint", "Gravel", 
 const scores: [number, number] = [0, 0];
 
 const panelHp = new Map<number, number>(); // damaged panels only
+const collapsedBuildings = new Set<number>();
+let pendingHpUpdates = new Map<number, number>();
 const destroyedPanels = new Set<number>();
 const builtPanels = new Map<number, PanelDef>();
 let nextBuiltPanelId = BUILT_PANEL_ID_BASE;
@@ -344,9 +355,11 @@ function addBot(): void {
     body: createPlayerBody(gw, idx, spawn),
     state: makeChar(spawn),
     pending: new Map(),
+    arrivalTicks: new Map(),
     lastCmd: { seq: 0, ...ZERO_INPUT },
     lastSeq: 0,
     lastSeqTick: tick,
+    lastArrivalTick: tick,
     lastDepth: 0,
     hp: MAX_HP,
     dead: false,
@@ -558,9 +571,11 @@ function addPlayer(conn: Connection): void {
     body: createPlayerBody(gw, idx, spawn),
     state: makeChar(spawn),
     pending: new Map(),
+    arrivalTicks: new Map(),
     lastCmd: { seq: 0, ...ZERO_INPUT },
     lastSeq: 0,
     lastSeqTick: tick,
+    lastArrivalTick: tick,
     lastDepth: 0,
     hp: MAX_HP,
     dead: false,
@@ -585,6 +600,8 @@ function addPlayer(conn: Connection): void {
     mapEpoch,
     destroyed: [...destroyedPanels],
     built: [...builtPanels.values()],
+    collapsed: [...collapsedBuildings],
+    panelHp: [...panelHp.entries()],
   });
   broadcast({ type: "join", player: info }, p.conn?.id);
 }
@@ -613,6 +630,7 @@ function drainInputs(): void {
       if (c.seq <= p.lastSeq || p.pending.has(c.seq)) continue;
       if (p.pending.size >= MAX_BUFFERED_INPUTS) break;
       p.pending.set(c.seq, c);
+      p.arrivalTicks.set(c.seq, tick);
     }
   }
 }
@@ -647,6 +665,10 @@ function applyPlayerInput(p: Player): void {
     const seq = seqs[0];
     cmd = p.pending.get(seq)!;
     p.pending.delete(seq);
+    p.lastArrivalTick = p.arrivalTicks.get(seq) ?? tick;
+    for (const k of p.arrivalTicks.keys()) {
+      if (k <= seq) p.arrivalTicks.delete(k);
+    }
     p.lastSeq = seq;
     p.lastSeqTick = tick;
     p.lastCmd = cmd;
@@ -757,7 +779,10 @@ function rewindFor(p: Player): number {
   // Bots aim at the live world; humans report what they were rendering.
   if (p.bot) return 1;
   const viewTick = unwrapViewTick(p.lastCmd.viewTick, tick);
-  return Math.max(1, Math.min(HISTORY_TICKS, tick - viewTick));
+  const bufferWait = Math.max(0, tick - p.lastArrivalTick);
+  const clientView = Math.max(0, tick - bufferWait - viewTick);
+  const rewind = Math.min(clientView, VIEW_REWIND_CAP_TICKS) + bufferWait;
+  return Math.max(1, Math.min(HISTORY_TICKS, rewind));
 }
 
 function resolveShot(
@@ -850,8 +875,13 @@ function damagePanel(panelId: number, dmg: number): void {
   if (destroyedPanels.has(panelId)) return;
   const hp = (panelHp.get(panelId) ?? PANEL_HP) - dmg;
   if (hp <= 0) destroyPanel(panelId);
-  else panelHp.set(panelId, hp);
+  else {
+    panelHp.set(panelId, hp);
+    pendingHpUpdates.set(panelId, hp); // batched per tick for damage tinting
+  }
 }
+
+const panelById = new Map(MAP.panels.map((p) => [p.id, p]));
 
 function destroyPanel(panelId: number): void {
   if (destroyedPanels.has(panelId)) return;
@@ -860,9 +890,30 @@ function destroyPanel(panelId: number): void {
   builtPanels.delete(panelId);
   removePanelBody(gw, panelId);
   pendingDestroys.push(panelId);
+  // BattleBit-style critical health: enough wall damage fells the building.
+  const buildingId = panelById.get(panelId)?.buildingId;
+  if (buildingId !== undefined && !collapsedBuildings.has(buildingId)) {
+    const b = MAP.buildings[buildingId];
+    const gone = b.wallPanelIds.filter((id) => destroyedPanels.has(id)).length;
+    if (gone >= Math.ceil(b.wallPanelIds.length * COLLAPSE_WALL_FRACTION)) {
+      collapseBuilding(buildingId);
+    }
+  }
+}
+
+function collapseBuilding(buildingId: number): void {
+  collapsedBuildings.add(buildingId); // before the cascade, so it can't recurse
+  const b = MAP.buildings[buildingId];
+  broadcast({ type: "collapse", buildingId });
+  for (const id of [...b.wallPanelIds, ...b.roofPanelIds]) destroyPanel(id);
+  addRubbleBody(gw, b, RUBBLE_HEIGHT);
 }
 
 function flushDestroys(): void {
+  if (pendingHpUpdates.size > 0) {
+    broadcast({ type: "panelhp", updates: [...pendingHpUpdates.entries()] });
+    pendingHpUpdates = new Map();
+  }
   if (pendingDestroys.length === 0) return;
   broadcast({ type: "destroy", panelIds: pendingDestroys });
   pendingDestroys = [];
@@ -919,18 +970,16 @@ function explode(at: [number, number, number], ownerIdx: number): void {
     }
   }
 
-  // Panels: anything close enough is deleted outright.
+  // Panels: deleted outright up close, chipped in an outer falloff ring.
+  const blastPanel = (id: number, px: number, py: number, pz: number) => {
+    const dist = Math.hypot(px - at[0], py - at[1], pz - at[2]);
+    if (dist <= EXPLOSION_PANEL_RADIUS) destroyPanel(id);
+    else if (dist <= EXPLOSION_PANEL_OUTER_RADIUS) damagePanel(id, EXPLOSION_PANEL_OUTER_DAMAGE);
+  };
   for (const p of MAP.panels) {
-    if (destroyedPanels.has(p.id)) continue;
-    if (Math.hypot(p.x - at[0], p.y - at[1], p.z - at[2]) <= EXPLOSION_PANEL_RADIUS) {
-      destroyPanel(p.id);
-    }
+    if (!destroyedPanels.has(p.id)) blastPanel(p.id, p.x, p.y, p.z);
   }
-  for (const [id, p] of builtPanels) {
-    if (Math.hypot(p.x - at[0], p.y - at[1], p.z - at[2]) <= EXPLOSION_PANEL_RADIUS) {
-      destroyPanel(id);
-    }
-  }
+  for (const [id, p] of builtPanels) blastPanel(id, p.x, p.y, p.z);
 
   // Other grenades get knocked around.
   for (const g of grenades) {
@@ -950,9 +999,11 @@ function explode(at: [number, number, number], ownerIdx: number): void {
 
 // --- Lifecycle ------------------------------------------------------------------------
 
-// Position history depth = the deepest rewind we honor (~400ms). Beyond
-// that, favoring the shooter punishes the target too much.
 const HISTORY_TICKS = 12;
+// Cap on the CLIENT-attributable rewind (interp delay + transit): 120ms.
+// The server's own input-buffer wait is added on top uncapped — that delay
+// is ours, not the shooter's ping, and exists even on LAN.
+const VIEW_REWIND_CAP_TICKS = Math.round(120 / TICK_MS);
 
 function stepLifecycles(): void {
   for (const p of players.values()) {
@@ -998,6 +1049,8 @@ async function resetRound(): Promise<void> {
   panelHp.clear();
   destroyedPanels.clear();
   builtPanels.clear();
+  collapsedBuildings.clear();
+  pendingHpUpdates = new Map();
   pendingDestroys = [];
   grenades = [];
   scores[0] = 0;
