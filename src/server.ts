@@ -1274,6 +1274,7 @@ const RUBBLE_CHANCE: Partial<Record<PanelMaterial, number>> = {
   crate: 0.7,
   sandbag: 0.45,
   rock: 0.6,
+  concrete: 0.45,
   metal: 0.5,
 };
 const RUBBLE_CAP = 1200; // mirrors the client's instanced rubble pool

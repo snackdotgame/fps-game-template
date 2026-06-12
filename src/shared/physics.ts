@@ -115,6 +115,23 @@ const COYOTE_TICKS = 4;
 const GROUND_PROBE = 0.16; // generous: uneven terrain underfoot
 const STEP_MAX = 0.55; // tallest ledge the step-up assist climbs
 
+// Ladder volumes are map data; the controller climbs whichever one the
+// capsule overlaps. Returns the ladder when the player hugs its wall face.
+const LADDER_REACH = 0.85;
+const LADDER_CLIMB = 3.0;
+
+function ladderAt(x: number, feetY: number, z: number): { nx: number; nz: number } | null {
+  for (const l of MAP.ladders) {
+    const out = (x - l.x) * l.nx + (z - l.z) * l.nz; // off the wall face
+    if (out < -0.1 || out > LADDER_REACH) continue;
+    const along = (x - l.x) * -l.nz + (z - l.z) * l.nx;
+    if (Math.abs(along) > 0.6) continue;
+    if (feetY < -0.5 || feetY > l.y1 - 0.1) continue;
+    return l;
+  }
+  return null;
+}
+
 export function makeChar(spawn: readonly number[]): CharState {
   return {
     x: spawn[0],
@@ -656,9 +673,33 @@ export function stepPlayerController(
     vz = approach(vz, 0, GROUND_FRICTION * DT);
   }
 
-  // --- Jump. ---
+  // --- Ladders + jump. Climbing is deterministic shared logic: push toward
+  // the wall to go up, pull away to step off, jump to kick off backward.
+  const ladder = locked ? null : ladderAt(pos.x, feetY, pos.z);
   const jumpPressed = input.jump && !s.jumpHeld && !locked;
-  if (jumpPressed && (grounded || s.coyoteTicks > 0)) {
+  if (ladder) {
+    if (jumpPressed) {
+      vy = JUMP_VEL * 0.7;
+      vx = ladder.nx * 3.5;
+      vz = ladder.nz * 3.5;
+    } else {
+      const into = -(mx * ladder.nx + mz * ladder.nz);
+      if (into > 0.25) {
+        vy = LADDER_CLIMB;
+        vx = mx * 1.2;
+        vz = mz * 1.2;
+      } else if (into >= -0.25) {
+        // Holding on: cancel gravity and slide.
+        vy = 0;
+        vx *= 0.2;
+        vz *= 0.2;
+      }
+      // Pulling away keeps normal walk velocity and gravity takes over.
+    }
+    grounded = false;
+    s.onGround = false;
+    s.coyoteTicks = 0;
+  } else if (jumpPressed && (grounded || s.coyoteTicks > 0)) {
     vy = JUMP_VEL;
     grounded = false;
     s.onGround = false;

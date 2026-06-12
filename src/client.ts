@@ -140,6 +140,12 @@ const glassMat = new THREE.MeshStandardMaterial({
   depthWrite: false,
 });
 
+const ladderMat = new THREE.MeshStandardMaterial({
+  color: 0x6f6356,
+  roughness: 0.9,
+  flatShading: true,
+});
+
 const MAT = {
   wall: new THREE.MeshStandardMaterial({ color: 0x9b958a, roughness: 1, flatShading: true }),
   rubble: new THREE.MeshStandardMaterial({ color: 0x6e6a62, roughness: 1, flatShading: true }),
@@ -170,6 +176,7 @@ const PIECE_STYLE: Record<
   crate: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a7a52 },
   sandbag: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a8f72 },
   rock: { geo: GEO.rock, mat: voxelMat, debris: 0x8d8a84 },
+  concrete: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a9da1 },
   glass: { geo: GEO.box, mat: glassMat, debris: 0xd8eef7 },
   rubble: { geo: GEO.bevel, mat: voxelMat, debris: 0x847d72 },
   metal: { geo: GEO.bevel, mat: voxelMat, debris: 0x8a949e },
@@ -234,6 +241,8 @@ function pieceColor(def: PanelDef, out: THREE.Color): THREE.Color {
       return out.setHSL(0.112 + h1 * 0.012, 0.2 + h2 * 0.06, 0.5 + h1 * 0.12);
     case "rock":
       return out.setHSL(0.085 + h1 * 0.02, 0.04 + h2 * 0.05, 0.4 + h1 * 0.2);
+    case "concrete":
+      return out.setHSL(0.58 + h1 * 0.02, 0.02 + h2 * 0.03, 0.54 + h1 * 0.12);
     case "glass":
       return out.setHex(0xd6eef7);
     case "rubble":
@@ -684,6 +693,29 @@ function buildMapVisuals(): void {
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mapGroup.add(mesh);
+  }
+
+  // Ladders: cosmetic rails + rungs over the climb volumes (the climbing
+  // itself is shared controller logic on the map data).
+  for (const l of MAP.ladders) {
+    const group = new THREE.Group();
+    group.position.set(l.x + l.nx * 0.16, 0, l.z + l.nz * 0.16);
+    group.rotation.y = Math.atan2(l.nx, l.nz);
+    const railGeo = new THREE.BoxGeometry(0.07, l.y1 + 0.25, 0.07);
+    for (const s of [-1, 1]) {
+      const rail = new THREE.Mesh(railGeo, ladderMat);
+      rail.position.set(s * 0.31, (l.y1 + 0.25) / 2, 0);
+      rail.castShadow = true;
+      group.add(rail);
+    }
+    for (let y = 0.35; y < l.y1; y += 0.38) {
+      const rung = new THREE.Mesh(GEO.box, ladderMat);
+      rung.scale.set(0.62, 0.06, 0.06);
+      rung.position.set(0, y, 0);
+      rung.userData.sharedGeo = true;
+      group.add(rung);
+    }
+    mapGroup.add(group);
   }
 
   looseBoxes.rebuild(GEO.bevel, mapGroup);
