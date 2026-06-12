@@ -575,7 +575,10 @@ export function rayVsCapsule(
   const py = origin[1] + dir[1] * t;
   const pz = origin[2] + dir[2] * t;
   const distSq = (px - cx) ** 2 + (py - cy) ** 2 + (pz - cz) ** 2;
-  return distSq <= PLAYER_RADIUS * PLAYER_RADIUS ? t : null;
+  // Small hit slop: shots that graze the capsule edge register. FPS hitboxes
+  // are conventionally a touch generous — tight ones read as missed hits.
+  const r = PLAYER_RADIUS + 0.05;
+  return distSq <= r * r ? t : null;
 }
 
 // Current rifle spread (radians) — worse while moving or airborne.

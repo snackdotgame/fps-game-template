@@ -557,8 +557,17 @@ function addPlayer(conn: Connection): void {
 
   const park = parked.get(conn.userId);
   parked.delete(conn.userId);
-  const [a, b] = teamCounts();
-  const team = park?.team ?? (a <= b ? 0 : 1);
+  // Balance HUMANS across teams (bots backfill totals afterwards) — counting
+  // bots here funnels every human onto one side, where half the battlefield
+  // is friendlies their bullets ignore.
+  let humansA = 0;
+  let humansB = 0;
+  for (const q of players.values()) {
+    if (q.bot) continue;
+    if (q.team === 0) humansA++;
+    else humansB++;
+  }
+  const team = park?.team ?? (humansA <= humansB ? 0 : 1);
 
   const spawn = spawnPoint(team, idx);
   const p: Player = {
@@ -799,7 +808,8 @@ function resolveShot(
   pushEvent(EV_TRACER, p.idx, hit.point);
   if (hit.victim) {
     damagePlayer(hit.victim, RIFLE_DAMAGE, p, "rifle");
-    pushEvent(EV_HIT_PLAYER, hit.victim.idx, hit.point);
+    // a packs victim (low nibble) and shooter (high nibble): idx < 16.
+    pushEvent(EV_HIT_PLAYER, (hit.victim.idx & 0xf) | ((p.idx & 0xf) << 4), hit.point);
   } else if (hit.panelBody) {
     const tag = hit.panelBody.userData as { panelId?: number };
     if (tag.panelId !== undefined) {
