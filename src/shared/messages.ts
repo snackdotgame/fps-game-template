@@ -33,13 +33,15 @@ export type ServerMsg =
   | { type: "destroy"; panelIds: number[] }
   | { type: "panelhp"; updates: Array<[number, number]> } // [panelId, hp]
   | { type: "collapse"; buildingId: number }
-  // A piece lost its support and is now tumbling (cosmetic on clients; the
-  // server simulates it). fromId is the static piece that was removed.
-  | { type: "fall"; piece: PanelDef; fromId: number }
-  // A fallen piece came to rest: it re-enters the world as a static,
-  // destructible piece at this pose. Carries the full def so even clients
-  // that missed the fall can materialize it.
-  | { type: "settle"; piece: PanelDef }
+  // A connected cluster of pieces lost its support and is now ONE rigid
+  // chunk tumbling under the server's simulation. pieces carry world-space
+  // poses at the moment of release; origin is the chunk's reference frame,
+  // and live poses stream inside snapshots until the chunk settles.
+  | { type: "fall"; chunkId: number; origin: [number, number, number]; pieces: PanelDef[] }
+  // The chunk came to rest and split back into individual static,
+  // destructible pieces at their final poses. Carries full defs so even
+  // clients that missed the fall can materialize them.
+  | { type: "settle"; chunkId: number; pieces: PanelDef[] }
   | { type: "crater"; crater: Crater }
   | { type: "build"; panel: PanelDef; byIdx: number }
   | { type: "score"; scores: [number, number] }

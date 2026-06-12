@@ -9,6 +9,7 @@
 import { type Connection, server } from "minion:server";
 import {
   BOT_FILL,
+  SANDBOX,
   EXPLOSION_IMPULSE,
   EXPLOSION_MAX_DAMAGE,
   EXPLOSION_MIN_DAMAGE,
@@ -45,6 +46,7 @@ import {
   type PanelDef,
   type PanelMaterial,
   resetCraters,
+  slabOfPiece,
   spawnPoint,
 } from "./shared/map.js";
 import {
@@ -57,6 +59,7 @@ import {
   decodeInputs,
   encodeSnapshot,
   unwrapViewTick,
+  type ChunkSnap,
   type EntitySnap,
   EV_EXPLOSION,
   EV_HIT_PLAYER,
@@ -90,7 +93,9 @@ import {
   joltModule,
   makeChar,
   castWallDistance,
-  createFallingBody,
+  createFallingChunkBody,
+  pieceIdFromHit,
+  rebuildSlabBody,
   PLAYER_HALF_HEIGHT,
   rayVsCapsule,
   readChar,
@@ -187,6 +192,21 @@ const BOT_NAMES = ["Ash", "Brick", "Castle", "Dune", "Echo", "Flint", "Gravel", 
 const scores: [number, number] = [0, 0];
 
 const panelHp = new Map<number, number>(); // damaged panels only
+const pieceAlive = (id: number): boolean => !destroyedPanels.has(id);
+// Slabs whose damage set changed this tick — collision rebuilds are batched.
+const dirtySlabs = new Set<number>();
+
+function markPieceGone(panelId: number): void {
+  if (panelId < BUILT_PANEL_ID_BASE) {
+    const slabIdx = slabOfPiece(panelId);
+    if (slabIdx >= 0) dirtySlabs.add(slabIdx);
+  }
+}
+
+function flushSlabRebuilds(): void {
+  for (const slabIdx of dirtySlabs) rebuildSlabBody(gw, slabIdx, pieceAlive);
+  dirtySlabs.clear();
+}
 const collapsedBuildings = new Set<number>();
 let pendingHpUpdates = new Map<number, number>();
 const destroyedPanels = new Set<number>();
@@ -199,16 +219,18 @@ let nextGrenadeId = 1;
 
 // Pieces released by the support cascade: intact, dynamic, tumbling under
 // the server's sim until they settle and re-freeze as static pieces.
-interface FallingPiece {
+interface FallingChunk {
   id: number;
-  def: PanelDef;
+  origin: [number, number, number];
+  pieces: PanelDef[]; // world-space defs at release time; local = piece - origin
   body: Body;
   calmTicks: number;
   bornTick: number;
 }
 
-const falling = new Map<number, FallingPiece>();
-const FALLING_CAP = 350;
+const falling = new Map<number, FallingChunk>();
+const releasedThisTick: PanelDef[] = [];
+const FALLING_CAP = 24; // concurrent chunks (each may hold dozens of pieces)
 const FALL_TIMEOUT_TICKS = 6 * TICK_RATE;
 
 // Set for the duration of one explosion so released pieces inherit a blast
@@ -264,7 +286,9 @@ async function stepServer(): Promise<void> {
   const t1 = server.elapsedMs();
 
   drainReleases();
+  launchReleasedChunks();
   stepGrenades();
+  flushSlabRebuilds();
   gw.world.step(1 / TICK_RATE);
   stepFalling();
   const t2 = server.elapsedMs();
@@ -330,6 +354,7 @@ function teamCounts(): [number, number] {
 // --- Bots: fill the lobby, leave one-for-one as humans join. -------------------
 
 function syncBots(): void {
+  if (SANDBOX) return;
   let humans = 0;
   let bots = 0;
   for (const p of players.values()) {
@@ -523,8 +548,8 @@ function botThink(p: Player, b: BotBrain): InputCmd {
         [eye[0], eye[1] - 0.5, eye[2]],
         [dir[0] * 1.8, 0, dir[2] * 1.8],
       );
-      const tag = (ahead?.body?.userData ?? {}) as { panelId?: number };
-      if (tag.panelId !== undefined) melee = true;
+      const tag = (ahead?.body?.userData ?? {}) as { panelId?: number; slabIdx?: number };
+      if (tag.panelId !== undefined || tag.slabIdx !== undefined) melee = true;
       else jump = true;
       if (rng() < 0.3) b.repathAtTick = 0; // sometimes just go somewhere else
     }
@@ -884,9 +909,9 @@ function resolveShot(
     // a packs victim (low nibble) and shooter (high nibble): idx < 16.
     pushEvent(EV_HIT_PLAYER, (hit.victim.idx & 0xf) | ((p.idx & 0xf) << 4), hit.point);
   } else if (hit.panelBody) {
-    const tag = hit.panelBody.userData as { panelId?: number };
-    if (tag.panelId !== undefined) {
-      damagePanel(tag.panelId, RIFLE_PANEL_DAMAGE);
+    const pieceId = pieceIdFromHit(hit.panelBody, hit.point, pieceAlive);
+    if (pieceId !== null) {
+      damagePanel(pieceId, RIFLE_PANEL_DAMAGE);
       pushEvent(EV_PANEL_HIT, 0, hit.point);
     }
   }
@@ -902,8 +927,8 @@ function resolveMelee(
   if (hit.victim) {
     damagePlayer(hit.victim, MELEE_DAMAGE, p, "melee");
   } else if (hit.panelBody) {
-    const tag = hit.panelBody.userData as { panelId?: number };
-    if (tag.panelId !== undefined) damagePanel(tag.panelId, MELEE_PANEL_DAMAGE);
+    const pieceId = pieceIdFromHit(hit.panelBody, hit.point, pieceAlive);
+    if (pieceId !== null) damagePanel(pieceId, MELEE_PANEL_DAMAGE);
   }
 }
 
@@ -933,6 +958,7 @@ function damagePlayer(
   attacker: Player,
   weapon: "rifle" | "grenade" | "melee",
 ): void {
+  if (SANDBOX) return;
   if (victim.dead || tick < victim.protectUntilTick || phase !== "playing") return;
   victim.hp -= dmg;
   victim.lastDamageTick = tick;
@@ -1041,29 +1067,26 @@ function recheckSettledNear(x: number, y: number, z: number): void {
   }
 }
 
-// Turn a still-alive static piece into a falling dynamic one. The original
-// id is retired (it counts toward structure integrity — the wall really did
-// lose that piece); the airborne piece lives under a fresh runtime id and
-// re-enters play when it settles.
+// Retire a still-alive static piece into this tick's release batch. The
+// original id counts toward structure integrity (the wall really did lose
+// it); the surviving piece tumbles inside a rigid chunk and re-enters play
+// when the chunk settles. Glass shatters instead of tumbling.
 function releasePiece(panelId: number): void {
   if (destroyedPanels.has(panelId)) return;
   const src = panelById.get(panelId) ?? builtPanels.get(panelId);
   if (!src) return;
-  // Glass doesn't tumble — it shatters.
   if (src.material === "glass" || falling.size >= FALLING_CAP) {
     destroyPanel(panelId, true);
     return;
   }
-  // Retire the static piece (no rubble — the piece itself survives).
   destroyedPanels.add(panelId);
   panelHp.delete(panelId);
   builtPanels.delete(panelId);
   removePanelBody(gw, panelId);
+  markPieceGone(panelId);
   pendingDestroys.push(panelId);
-
-  const id = nextBuiltPanelId++;
-  const def: PanelDef = {
-    id,
+  releasedThisTick.push({
+    id: 0, // assigned when the chunk settles
     x: src.x,
     y: src.y,
     z: src.z,
@@ -1072,58 +1095,134 @@ function releasePiece(panelId: number): void {
     ez: src.ez,
     material: src.material,
     rot: src.rot,
-  };
-  // Blast-released pieces fly outward; cascade-released ones just slump.
-  let vel: [number, number, number] = [(rng() - 0.5) * 0.6, 0.1, (rng() - 0.5) * 0.6];
-  if (blastCtx && blastCtx.tick === tick) {
-    const dx = def.x - blastCtx.x;
-    const dy = def.y - blastCtx.y;
-    const dz = def.z - blastCtx.z;
-    const d = Math.hypot(dx, dy, dz) || 1;
-    const kick = Math.min(9, 14 / (1 + d));
-    vel = [(dx / d) * kick, Math.abs(dy / d) * kick * 0.5 + 2.5, (dz / d) * kick];
-  }
-  falling.set(id, {
-    id,
-    def,
-    body: createFallingBody(gw, id, def, vel),
-    calmTicks: 0,
-    bornTick: tick,
+    seed: src.seed ?? src.id,
   });
-  broadcast({ type: "fall", piece: def, fromId: panelId });
   // The piece left its slot — whatever rested on IT falls next.
   if (panelId < BUILT_PANEL_ID_BASE) cascadeUnsupported(panelId);
 }
 
-// Settle check: a released piece that has stopped moving (or timed out)
-// re-freezes as a static, destructible piece at its resting pose.
+// Group this tick's released pieces into connected clusters (touching
+// AABBs) and launch each as ONE rigid compound body — a wall slab tips over
+// coherently, a tree top topples whole, instead of N bricks rearranging.
+function launchReleasedChunks(): void {
+  const batch = releasedThisTick.splice(0);
+  if (batch.length === 0) return;
+
+  const parent = batch.map((_, i) => i);
+  const find = (i: number): number => {
+    while (parent[i] !== i) {
+      parent[i] = parent[parent[i]];
+      i = parent[i];
+    }
+    return i;
+  };
+  const touching = (a: PanelDef, b: PanelDef): boolean =>
+    Math.abs(a.x - b.x) - (a.ex + b.ex) / 2 < 0.12 &&
+    Math.abs(a.y - b.y) - (a.ey + b.ey) / 2 < 0.12 &&
+    Math.abs(a.z - b.z) - (a.ez + b.ez) / 2 < 0.12;
+  for (let i = 0; i < batch.length; i++) {
+    for (let j = i + 1; j < batch.length; j++) {
+      if (find(i) !== find(j) && touching(batch[i], batch[j])) parent[find(j)] = find(i);
+    }
+  }
+  const clusters = new Map<number, PanelDef[]>();
+  for (let i = 0; i < batch.length; i++) {
+    const root = find(i);
+    const list = clusters.get(root);
+    if (list) list.push(batch[i]);
+    else clusters.set(root, [batch[i]]);
+  }
+
+  for (const pieces of clusters.values()) {
+    const id = nextBuiltPanelId++;
+    let ox = 0;
+    let oy = 0;
+    let oz = 0;
+    for (const p of pieces) {
+      ox += p.x;
+      oy += p.y;
+      oz += p.z;
+    }
+    const origin: [number, number, number] = [
+      ox / pieces.length,
+      oy / pieces.length,
+      oz / pieces.length,
+    ];
+    // Blast-released chunks fly outward (lighter ones farther);
+    // cascade-released ones slump in place.
+    let vel: [number, number, number] = [(rng() - 0.5) * 0.4, 0, (rng() - 0.5) * 0.4];
+    if (blastCtx && blastCtx.tick === tick) {
+      const dx = origin[0] - blastCtx.x;
+      const dy = origin[1] - blastCtx.y;
+      const dz = origin[2] - blastCtx.z;
+      const d = Math.hypot(dx, dy, dz) || 1;
+      const kick = Math.min(7, 11 / (1 + d)) / Math.max(1, Math.sqrt(pieces.length / 4));
+      vel = [(dx / d) * kick, Math.abs(dy / d) * kick * 0.5 + 1.5, (dz / d) * kick];
+    }
+    falling.set(id, {
+      id,
+      origin,
+      pieces,
+      body: createFallingChunkBody(gw, id, origin, pieces, vel),
+      calmTicks: 0,
+      bornTick: tick,
+    });
+    broadcast({ type: "fall", chunkId: id, origin, pieces });
+  }
+}
+
+// Settle check: a chunk that has stopped moving (or timed out) splits back
+// into individual static, destructible pieces at their final poses.
 function stepFalling(): void {
   // Snapshot first: settling mutates the map mid-iteration.
   const active = [...falling.values()];
   for (const f of active) {
     const pos = f.body.translation();
-    if (pos.y < -2) {
-      // Slipped out of the world: quietly gone.
+    if (pos.y < -3) {
       falling.delete(f.id);
       gw.world.removeBody(f.body);
       continue;
     }
     const v = f.body.linearVelocity();
     const w = f.body.angularVelocity();
-    const calm = Math.hypot(v.x, v.y, v.z) < 0.15 && Math.hypot(w.x, w.y, w.z) < 0.35;
+    const calm = Math.hypot(v.x, v.y, v.z) < 0.18 && Math.hypot(w.x, w.y, w.z) < 0.3;
     f.calmTicks = calm ? f.calmTicks + 1 : 0;
     if (f.calmTicks < 8 && tick - f.bornTick < FALL_TIMEOUT_TICKS) continue;
 
     const rot = f.body.rotation();
     falling.delete(f.id);
     gw.world.removeBody(f.body);
-    f.def.x = pos.x;
-    f.def.y = pos.y;
-    f.def.z = pos.z;
-    f.def.rot = [rot.x, rot.y, rot.z, rot.w];
-    addPanelBody(gw, f.def);
-    builtPanels.set(f.id, f.def);
-    broadcast({ type: "settle", piece: f.def });
+    const qx = rot.x;
+    const qy = rot.y;
+    const qz = rot.z;
+    const qw = rot.w;
+    const settled: PanelDef[] = [];
+    for (const p of f.pieces) {
+      const lx = p.x - f.origin[0];
+      const ly = p.y - f.origin[1];
+      const lz = p.z - f.origin[2];
+      // Quaternion-rotate the local offset into the resting frame.
+      const tx = 2 * (qy * lz - qz * ly);
+      const ty = 2 * (qz * lx - qx * lz);
+      const tz = 2 * (qx * ly - qy * lx);
+      const def: PanelDef = {
+        id: nextBuiltPanelId++,
+        x: pos.x + lx + qw * tx + qy * tz - qz * ty,
+        y: pos.y + ly + qw * ty + qz * tx - qx * tz,
+        z: pos.z + lz + qw * tz + qx * ty - qy * tx,
+        ex: p.ex,
+        ey: p.ey,
+        ez: p.ez,
+        material: p.material,
+        rot: [qx, qy, qz, qw],
+        seed: p.seed,
+      };
+      if (def.y < -1) continue;
+      addPanelBody(gw, def);
+      builtPanels.set(def.id, def);
+      settled.push(def);
+    }
+    broadcast({ type: "settle", chunkId: f.id, pieces: settled });
   }
 }
 
@@ -1149,6 +1248,7 @@ function destroyPanel(panelId: number, leaveRubble = true): void {
   panelHp.delete(panelId);
   builtPanels.delete(panelId);
   removePanelBody(gw, panelId);
+  markPieceGone(panelId);
   pendingDestroys.push(panelId);
   if (leaveRubble && src) maybeLeaveRubble(src);
   if (leaveRubble && panelId < BUILT_PANEL_ID_BASE) cascadeUnsupported(panelId);
@@ -1198,6 +1298,7 @@ function maybeLeaveRubble(src: PanelDef): void {
     ey: s,
     ez: s * (1 + rng() * 0.4),
     material: "rubble",
+    seed: src.seed ?? src.id,
   };
   addPanelBody(gw, def);
   builtPanels.set(def.id, def);
@@ -1350,6 +1451,11 @@ function stepLifecycles(): void {
 }
 
 async function stepPhase(): Promise<void> {
+  if (SANDBOX) {
+    // Endless round: the test environment never resets the world.
+    phaseEndTick = tick + ROUND_TICKS;
+    return;
+  }
   if (phase === "playing") {
     if (
       players.size > 0 &&
@@ -1369,7 +1475,9 @@ async function stepPhase(): Promise<void> {
 async function resetRound(): Promise<void> {
   destroyGameWorld(gw);
   falling.clear();
+  releasedThisTick.length = 0;
   releaseQueue.length = 0;
+  dirtySlabs.clear();
   resetCraters();
   gw = await createGameWorld();
   panelHp.clear();
@@ -1431,6 +1539,23 @@ function broadcastSnapshots(): void {
   const all = [...players.values()];
   for (const p of all) readChar(p.body, p.state);
 
+  const chunkSnaps: ChunkSnap[] = [];
+  for (const f of falling.values()) {
+    if (chunkSnaps.length >= 32) break;
+    const pos = f.body.translation();
+    const rot = f.body.rotation();
+    chunkSnaps.push({
+      id: f.id & 0xffff,
+      x: pos.x,
+      y: pos.y,
+      z: pos.z,
+      qx: rot.x,
+      qy: rot.y,
+      qz: rot.z,
+      qw: rot.w,
+    });
+  }
+
   const entities: EntitySnap[] = grenades.map((g) => {
     const pos = g.body.translation();
     const vel = g.body.linearVelocity();
@@ -1475,6 +1600,7 @@ function broadcastSnapshots(): void {
       serverTick: tick,
       phase: phase === "playing" ? 0 : 1,
       phaseEndTick,
+      chunks: chunkSnaps,
       self: {
         ackSeq: p.lastSeq,
         ackTick: p.lastSeqTick,

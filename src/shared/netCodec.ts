@@ -163,6 +163,20 @@ export interface EntitySnap {
   fuseTicks: number;
 }
 
+// A falling compound chunk's live pose — the server streams these every
+// snapshot while the chunk tumbles, so clients render the authoritative
+// motion instead of guessing.
+export interface ChunkSnap {
+  id: number;
+  x: number;
+  y: number;
+  z: number;
+  qx: number;
+  qy: number;
+  qz: number;
+  qw: number;
+}
+
 export interface Snapshot {
   serverTick: number;
   phase: number; // 0 playing, 1 results
@@ -170,6 +184,7 @@ export interface Snapshot {
   self: SelfSnap;
   remotes: RemoteSnap[];
   entities: EntitySnap[];
+  chunks: ChunkSnap[];
   events: GameEvent[];
 }
 
@@ -177,6 +192,7 @@ const SELF_FIXED = 4 + 4 + 1 + 1 + 1 + 2; // ack, tick, status, depth, hp, respa
 const SELF_STATE = 6 * 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1; // pos/vel f64, flags+counters
 const REMOTE_BYTES = 1 + 1 + 3 * 4 + 4 + 2;
 const ENTITY_BYTES = 1 + 6 * 4 + 1;
+const CHUNK_BYTES = 2 + 7 * 4;
 const EVENT_BYTES = 2 + 1 + 1 + 3 * 4;
 
 export function encodeSnapshot(snap: Snapshot): Uint8Array {
@@ -191,6 +207,8 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
     snap.remotes.length * REMOTE_BYTES +
     1 +
     snap.entities.length * ENTITY_BYTES +
+    1 +
+    snap.chunks.length * CHUNK_BYTES +
     1 +
     snap.events.length * EVENT_BYTES;
   const buf = new ArrayBuffer(size);
@@ -255,6 +273,19 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
     dv.setFloat32(o + 21, e.vz);
     dv.setUint8(o + 25, Math.min(255, e.fuseTicks));
     o += ENTITY_BYTES;
+  }
+
+  dv.setUint8(o++, snap.chunks.length);
+  for (const c of snap.chunks) {
+    dv.setUint16(o, c.id & 0xffff);
+    dv.setFloat32(o + 2, c.x);
+    dv.setFloat32(o + 6, c.y);
+    dv.setFloat32(o + 10, c.z);
+    dv.setFloat32(o + 14, c.qx);
+    dv.setFloat32(o + 18, c.qy);
+    dv.setFloat32(o + 22, c.qz);
+    dv.setFloat32(o + 26, c.qw);
+    o += CHUNK_BYTES;
   }
 
   dv.setUint8(o++, snap.events.length);
@@ -346,6 +377,23 @@ export function decodeSnapshot(bytes: Uint8Array): Snapshot | null {
     o += ENTITY_BYTES;
   }
 
+  const chunks: ChunkSnap[] = [];
+  const chunkCount = dv.getUint8(o++);
+  if (bytes.length < o + chunkCount * CHUNK_BYTES + 1) return null;
+  for (let i = 0; i < chunkCount; i++) {
+    chunks.push({
+      id: dv.getUint16(o),
+      x: dv.getFloat32(o + 2),
+      y: dv.getFloat32(o + 6),
+      z: dv.getFloat32(o + 10),
+      qx: dv.getFloat32(o + 14),
+      qy: dv.getFloat32(o + 18),
+      qz: dv.getFloat32(o + 22),
+      qw: dv.getFloat32(o + 26),
+    });
+    o += CHUNK_BYTES;
+  }
+
   const events: GameEvent[] = [];
   const eventCount = dv.getUint8(o++);
   if (bytes.length < o + eventCount * EVENT_BYTES) return null;
@@ -368,6 +416,7 @@ export function decodeSnapshot(bytes: Uint8Array): Snapshot | null {
     self: { ackSeq, ackTick, status, bufferDepth, hp, respawnTicks, state },
     remotes,
     entities,
+    chunks,
     events,
   };
 }

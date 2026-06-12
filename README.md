@@ -29,6 +29,12 @@ grenades blow buildings open — and you can deploy fresh cover of your own.
 - **Terrain destruction**: ground-level explosions dig real craters — the shared
   heightfield drops, chunked Jolt terrain tiles rebuild on both sides, crater bowls
   render scorched, and the grass clears out. Pads and spawns can't be undermined.
+- **One body per structure, not per brick**: a wall/roof/tree is a single
+  static Jolt body whose collision boxes are greedy-merged from its surviving
+  pieces (a pristine 230-brick wall is 3 boxes); hits resolve to the exact
+  brick analytically from the hit position and the known grid, and the slab's
+  shape rebuilds (batched, ~0.4ms worst case) when its damage set changes.
+  ~9,000 destructible pieces ride in ~190 bodies.
 - **Real structural physics**: every piece knows what it rests on. Knock out a
   wall's bottom course and the intact bricks above RELEASE — they become dynamic
   bodies on the server, tumble, and re-freeze wherever they land as repositioned,
@@ -64,6 +70,13 @@ grenades blow buildings open — and you can deploy fresh cover of your own.
 
 Controls: click to lock the mouse, WASD + shift sprint + space jump, LMB fire,
 R reload, G grenade, F sledge, Q build, Tab scores.
+
+## Sandbox
+
+Flip `SANDBOX = true` in `src/shared/constants.ts` (and restart `dev`) for the
+destruction test environment: no bots, no damage, bottomless
+ammo/grenades/cover, and an endless round — iterate on destruction and
+procgen without getting shot.
 
 ## Architecture
 

@@ -10,6 +10,7 @@ import {
   heightAt,
   MAP,
   resetCraters,
+  slabOfPiece,
   spawnPoint,
 } from "../src/shared/map.js";
 import { quantizeAngle, quantizeMove } from "../src/shared/netCodec.js";
@@ -18,6 +19,9 @@ import {
   type Body,
   buildPlacement,
   castWallDistance,
+  mergeSlabBoxes,
+  pieceIdFromHit,
+  rebuildSlabBody,
   rayVsCapsule,
   type CharState,
   createGameWorld,
@@ -29,7 +33,6 @@ import {
   type InputCmd,
   makeChar,
   readChar,
-  removePanelBody,
   type StepHooks,
   stepPlayerController,
   writeChar,
@@ -167,27 +170,63 @@ async function main(): Promise<void> {
     destroyGameWorld(r.gw);
   }
 
-  // --- Breaching: a wall blocks rays until its panel is removed. ---
+  // --- Breaching: a wall blocks rays; destroying the HIT BRICK (resolved
+  // analytically from the hit point) opens a hole exactly there. ---
   {
     const gw = await createGameWorld();
+    const destroyed = new Set<number>();
+    const alive = (id: number): boolean => !destroyed.has(id);
     // The center building's south wall sits at z = -4; shoot it from outside.
     const hit1 = gw.world.castRay([0.2, 0.6, -8], [0, 0, 6]);
-    const tag1 = (hit1?.body?.userData ?? {}) as { panelId?: number };
-    check(
-      "wall blocks the shot",
-      hit1 !== null && tag1.panelId !== undefined,
-      JSON.stringify(tag1),
-    );
-    if (tag1.panelId !== undefined) {
-      removePanelBody(gw, tag1.panelId);
-      const hit2 = gw.world.castRay([0.2, 0.6, -8], [0, 0, 6]);
-      const tag2 = (hit2?.body?.userData ?? {}) as { panelId?: number };
+    const piece1 = hit1?.body
+      ? pieceIdFromHit(hit1.body, [0.2, 0.6, -8 + 6 * hit1.fraction], alive)
+      : null;
+    check("wall blocks the shot and resolves to a brick", piece1 !== null, "");
+    if (piece1 !== null) {
+      const def = MAP.panels[piece1 - 1];
       check(
-        "breached wall lets shots through",
-        hit2 === null || tag2.panelId !== tag1.panelId,
-        JSON.stringify(tag2),
+        "resolved brick contains the hit point",
+        def.material === "brick" && Math.abs(def.x - 0.2) < 0.6 && Math.abs(def.y - 0.6) < 0.3,
+        `${def.material} (${def.x.toFixed(2)},${def.y.toFixed(2)})`,
       );
+      destroyed.add(piece1);
+      rebuildSlabBody(gw, slabOfPiece(piece1), alive);
+      const hit2 = gw.world.castRay([0.2, 0.6, -8], [0, 0, 6]);
+      const piece2 = hit2?.body
+        ? pieceIdFromHit(hit2.body, [0.2, 0.6, -8 + 6 * hit2.fraction], alive)
+        : null;
+      check("breached brick lets shots through", piece2 !== piece1, `p2=${piece2}`);
+      // A shot 0.6m to the side still hits the wall (neighbor bricks stand).
+      const hit3 = gw.world.castRay([0.8, 0.6, -8], [0, 0, 6]);
+      check("neighboring bricks still block", hit3 !== null, "");
     }
+    destroyGameWorld(gw);
+  }
+
+  // --- Slab merge: one body per structure, a handful of boxes per wall. ---
+  {
+    const gw = await createGameWorld();
+    check(
+      "world is ~190 slab bodies, not 9k pieces",
+      gw.slabs.size === MAP.slabs.length && MAP.slabs.length < 220,
+      `slabs=${gw.slabs.size}`,
+    );
+    // A pristine wall face (hundreds of bricks) merges into few boxes.
+    const wallSlabIdx = slabOfPiece(1); // first wall run of the center house
+    const slab = MAP.slabs[wallSlabIdx];
+    const pieces = MAP.panels.slice(slab.first - 1, slab.last);
+    const boxes = mergeSlabBoxes(pieces, () => true);
+    check(
+      "pristine wall merges to a handful of boxes",
+      pieces.length > 100 && boxes.length <= 16,
+      `pieces=${pieces.length} boxes=${boxes.length}`,
+    );
+    // Merged boxes cover exactly the same volume as the pieces.
+    const vol = (b: { x0: number; y0: number; z0: number; x1: number; y1: number; z1: number }) =>
+      (b.x1 - b.x0) * (b.y1 - b.y0) * (b.z1 - b.z0);
+    const pieceVol = pieces.reduce((a, p) => a + p.ex * p.ey * p.ez, 0);
+    const boxVol = boxes.reduce((a, b) => a + vol(b), 0);
+    check("merge preserves volume", Math.abs(pieceVol - boxVol) < 1e-6, `${pieceVol} vs ${boxVol}`);
     destroyGameWorld(gw);
   }
 
@@ -228,11 +267,11 @@ async function main(): Promise<void> {
     check("0.8m off-axis misses", rayVsCapsule(eye, dirMiss, 90, feet) === null, "");
     // Wall occlusion: hop over player bodies, stop at panels.
     const wall = castWallDistance(gw, [0.2, 0.6, -8], [0, 0, 1], 90);
-    const tag = (wall.body?.userData ?? {}) as { panelId?: number };
+    const wallPiece = wall.body ? pieceIdFromHit(wall.body, wall.point, () => true) : null;
     check(
       "wall distance finds the building wall",
-      wall.dist < 6 && tag.panelId !== undefined,
-      `dist=${wall.dist}`,
+      wall.dist < 6 && wallPiece !== null,
+      `dist=${wall.dist} piece=${wallPiece}`,
     );
     destroyGameWorld(gw);
   }
@@ -465,13 +504,20 @@ async function main(): Promise<void> {
     const gw = await createGameWorld();
     // The center building's windows: doorSide 0 means walls 1,2,3 are glazed.
     const pane = glass.find((p) => p.buildingId === 0 && p.z < 0)!;
+    const destroyed = new Set<number>();
+    const alive = (id: number): boolean => !destroyed.has(id);
     const hit = gw.world.castRay([pane.x, pane.y, pane.z - 2], [0, 0, 2.5]);
-    const tag = (hit?.body?.userData ?? {}) as { panelId?: number };
-    check("glass blocks shots until shattered", tag.panelId === pane.id, JSON.stringify(tag));
-    removePanelBody(gw, pane.id);
+    const hitId = hit?.body
+      ? pieceIdFromHit(hit.body, [pane.x, pane.y, pane.z - 2 + 2.5 * hit.fraction], alive)
+      : null;
+    check("glass blocks shots until shattered", hitId === pane.id, `hit=${hitId}`);
+    destroyed.add(pane.id);
+    rebuildSlabBody(gw, slabOfPiece(pane.id), alive);
     const hit2 = gw.world.castRay([pane.x, pane.y, pane.z - 2], [0, 0, 2.5]);
-    const tag2 = (hit2?.body?.userData ?? {}) as { panelId?: number };
-    check("shattered pane lets shots through", tag2.panelId !== pane.id, "");
+    const hitId2 = hit2?.body
+      ? pieceIdFromHit(hit2.body, [pane.x, pane.y, pane.z - 2 + 2.5 * hit2.fraction], alive)
+      : null;
+    check("shattered pane lets shots through", hitId2 !== pane.id, "");
     destroyGameWorld(gw);
   }
 
