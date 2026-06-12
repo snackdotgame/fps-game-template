@@ -5,8 +5,8 @@
 import { client } from "minion:client";
 import * as THREE from "three";
 import { INPUT_REDUNDANCY, MAX_HP, TEAM_NAMES, TICK_MS, TICK_RATE } from "./shared/constants.js";
-import { MAP, type PanelDef, panelExtents, terrainMesh } from "./shared/map.js";
-import { PANEL_HP, RUBBLE_HEIGHT } from "./shared/constants.js";
+import { MAP, PANEL_HP, type PanelDef, type PanelMaterial, terrainMesh } from "./shared/map.js";
+import { RUBBLE_HEIGHT } from "./shared/constants.js";
 import { parseServerMsg, type PlayerInfo } from "./shared/messages.js";
 import {
   decodeSnapshot,
@@ -57,6 +57,8 @@ const TEAM_COLORS_CSS = ["#e8743a", "#3a7be8"];
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(1.5, window.devicePixelRatio));
 renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.style.cssText = "margin:0;overflow:hidden;background:#0c0f14;";
@@ -93,60 +95,127 @@ window.addEventListener("resize", () => {
 // ---------------------------------------------------------------------------
 // Map visuals.
 
+// CC0 PBR textures from ambientCG — see assets/textures/CREDITS.txt.
+const texLoader = new THREE.TextureLoader();
+
+function tex(file: string, srgb: boolean, rx: number, ry: number): THREE.Texture {
+  const t = texLoader.load(`/assets/textures/${file}`);
+  t.wrapS = THREE.RepeatWrapping;
+  t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(rx, ry);
+  t.anisotropy = 4;
+  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+
+function surface(
+  name: string,
+  opts: { rx?: number; ry?: number; color?: number; rough?: number } = {},
+): THREE.MeshStandardMaterial {
+  const rx = opts.rx ?? 1;
+  const ry = opts.ry ?? 1;
+  return new THREE.MeshStandardMaterial({
+    map: tex(`${name}_color.jpg`, true, rx, ry),
+    normalMap: tex(`${name}_normal.jpg`, false, rx, ry),
+    color: opts.color ?? 0xffffff,
+    roughness: opts.rough ?? 0.95,
+    metalness: 0,
+  });
+}
+
 const MAT = {
-  wall: new THREE.MeshLambertMaterial({ color: 0x9b958a }),
-  crate: new THREE.MeshLambertMaterial({ color: 0x8a6f4d }),
-  panel: new THREE.MeshLambertMaterial({ color: 0xb9b2a6 }),
-  panelRoof: new THREE.MeshLambertMaterial({ color: 0xa39a8a }),
-  built: new THREE.MeshLambertMaterial({ color: 0x7d8a96 }),
-  trunk: new THREE.MeshLambertMaterial({ color: 0x6e4f30 }),
-  canopy: new THREE.MeshLambertMaterial({ color: 0x4d7a3a }),
-  debris: new THREE.MeshLambertMaterial({ color: 0xa59c8e }),
+  wall: new THREE.MeshStandardMaterial({ color: 0x9b958a, roughness: 1 }),
+  rubble: new THREE.MeshStandardMaterial({ color: 0x6e6a62, roughness: 1 }),
 };
 
-function panelMaterial(p: PanelDef): THREE.MeshLambertMaterial {
-  switch (p.orient) {
-    case "flat":
-      return MAT.panelRoof;
-    case "bx":
-    case "bz":
-      return MAT.built;
-    case "trunk":
-      return MAT.trunk;
-    case "canopy":
-      return MAT.canopy;
-    default:
-      return MAT.panel;
-  }
-}
+// Unit geometries, scaled per instance to each piece's extents: boxes for
+// masonry, cylinders for logs and trunks, irregular blobs for foliage.
+const GEO = {
+  box: new THREE.BoxGeometry(1, 1, 1),
+  cyl: new THREE.CylinderGeometry(0.5, 0.5, 1, 9),
+  blob: new THREE.IcosahedronGeometry(0.55, 1),
+};
 
-// One shared BoxGeometry per orientation — a thousand panels, seven geometries.
-const panelGeos = new Map<string, THREE.BoxGeometry>();
+const barkMat = surface("bark", { rx: 2, ry: 1 });
 
-function panelGeometry(orient: PanelDef["orient"]): THREE.BoxGeometry {
-  let geo = panelGeos.get(orient);
-  if (!geo) {
-    const [w, h, d] = panelExtents(orient);
-    geo = new THREE.BoxGeometry(w, h, d);
-    panelGeos.set(orient, geo);
-  }
-  return geo;
-}
+// How each piece material renders: shape + textured surface + debris color.
+const PIECE_STYLE: Record<
+  PanelMaterial,
+  { geo: THREE.BufferGeometry; mat: THREE.Material; debris: number }
+> = {
+  brick: { geo: GEO.box, mat: surface("brick", { rx: 0.5, ry: 0.22 }), debris: 0xa66045 },
+  log: { geo: GEO.cyl, mat: barkMat, debris: 0x6e5439 },
+  plank: { geo: GEO.box, mat: surface("planks", { rx: 1, ry: 0.5 }), debris: 0x9a7a52 },
+  post: {
+    geo: GEO.box,
+    mat: surface("planks", { rx: 0.3, ry: 1, color: 0x8a7458 }),
+    debris: 0x6e5439,
+  },
+  trunk: { geo: GEO.cyl, mat: barkMat, debris: 0x6e5439 },
+  canopy: { geo: GEO.blob, mat: surface("moss", { color: 0x9fc27c }), debris: 0x4d7a3a },
+  crate: {
+    geo: GEO.box,
+    mat: surface("planks", { rx: 0.55, ry: 0.55, color: 0xc9a877 }),
+    debris: 0x9a7a52,
+  },
+  sandbag: {
+    geo: GEO.box,
+    mat: surface("fabric", { rx: 0.6, ry: 0.4, color: 0xa89a76 }),
+    debris: 0x9a8f72,
+  },
+  metal: { geo: GEO.box, mat: surface("steel", { rx: 1, ry: 0.7 }), debris: 0x8a949e },
+};
 
 let mapGroup = new THREE.Group();
 scene.add(mapGroup);
-const panelMeshes = new Map<number, THREE.Mesh>();
 
-function panelMesh(p: PanelDef): THREE.Mesh {
-  const mesh = new THREE.Mesh(panelGeometry(p.orient), panelMaterial(p));
-  mesh.position.set(p.x, p.y, p.z);
-  mesh.castShadow = true;
-  mesh.receiveShadow = true;
-  return mesh;
+// Static map pieces live in one InstancedMesh pool per material (3k pieces,
+// ~8 draw calls); deployed cover is added at runtime as individual meshes.
+interface PieceSlot {
+  mesh: THREE.InstancedMesh;
+  index: number;
+  shade: number;
+}
+const panelSlots = new Map<number, PieceSlot>();
+const builtMeshes = new Map<number, THREE.Mesh>();
+const panelDefs = new Map<number, PanelDef>(); // map + built, for tint/debris
+
+const _m4 = new THREE.Matrix4();
+const _q = new THREE.Quaternion();
+const _pos = new THREE.Vector3();
+const _scl = new THREE.Vector3();
+const _col = new THREE.Color();
+const X_AXIS = new THREE.Vector3(1, 0, 0);
+const Y_AXIS = new THREE.Vector3(0, 1, 0);
+const Z_AXIS = new THREE.Vector3(0, 0, 1);
+const ZERO_SCALE = new THREE.Matrix4().makeScale(0, 0, 0);
+
+// Logs lie on their side (cylinder axis along the wall), trunks stand up,
+// canopy clumps get a per-piece twist so the blobs don't read as tiled.
+function pieceMatrix(def: PanelDef): THREE.Matrix4 {
+  _pos.set(def.x, def.y, def.z);
+  if (def.material === "log" && def.ex >= def.ez) {
+    _q.setFromAxisAngle(Z_AXIS, Math.PI / 2);
+    _scl.set(def.ey, def.ex, def.ez);
+  } else if (def.material === "log") {
+    _q.setFromAxisAngle(X_AXIS, Math.PI / 2);
+    _scl.set(def.ex, def.ez, def.ey);
+  } else {
+    if (def.material === "canopy") _q.setFromAxisAngle(Y_AXIS, (def.id % 7) * 0.9);
+    else _q.identity();
+    _scl.set(def.ex, def.ey, def.ez);
+  }
+  return _m4.compose(_pos, _q, _scl);
 }
 
-// Terrain rendered from the same heightfield the physics mesh uses, with a
-// subtle two-tone grass blend by elevation.
+// Deterministic per-piece brightness jitter: identical bricks sharing one
+// texture would otherwise read as a flat sheet.
+function shadeFor(id: number): number {
+  return 0.86 + (((Math.imul(id, 2654435761) >>> 16) % 100) / 100) * 0.26;
+}
+
+// Terrain rendered from the same heightfield the physics mesh uses; grass
+// texture with a vertex-color elevation blend on top.
 function makeTerrainMesh(): THREE.Mesh {
   const data = terrainMesh();
   const geo = new THREE.BufferGeometry();
@@ -154,61 +223,98 @@ function makeTerrainMesh(): THREE.Mesh {
   geo.setIndex(data.indices);
   geo.computeVertexNormals();
   const colors: number[] = [];
-  const low = new THREE.Color(0x86996a);
-  const high = new THREE.Color(0x9aa66f);
+  const uvs: number[] = [];
+  const low = new THREE.Color(0.74, 0.82, 0.66);
+  const high = new THREE.Color(1.04, 1.04, 0.94);
   for (let i = 0; i < data.vertices.length; i += 3) {
     const t = Math.min(1, data.vertices[i + 1] / 1.1);
     const c = low.clone().lerp(high, t);
     colors.push(c.r, c.g, c.b);
+    uvs.push(data.vertices[i] / 2.5, data.vertices[i + 2] / 2.5);
   }
   geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
-  const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
+  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  const mat = surface("grass", { rough: 1 });
+  mat.vertexColors = true;
+  const mesh = new THREE.Mesh(geo, mat);
   mesh.receiveShadow = true;
   return mesh;
 }
 
 function buildMapVisuals(): void {
   scene.remove(mapGroup);
+  mapGroup.traverse((o) => {
+    if (o instanceof THREE.InstancedMesh) o.dispose();
+  });
   mapGroup = new THREE.Group();
   scene.add(mapGroup);
-  panelMeshes.clear();
+  panelSlots.clear();
+  builtMeshes.clear();
+  panelDefs.clear();
 
   mapGroup.add(makeTerrainMesh());
   for (const s of MAP.statics) {
-    const mat = s.kind === "crate" ? MAT.crate : MAT.wall;
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.w, s.h, s.d), mat);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.w, s.h, s.d), MAT.wall);
     mesh.position.set(s.x, s.y, s.z);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     mapGroup.add(mesh);
   }
+
+  const byMat = new Map<PanelMaterial, PanelDef[]>();
   for (const p of MAP.panels) {
-    const mesh = panelMesh(p);
+    panelDefs.set(p.id, p);
+    const list = byMat.get(p.material);
+    if (list) list.push(p);
+    else byMat.set(p.material, [p]);
+  }
+  for (const [material, defs] of byMat) {
+    const style = PIECE_STYLE[material];
+    const mesh = new THREE.InstancedMesh(style.geo, style.mat, defs.length);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    for (let i = 0; i < defs.length; i++) {
+      const shade = shadeFor(defs[i].id);
+      mesh.setMatrixAt(i, pieceMatrix(defs[i]));
+      mesh.setColorAt(i, _col.setScalar(shade));
+      panelSlots.set(defs[i].id, { mesh, index: i, shade });
+    }
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mapGroup.add(mesh);
-    panelMeshes.set(p.id, mesh);
   }
 }
 
 function addBuiltPanelVisual(p: PanelDef): void {
-  const mesh = panelMesh(p);
+  const mesh = new THREE.Mesh(GEO.box, PIECE_STYLE.metal.mat);
+  mesh.scale.set(p.ex, p.ey, p.ez);
+  mesh.position.set(p.x, p.y, p.z);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
   mapGroup.add(mesh);
-  panelMeshes.set(p.id, mesh);
+  builtMeshes.set(p.id, mesh);
+  panelDefs.set(p.id, p);
 }
 
-const RUBBLE_MAT = new THREE.MeshLambertMaterial({ color: 0x6e6a62 });
+const RUBBLE_MAT = MAT.rubble;
 
 function tintPanelDamage(id: number, hp: number): void {
-  const mesh = panelMeshes.get(id);
+  const def = panelDefs.get(id);
+  if (!def) return;
+  const damage = 1 - Math.max(0, Math.min(1, hp / PANEL_HP[def.material]));
+  const slot = panelSlots.get(id);
+  if (slot) {
+    slot.mesh.setColorAt(slot.index, _col.setScalar(slot.shade * (1 - damage * 0.6)));
+    if (slot.mesh.instanceColor) slot.mesh.instanceColor.needsUpdate = true;
+    return;
+  }
+  const mesh = builtMeshes.get(id);
   if (!mesh) return;
   if (!mesh.userData.ownMat) {
-    mesh.material = (mesh.material as THREE.MeshLambertMaterial).clone();
+    mesh.material = (mesh.material as THREE.MeshStandardMaterial).clone();
     mesh.userData.ownMat = true;
-    mesh.userData.baseColor = (mesh.material as THREE.MeshLambertMaterial).color.getHex();
   }
-  const mat = mesh.material as THREE.MeshLambertMaterial;
-  const damage = 1 - Math.max(0, Math.min(1, hp / PANEL_HP));
-  mat.color.setHex(mesh.userData.baseColor as number);
-  mat.color.multiplyScalar(1 - damage * 0.55); // chip toward charcoal
+  (mesh.material as THREE.MeshStandardMaterial).color.setScalar(1 - damage * 0.6);
 }
 
 function addRubbleVisual(buildingId: number): void {
@@ -261,11 +367,22 @@ function collapseFx(buildingId: number): void {
 }
 
 function removePanelVisual(id: number, withDebris: boolean): void {
-  const mesh = panelMeshes.get(id);
-  if (!mesh) return;
-  if (withDebris) spawnDebris(mesh.position, 4);
-  mapGroup.remove(mesh);
-  panelMeshes.delete(id); // geometry is shared per-orient — never disposed
+  const def = panelDefs.get(id);
+  const slot = panelSlots.get(id);
+  if (slot) {
+    slot.mesh.setMatrixAt(slot.index, ZERO_SCALE);
+    slot.mesh.instanceMatrix.needsUpdate = true;
+    panelSlots.delete(id);
+  } else {
+    const mesh = builtMeshes.get(id);
+    if (!mesh) return;
+    mapGroup.remove(mesh);
+    builtMeshes.delete(id);
+  }
+  panelDefs.delete(id);
+  if (withDebris && def) {
+    spawnDebris(_pos.set(def.x, def.y, def.z), 3, PIECE_STYLE[def.material].debris);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -732,11 +849,13 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       break;
     }
     case "destroy": {
+      // Collapses destroy hundreds of pieces at once — cap the debris shower.
+      let debrisLeft = 50;
       for (const id of msg.panelIds) {
         destroyedSet.add(id);
         builtList = builtList.filter((p) => p.id !== id);
         if (gw) removePanelBody(gw, id);
-        removePanelVisual(id, true);
+        removePanelVisual(id, debrisLeft-- > 0);
       }
       break;
     }
@@ -1272,10 +1391,22 @@ function spawnExplosion(at: THREE.Vector3): void {
   }
 }
 
-function spawnDebris(at: THREE.Vector3, count: number): void {
+const debrisMats = new Map<number, THREE.MeshLambertMaterial>();
+
+function debrisMat(color: number): THREE.MeshLambertMaterial {
+  let m = debrisMats.get(color);
+  if (!m) {
+    m = new THREE.MeshLambertMaterial({ color });
+    debrisMats.set(color, m);
+  }
+  return m;
+}
+
+function spawnDebris(at: THREE.Vector3, count: number, color = 0xa59c8e): void {
   for (let i = 0; i < count; i++) {
     const s = 0.1 + Math.random() * 0.2;
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(s, s, s), MAT.debris);
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(s, s, s), debrisMat(color));
+    mesh.userData.sharedMat = true;
     mesh.position.set(
       at.x + (Math.random() - 0.5) * 0.8,
       at.y + (Math.random() - 0.5) * 0.8,
@@ -1314,7 +1445,7 @@ function stepEffects(dt: number): void {
       scene.remove(e.obj);
       if (
         e.obj instanceof THREE.Mesh &&
-        e.obj.material !== MAT.debris &&
+        !e.obj.userData.sharedMat &&
         e.obj.material !== tracerMat
       ) {
         e.obj.geometry.dispose();
@@ -1492,8 +1623,7 @@ function frame(): void {
   // Build preview while holding Q-able state (always shown when alive + supply).
   if (predState && (selfStatus & SS_DEAD) === 0 && keys.has("KeyQ") && predState.supply > 0) {
     const placement = buildPlacement(predState, yaw);
-    const [w, h, d] = panelExtents(placement.orient);
-    buildPreview.scale.set(w, h, d);
+    buildPreview.scale.set(placement.ex, placement.ey, placement.ez);
     buildPreview.position.set(placement.x, placement.y, placement.z);
     buildPreview.visible = true;
   } else {
@@ -1721,7 +1851,7 @@ window.__fps = {
   seq: () => seq,
   selfStatus: () => selfStatus,
   ammo: () => (predState ? predState.ammo : 0),
-  panelCount: () => panelMeshes.size,
+  panelCount: () => panelSlots.size + builtMeshes.size,
   myHits: () => myHits,
   // What the mirror world says is under the crosshair (panel id, or null).
   aimPanel: () => {

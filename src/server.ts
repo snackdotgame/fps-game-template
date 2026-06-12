@@ -20,7 +20,6 @@ import {
   MELEE_DAMAGE,
   MELEE_PANEL_DAMAGE,
   MELEE_RANGE,
-  PANEL_HP,
   PROTECT_TICKS,
   REGEN_DELAY_TICKS,
   REGEN_PER_TICK,
@@ -34,7 +33,7 @@ import {
   TICK_MS,
   TICK_RATE,
 } from "./shared/constants.js";
-import { BUILT_PANEL_ID_BASE, MAP, type PanelDef, spawnPoint } from "./shared/map.js";
+import { BUILT_PANEL_ID_BASE, MAP, PANEL_HP, type PanelDef, spawnPoint } from "./shared/map.js";
 import {
   EXPLOSION_PANEL_OUTER_DAMAGE,
   EXPLOSION_PANEL_OUTER_RADIUS,
@@ -880,17 +879,22 @@ function damagePlayer(
   }
 }
 
+const panelById = new Map(MAP.panels.map((p) => [p.id, p]));
+
+function panelMaxHp(panelId: number): number {
+  const def = panelById.get(panelId) ?? builtPanels.get(panelId);
+  return def ? PANEL_HP[def.material] : PANEL_HP.metal;
+}
+
 function damagePanel(panelId: number, dmg: number): void {
   if (destroyedPanels.has(panelId)) return;
-  const hp = (panelHp.get(panelId) ?? PANEL_HP) - dmg;
+  const hp = (panelHp.get(panelId) ?? panelMaxHp(panelId)) - dmg;
   if (hp <= 0) destroyPanel(panelId);
   else {
     panelHp.set(panelId, hp);
     pendingHpUpdates.set(panelId, hp); // batched per tick for damage tinting
   }
 }
-
-const panelById = new Map(MAP.panels.map((p) => [p.id, p]));
 
 function destroyPanel(panelId: number): void {
   if (destroyedPanels.has(panelId)) return;

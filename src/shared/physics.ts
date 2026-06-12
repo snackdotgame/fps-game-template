@@ -26,14 +26,7 @@ import {
   RIFLE_MAG,
   TICK_RATE,
 } from "./constants.js";
-import {
-  type BuildingDef,
-  MAP,
-  type PanelDef,
-  type PanelOrient,
-  panelExtents,
-  terrainMesh,
-} from "./map.js";
+import { type BuildingDef, MAP, type PanelDef, terrainMesh } from "./map.js";
 
 export type { Body } from "jolt-ts";
 
@@ -213,10 +206,9 @@ export function destroyGameWorld(gw: GameWorld): void {
 }
 
 export function addPanelBody(gw: GameWorld, p: PanelDef): Body {
-  const [w, h, d] = panelExtents(p.orient);
   const body = gw.world.createBody({
     type: "static",
-    shape: Shape.box({ halfExtents: [w / 2, h / 2, d / 2] }),
+    shape: Shape.box({ halfExtents: [p.ex / 2, p.ey / 2, p.ez / 2] }),
     position: [p.x, p.y, p.z],
     layer: "static",
     friction: 0.6,
@@ -345,13 +337,16 @@ export function buildPlacement(s: CharState, yaw: number): PanelDef {
   const px = s.x + dx * BUILD_RANGE;
   const pz = s.z + dz * BUILD_RANGE;
   // Face the player: wall axis perpendicular to view.
-  const orient: PanelOrient = Math.abs(dx) > Math.abs(dz) ? "bz" : "bx";
+  const alongX = Math.abs(dx) <= Math.abs(dz);
   return {
     id: 0, // assigned by the server
     x: Math.round(px * 2) / 2,
     y: s.y + 1.25 / 2,
     z: Math.round(pz * 2) / 2,
-    orient,
+    ex: alongX ? 2 : 0.22,
+    ey: 1.25,
+    ez: alongX ? 0.22 : 2,
+    material: "metal",
   };
 }
 

@@ -12,10 +12,15 @@ grenades blow buildings open — and you can deploy fresh cover of your own.
 - **Team deathmatch**, two teams, auto-balanced. First to 40 kills or best score after
   5 minutes; short results screen, then the map fully restores and a new round starts.
 - **Buildings collapse** (BattleBit's critical-health 'levolution'): every structure
-  tracks integrity — buildings fall at 40% wall loss, trees fall when the trunk
+  tracks integrity — buildings fall at 35% structural loss, trees fall when the trunk
   breaks — and a collapse drops everything left standing with dust, debris, ground
-  shake, and a rubble mound that becomes new cover. Panels darken as they're chipped,
-  and explosions delete panels up close while cracking them in an outer falloff ring.
+  shake, and a rubble mound that becomes new cover. Pieces darken as they're chipped,
+  and explosions delete pieces up close while cracking them in an outer falloff ring.
+- **Everything is destructible, piece by material-shaped piece**: brick walls are
+  individual clay bricks in running bond (gunfire knocks out single bricks), cabins
+  are stacked logs, roofs are planks, trees are trunk segments and foliage clumps,
+  and sandbags, crates, and corner posts all break too. Only the ground and the
+  arena's perimeter can't be destroyed.
 - **Uneven terrain**: rolling noise-generated ground (one shared height function drives
   both Jolt collision and the rendered mesh), with ridgelines as natural cover and
   buildings on flat pads.
@@ -23,7 +28,8 @@ grenades blow buildings open — and you can deploy fresh cover of your own.
   moving or airborne. R reloads (auto on empty).
 - **Grenades (G)** — real physics projectiles (they bounce); the blast damages players
   with falloff, shoves everyone nearby, and deletes every wall panel in the radius.
-- **Sledgehammer (F)** — two swings open a wall; also a melee weapon.
+- **Sledgehammer (F)** — one swing knocks a brick out of a wall, two fell a tree;
+  also a melee weapon.
 - **Build (Q)** — deploy a cover panel where you're looking (6 per life, with a ghost
   preview). Deployed cover is destructible like everything else.
 - Health regen after 6s, 3s respawns with brief spawn protection, kill feed, Tab
@@ -50,10 +56,14 @@ breached geometry the server does.
 - `src/shared/map.ts` — a **procedurally generated battlefield** from a fixed seed
   (change `MAP_SEED` for a new layout): value-noise terrain with real relief
   (flattened under buildings and spawns, identical Jolt mesh collision and rendered
-  geometry from one height function), five buildings made of ~950 fine-grained panels
-  (1m x 0.625m — holes where you actually shoot), procedurally placed cover walls and
-  crates, and **destructible trees** — two sledge swings or any blast to the trunk
-  fells the whole tree. Deployed cover becomes a panel at runtime.
+  geometry from one height function), and **~3,100 material-shaped destructible
+  pieces**: three brick houses laid brick-by-brick in running bond (with cut bricks
+  around the door and window openings), two log cabins of stacked 2m logs, plank
+  roofs, timber corner posts, sandbag emplacements, supply crates, and
+  **destructible trees** (four trunk segments + foliage clumps — two sledge swings
+  or a blast to the trunk fells the whole tree). Per-material HP: a brick dies to
+  one sledge swing, a log takes two, posts are tough. Deployed cover becomes a
+  steel piece at runtime.
 - `src/shared/physics.ts` — world construction and the deterministic FPS controller:
   walk/sprint/jump movement, plus the **deterministic weapon state machine** (ammo,
   cooldowns, reload, grenade/supply counts) that runs identically in prediction and on
@@ -63,9 +73,13 @@ breached geometry the server does.
 - `src/server.ts` — hitscan raycasts (Jolt `castRay` with view angles carried in every
   input), panel HP, explosion AoE (players, panels, other grenades), kill/score/respawn
   flow, and round resets that rebuild the world.
-- `src/client.ts` — first-person rendering (primitive-built map and soldiers, no asset
-  downloads at all), the prediction mirror world, view-model rifle with recoil, tracers,
-  explosion debris, build preview, HUD, and synthesized sounds.
+- `src/client.ts` — first-person rendering: the ~3,100 pieces draw as one
+  `InstancedMesh` pool per material (≈8 draw calls for the whole battlefield) with
+  per-instance brightness jitter and damage tinting, surfaced with **CC0 PBR
+  textures from [ambientCG](https://ambientcg.com)** (brick, bark, planks, grass,
+  moss, fabric, corrugated steel — see `assets/textures/CREDITS.txt`), ACES tone
+  mapping, prediction mirror world, view-model rifle with recoil, tracers, explosion
+  debris, build preview, HUD, and synthesized sounds.
 
 ### Netcode
 
