@@ -229,6 +229,7 @@ hud.innerHTML = `
   #hud { position:fixed; inset:0; pointer-events:none; font-family:"Trebuchet MS",system-ui,sans-serif; color:#fff; user-select:none; }
   .sh { text-shadow: 0 1px 2px rgba(0,0,0,.7); }
   #cross { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); font-size:22px; opacity:.9; }
+  #crossname { position:absolute; left:50%; top:54%; transform:translateX(-50%); font-size:14px; font-weight:800; opacity:0; }
   #hitmark { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%) rotate(45deg); font-size:26px; color:#ff5a4a; opacity:0; font-weight:900; }
   #scores { position:absolute; top:12px; left:50%; transform:translateX(-50%); font-size:22px; font-weight:900; background:rgba(10,14,22,.55); padding:6px 18px; border-radius:10px; }
   #timer { position:absolute; top:48px; left:50%; transform:translateX(-50%); font-size:14px; font-weight:700; opacity:.85; }
@@ -256,6 +257,7 @@ hud.innerHTML = `
   <div id="vignette"></div>
   <div id="flash"></div>
   <div id="cross" class="sh">+</div>
+  <div id="crossname" class="sh"></div>
   <div id="hitmark">+</div>
   <div id="scores" class="sh"></div>
   <div id="timer" class="sh"></div>
@@ -270,6 +272,7 @@ hud.innerHTML = `
 document.body.appendChild(hud);
 const el = {
   cross: document.getElementById("cross")!,
+  crossname: document.getElementById("crossname")!,
   hitmark: document.getElementById("hitmark")!,
   scores: document.getElementById("scores")!,
   timer: document.getElementById("timer")!,
@@ -490,7 +493,7 @@ let welcomeHp: Array<[number, number]> = [];
 let collapsedCount = 0;
 
 // Input-rate servo (see snack-dash): hold the server buffer at a small depth.
-const TARGET_DEPTH = 3;
+const TARGET_DEPTH = 2;
 let depthEma = TARGET_DEPTH;
 let serverTickRefTick = 0;
 let serverTickRefAtMs = 0;
@@ -500,8 +503,10 @@ let serverTickRefAtMs = 0;
 // delay is sized from MEASURED inter-arrival gaps (jitter + loss), not ping:
 // worst observed gap in the window plus one tick of slack, smoothly adjusted.
 const INTERP_MIN_MS = 2 * TICK_MS;
-const INTERP_MAX_MS = 250;
-let interpDelayMs = 4 * TICK_MS;
+// Must fit UNDER the server's 120ms lag-comp rewind cap with room for
+// transit: a jitter buffer the server won't rewind for converts into misses.
+const INTERP_MAX_MS = 3 * TICK_MS;
+let interpDelayMs = 3 * TICK_MS;
 let lastArrivalMs = 0;
 let gapWindowMax = 0;
 let gapWindowStart = 0;
@@ -1296,7 +1301,6 @@ function stepEffects(dt: number): void {
 
 // --- Transient event processing (from the snapshot ring). ---
 
-let lastSelfTracerSeq = -1;
 let myHits = 0;
 let dbgMyTracers = 0;
 let dbgHitEvents = 0;
@@ -1314,9 +1318,7 @@ function processEvents(list: GameEvent[]): void {
         if (e.a !== selfIdx) {
           const from = eyeOf(e.a);
           if (from) spawnTracer(from, at);
-        }
-        if (e.a === selfIdx) {
-          lastSelfTracerSeq = e.seq;
+        } else {
           dbgMyTracers++;
         }
         if (e.a !== selfIdx && predState) {
@@ -1327,18 +1329,16 @@ function processEvents(list: GameEvent[]): void {
       }
       case EV_HIT_PLAYER: {
         dbgHitEvents++;
+        const victim = e.a & 0xf;
+        const shooter = (e.a >> 4) & 0xf;
         spawnSpark(at, 0xff4a3a);
-        flashRemote(e.a); // the victim visibly flinches red
-        if (e.a === selfIdx) {
+        flashRemote(victim); // the victim visibly flinches red
+        if (victim === selfIdx) {
           el.vignette.style.opacity = "1";
           setTimeout(() => (el.vignette.style.opacity = "0"), 180);
           sounds.hurt();
-        } else if (
-          lastSelfTracerSeq >= 0 &&
-          (e.seq - lastSelfTracerSeq + 0x10000) % 0x10000 === 1
-        ) {
-          // Our tracer's companion hit event: confirmed hit. Make it LOUD —
-          // weak hit feedback reads as "my shots do nothing".
+        } else if (shooter === selfIdx) {
+          // Our hit, attributed directly by the server — no heuristics.
           myHits++;
           el.hitmark.style.opacity = "1";
           el.hitmark.style.transform = "translate(-50%,-50%) rotate(45deg) scale(1.6)";
@@ -1506,6 +1506,7 @@ function frame(): void {
     }
   }
 
+  updateCrosshairTarget();
   stepEffects(dt);
   updateHud();
   const tr0 = performance.now();
@@ -1524,6 +1525,33 @@ function shortestArc(a: number, b: number): number {
   while (d > Math.PI) d -= Math.PI * 2;
   while (d < -Math.PI) d += Math.PI * 2;
   return d;
+}
+
+// Friend-or-foe under the crosshair: orange/blue crosshair + name, so
+// shooting a teammate never reads as broken hit detection.
+let crossTargetIdx = -1;
+
+function updateCrosshairTarget(): void {
+  if (!predState || !gw || !selfBody) return;
+  const dir = [Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
+  const eye = [predState.x, predState.y + EYE_HEIGHT, predState.z];
+  const hit = castLocal(eye, dir, 60);
+  const tag = (hit?.body.userData ?? {}) as { playerIdx?: number };
+  const idx = tag.playerIdx !== undefined && tag.playerIdx >= 1000 ? tag.playerIdx - 1000 : -1;
+  if (idx === crossTargetIdx) return;
+  crossTargetIdx = idx;
+  const info = idx >= 0 ? roster.get(idx) : undefined;
+  if (info) {
+    const friendly = info.team === (roster.get(selfIdx)?.team ?? -1);
+    const color = friendly ? TEAM_COLORS_CSS[info.team] : "#ff5a4a";
+    el.cross.style.color = color;
+    el.crossname.style.color = TEAM_COLORS_CSS[info.team];
+    el.crossname.textContent = `${info.name}${friendly ? " (friendly)" : ""}`;
+    el.crossname.style.opacity = "1";
+  } else {
+    el.cross.style.color = "#fff";
+    el.crossname.style.opacity = "0";
+  }
 }
 
 // --- HUD updates.
