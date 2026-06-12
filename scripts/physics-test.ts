@@ -207,8 +207,8 @@ async function main(): Promise<void> {
   {
     const gw = await createGameWorld();
     check(
-      "world is ~190 slab bodies, not 9k pieces",
-      gw.slabs.size === MAP.slabs.length && MAP.slabs.length < 220,
+      "world is a few hundred slab bodies, not 9k pieces",
+      gw.slabs.size === MAP.slabs.length && MAP.slabs.length < 320,
       `slabs=${gw.slabs.size}`,
     );
     // A pristine wall face (hundreds of bricks) merges into few boxes.
@@ -333,7 +333,8 @@ async function main(): Promise<void> {
     const houses = MAP.buildings.filter((b) => b.kind === "building");
     const trees = MAP.buildings.filter((b) => b.kind === "tree");
     let ok = houses.length === 9 && trees.length >= 16;
-    for (const b of houses) ok &&= b.wallPanelIds.length >= 130 && b.roofPanelIds.length >= 40;
+    // Concrete buildings use far fewer (bigger) panels than brick ones.
+    for (const b of houses) ok &&= b.wallPanelIds.length >= 90 && b.roofPanelIds.length >= 40;
     for (const b of trees) {
       ok &&= b.wallPanelIds.length >= 3 && b.wallPanelIds.length <= 6 && b.roofPanelIds.length >= 4;
       // Two trunk segments always fell a tree, regardless of its height.
@@ -451,7 +452,7 @@ async function main(): Promise<void> {
       }
       return false;
     };
-    const house = MAP.buildings[1]; // 8x8 brick house
+    const house = MAP.buildings[0]; // the fixed center brick house
     const bricks = house.wallPanelIds.filter((id) => MAP.panels[id - 1].material === "brick");
     check(
       "bottom course is grounded",
@@ -490,6 +491,41 @@ async function main(): Promise<void> {
     // (wide walls) or be detected as stranded — both are legal; just assert
     // the flood terminates and is consistent.
     check("island flood is well-formed", island.size > 0, `size=${island.size}`);
+  }
+
+  // --- Ladders: real climbing — push into the wall and rise to the top. ---
+  {
+    check("ladders generated", MAP.ladders.length >= 2, `n=${MAP.ladders.length}`);
+    const lad = MAP.ladders[0];
+    const r = await rig([lad.x + lad.nx * 0.55, 0.1, lad.z + lad.nz * 0.55]);
+    for (let t = 0; t < 20; t++) step(r, cmd(t + 1)); // settle
+    const yaw = quantizeAngle(Math.atan2(-lad.nx, -lad.nz));
+    for (let t = 20; t < 140; t++) {
+      step(r, cmd(t + 1, { moveX: quantizeMove(-lad.nx), moveZ: quantizeMove(-lad.nz), yaw }));
+    }
+    check("climbing reaches the top", r.s.y > lad.y1 - 1.2, `y=${r.s.y.toFixed(2)} top=${lad.y1}`);
+    destroyGameWorld(r.gw);
+  }
+
+  // --- Stairwells never block doors: every multi-story building keeps its
+  // west wall solid at ground level where the flights hang. ---
+  {
+    let ok = true;
+    for (const b of MAP.buildings) {
+      if (b.kind !== "building") continue;
+      const pieces = [...b.wallPanelIds, ...b.roofPanelIds].map((id) => MAP.panels[id - 1]);
+      const hasStairs = pieces.some(
+        (p) => p.ey === 0.12 && Math.abs(p.x - (b.cx - b.w / 2) - 1.12) < 0.3,
+      );
+      if (!hasStairs) continue;
+      const x0 = b.cx - b.w / 2;
+      // A door would leave the west wall's ground band empty around mid.
+      const westGround = pieces.filter(
+        (p) => Math.abs(p.x - x0) < 0.2 && p.y < 1.0 && Math.abs(p.z - b.cz) < 0.55,
+      );
+      if (westGround.length === 0) ok = false;
+    }
+    check("stairwells never sit behind a door", ok, "");
   }
 
   // --- Terrain destruction: a crater lowers both heightAt and the rebuilt
