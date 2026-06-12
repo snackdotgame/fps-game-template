@@ -33,7 +33,19 @@ import {
   TICK_MS,
   TICK_RATE,
 } from "./shared/constants.js";
-import { BUILT_PANEL_ID_BASE, MAP, PANEL_HP, type PanelDef, spawnPoint } from "./shared/map.js";
+import {
+  addCrater,
+  BUILT_PANEL_ID_BASE,
+  type Crater,
+  craterList,
+  heightAt,
+  MAP,
+  PANEL_HP,
+  type PanelDef,
+  type PanelMaterial,
+  resetCraters,
+  spawnPoint,
+} from "./shared/map.js";
 import {
   EXPLOSION_PANEL_OUTER_DAMAGE,
   EXPLOSION_PANEL_OUTER_RADIUS,
@@ -65,6 +77,7 @@ import {
   addPanelBody,
   addRubbleBody,
   aimDirection,
+  applyCraterBodies,
   type Body,
   createGameWorld,
   createGrenadeBody,
@@ -609,6 +622,7 @@ function addPlayer(conn: Connection): void {
     built: [...builtPanels.values()],
     collapsed: [...collapsedBuildings],
     panelHp: [...panelHp.entries()],
+    craters: [...craterList()],
   });
   broadcast({ type: "join", player: info }, p.conn?.id);
 }
@@ -896,15 +910,17 @@ function damagePanel(panelId: number, dmg: number): void {
   }
 }
 
-function destroyPanel(panelId: number): void {
+function destroyPanel(panelId: number, leaveRubble = true): void {
   if (destroyedPanels.has(panelId)) return;
+  const src = panelById.get(panelId) ?? builtPanels.get(panelId);
   destroyedPanels.add(panelId);
   panelHp.delete(panelId);
   builtPanels.delete(panelId);
   removePanelBody(gw, panelId);
   pendingDestroys.push(panelId);
+  if (leaveRubble && src) maybeLeaveRubble(src);
   // BattleBit-style critical health: enough wall damage fells the building.
-  const buildingId = panelById.get(panelId)?.buildingId;
+  const buildingId = src?.buildingId;
   if (buildingId !== undefined && !collapsedBuildings.has(buildingId)) {
     const b = MAP.buildings[buildingId];
     const gone = b.wallPanelIds.filter((id) => destroyedPanels.has(id)).length;
@@ -914,11 +930,53 @@ function destroyPanel(panelId: number): void {
   }
 }
 
+// Destroyed pieces have a chance to leave a chunk of themselves on the
+// ground — persistent, collision-real cover that keeps evolving the level
+// long after the walls are gone. Chunks ride the existing "build" machinery
+// (they're just runtime panels), so clients get body + visual for free, and
+// they're destructible in turn (material "rubble", no re-rubble).
+const RUBBLE_CHANCE: Partial<Record<PanelMaterial, number>> = {
+  brick: 0.16,
+  log: 0.45,
+  plank: 0.12,
+  post: 0.7,
+  trunk: 0.55,
+  crate: 0.5,
+  sandbag: 0.3,
+  rock: 0.5,
+  metal: 0.35,
+};
+const RUBBLE_CAP = 900;
+
+function maybeLeaveRubble(src: PanelDef): void {
+  if (builtPanels.size >= RUBBLE_CAP) return;
+  if (rng() >= (RUBBLE_CHANCE[src.material] ?? 0)) return;
+  const span = Math.max(src.ex, src.ez);
+  const s = Math.min(0.6, Math.max(0.24, Math.min(src.ex, src.ey, src.ez) * (0.8 + rng() * 0.6)));
+  const x = src.x + (rng() - 0.5) * Math.min(1.2, span);
+  const z = src.z + (rng() - 0.5) * Math.min(1.2, span);
+  const def: PanelDef = {
+    id: nextBuiltPanelId++,
+    x,
+    y: heightAt(x, z) + s * 0.4,
+    z,
+    ex: s * (1 + rng() * 0.6),
+    ey: s,
+    ez: s * (1 + rng() * 0.4),
+    material: "rubble",
+  };
+  addPanelBody(gw, def);
+  builtPanels.set(def.id, def);
+  broadcast({ type: "build", panel: def, byIdx: -1 });
+}
+
 function collapseBuilding(buildingId: number): void {
   collapsedBuildings.add(buildingId); // before the cascade, so it can't recurse
   const b = MAP.buildings[buildingId];
   broadcast({ type: "collapse", buildingId });
-  for (const id of [...b.wallPanelIds, ...b.roofPanelIds]) destroyPanel(id);
+  // The cascade itself doesn't shed per-piece rubble (the mound covers it) —
+  // except trees, whose felled trunk chunks read as the fallen log.
+  for (const id of [...b.wallPanelIds, ...b.roofPanelIds]) destroyPanel(id, b.kind === "tree");
   addRubbleBody(gw, b, RUBBLE_HEIGHT);
 }
 
@@ -983,6 +1041,16 @@ function explode(at: [number, number, number], ownerIdx: number): void {
     }
   }
 
+  // Terrain: a ground-level blast digs a crater (dug BEFORE the panel pass so
+  // freshly shed rubble settles into the new bowl). Clients get the crater on
+  // the reliable stream and rebuild the same tiles.
+  if (at[1] - heightAt(at[0], at[2]) < 1.6) {
+    const crater: Crater = { x: at[0], z: at[2], r: 2.6, d: 0.85 };
+    addCrater(crater);
+    applyCraterBodies(gw, crater);
+    broadcast({ type: "crater", crater });
+  }
+
   // Panels: deleted outright up close, chipped in an outer falloff ring.
   const blastPanel = (id: number, px: number, py: number, pz: number) => {
     const dist = Math.hypot(px - at[0], py - at[1], pz - at[2]);
@@ -992,7 +1060,11 @@ function explode(at: [number, number, number], ownerIdx: number): void {
   for (const p of MAP.panels) {
     if (!destroyedPanels.has(p.id)) blastPanel(p.id, p.x, p.y, p.z);
   }
-  for (const [id, p] of builtPanels) blastPanel(id, p.x, p.y, p.z);
+  // Snapshot first: blast-destroyed pieces shed rubble INTO builtPanels
+  // mid-loop, and freshly shed chunks shouldn't be vaporized by the same
+  // blast that created them.
+  const preBlast = [...builtPanels];
+  for (const [id, p] of preBlast) blastPanel(id, p.x, p.y, p.z);
 
   // Other grenades get knocked around.
   for (const g of grenades) {
@@ -1058,6 +1130,7 @@ async function stepPhase(): Promise<void> {
 
 async function resetRound(): Promise<void> {
   destroyGameWorld(gw);
+  resetCraters();
   gw = await createGameWorld();
   panelHp.clear();
   destroyedPanels.clear();

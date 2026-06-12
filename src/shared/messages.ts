@@ -3,7 +3,7 @@
 // arrive exactly once on every client (they alter collision), and QUIC
 // streams give guaranteed ordered delivery for free.
 
-import type { PanelDef } from "./map.js";
+import type { Crater, PanelDef } from "./map.js";
 
 export interface PlayerInfo {
   idx: number;
@@ -22,9 +22,10 @@ export type ServerMsg =
       scores: [number, number];
       mapEpoch: number; // bumps every round restart (map fully restored)
       destroyed: number[]; // panel ids gone this round
-      built: PanelDef[]; // deployed cover panels alive this round
+      built: PanelDef[]; // deployed cover + rubble chunks alive this round
       collapsed: number[]; // building ids that crumbled this round
       panelHp: Array<[number, number]>; // damaged-but-alive panels
+      craters: Crater[]; // terrain digs this round
     }
   | { type: "join"; player: PlayerInfo }
   | { type: "leave"; idx: number }
@@ -32,6 +33,7 @@ export type ServerMsg =
   | { type: "destroy"; panelIds: number[] }
   | { type: "panelhp"; updates: Array<[number, number]> } // [panelId, hp]
   | { type: "collapse"; buildingId: number }
+  | { type: "crater"; crater: Crater }
   | { type: "build"; panel: PanelDef; byIdx: number }
   | { type: "score"; scores: [number, number] }
   | {

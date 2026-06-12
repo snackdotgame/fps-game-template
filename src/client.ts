@@ -5,8 +5,22 @@
 import { client } from "minion:client";
 import * as THREE from "three";
 import { INPUT_REDUNDANCY, MAX_HP, TEAM_NAMES, TICK_MS, TICK_RATE } from "./shared/constants.js";
-import { MAP, PANEL_HP, type PanelDef, type PanelMaterial, terrainMesh } from "./shared/map.js";
+import {
+  addCrater,
+  baseHeightAt,
+  chunksTouching,
+  heightAt,
+  MAP,
+  PANEL_HP,
+  type PanelDef,
+  type PanelMaterial,
+  resetCraters,
+  TERRAIN_CHUNK,
+  TERRAIN_CHUNKS,
+  terrainChunkMesh,
+} from "./shared/map.js";
 import { RUBBLE_HEIGHT } from "./shared/constants.js";
+import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 import { parseServerMsg, type PlayerInfo } from "./shared/messages.js";
 import {
   decodeSnapshot,
@@ -28,6 +42,7 @@ import {
 import {
   addPanelBody,
   addRubbleBody,
+  applyCraterBodies,
   type Body,
   buildPlacement,
   type CharState,
@@ -95,86 +110,117 @@ window.addEventListener("resize", () => {
 // ---------------------------------------------------------------------------
 // Map visuals.
 
-// CC0 PBR textures from ambientCG — see assets/textures/CREDITS.txt.
-const texLoader = new THREE.TextureLoader();
+// Texture-free voxel look: every piece is a crisp beveled solid in a
+// hand-picked palette with deterministic per-piece variation — shape, light,
+// and color variance do the work textures used to.
 
-function tex(file: string, srgb: boolean, rx: number, ry: number): THREE.Texture {
-  const t = texLoader.load(`/assets/textures/${file}`);
-  t.wrapS = THREE.RepeatWrapping;
-  t.wrapT = THREE.RepeatWrapping;
-  t.repeat.set(rx, ry);
-  t.anisotropy = 4;
-  if (srgb) t.colorSpace = THREE.SRGBColorSpace;
-  return t;
+function hash01(id: number, salt: number): number {
+  let h = Math.imul(id + Math.imul(salt, 0x9e3779b9), 2654435761);
+  h ^= h >>> 15;
+  return ((h >>> 8) % 10000) / 10000;
 }
 
-function surface(
-  name: string,
-  opts: { rx?: number; ry?: number; color?: number; rough?: number } = {},
-): THREE.MeshStandardMaterial {
-  const rx = opts.rx ?? 1;
-  const ry = opts.ry ?? 1;
-  return new THREE.MeshStandardMaterial({
-    map: tex(`${name}_color.jpg`, true, rx, ry),
-    normalMap: tex(`${name}_normal.jpg`, false, rx, ry),
-    color: opts.color ?? 0xffffff,
-    roughness: opts.rough ?? 0.95,
-    metalness: 0,
-  });
-}
+const voxelMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff,
+  roughness: 0.92,
+  metalness: 0,
+  flatShading: true,
+});
+const glassMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff,
+  roughness: 0.08,
+  metalness: 0,
+  transparent: true,
+  opacity: 0.32,
+  depthWrite: false,
+});
 
 const MAT = {
-  wall: new THREE.MeshStandardMaterial({ color: 0x9b958a, roughness: 1 }),
-  rubble: new THREE.MeshStandardMaterial({ color: 0x6e6a62, roughness: 1 }),
+  wall: new THREE.MeshStandardMaterial({ color: 0x9b958a, roughness: 1, flatShading: true }),
+  rubble: new THREE.MeshStandardMaterial({ color: 0x6e6a62, roughness: 1, flatShading: true }),
 };
 
-// Unit geometries, scaled per instance to each piece's extents: boxes for
-// masonry, cylinders for logs and trunks, irregular blobs for foliage.
+// Unit geometries, scaled per instance to each piece's extents: beveled boxes
+// for masonry (the bevel catches light, so every brick reads as a brick),
+// faceted cylinders for logs and trunks, soft-cornered lumps for rocks.
 const GEO = {
   box: new THREE.BoxGeometry(1, 1, 1),
-  cyl: new THREE.CylinderGeometry(0.5, 0.5, 1, 9),
-  blob: new THREE.IcosahedronGeometry(0.55, 1),
+  bevel: new RoundedBoxGeometry(1, 1, 1, 1, 0.055),
+  rock: new RoundedBoxGeometry(1, 1, 1, 2, 0.2),
+  cyl: new THREE.CylinderGeometry(0.5, 0.5, 1, 7),
+  decal: new THREE.PlaneGeometry(1, 1),
 };
 
-const barkMat = surface("bark", { rx: 2, ry: 1 });
-
-// How each piece material renders: shape + textured surface + debris color.
+// How each piece material renders: shape + debris color.
 const PIECE_STYLE: Record<
   PanelMaterial,
   { geo: THREE.BufferGeometry; mat: THREE.Material; debris: number }
 > = {
-  brick: { geo: GEO.box, mat: surface("brick", { rx: 0.5, ry: 0.22 }), debris: 0xa66045 },
-  log: { geo: GEO.cyl, mat: barkMat, debris: 0x6e5439 },
-  plank: { geo: GEO.box, mat: surface("planks", { rx: 1, ry: 0.5 }), debris: 0x9a7a52 },
-  post: {
-    geo: GEO.box,
-    mat: surface("planks", { rx: 0.3, ry: 1, color: 0x8a7458 }),
-    debris: 0x6e5439,
-  },
-  trunk: { geo: GEO.cyl, mat: barkMat, debris: 0x6e5439 },
-  canopy: { geo: GEO.blob, mat: surface("moss", { color: 0x9fc27c }), debris: 0x4d7a3a },
-  crate: {
-    geo: GEO.box,
-    mat: surface("planks", { rx: 0.55, ry: 0.55, color: 0xc9a877 }),
-    debris: 0x9a7a52,
-  },
-  sandbag: {
-    geo: GEO.box,
-    mat: surface("fabric", { rx: 0.6, ry: 0.4, color: 0xa89a76 }),
-    debris: 0x9a8f72,
-  },
-  metal: { geo: GEO.box, mat: surface("steel", { rx: 1, ry: 0.7 }), debris: 0x8a949e },
+  brick: { geo: GEO.bevel, mat: voxelMat, debris: 0xa66045 },
+  log: { geo: GEO.cyl, mat: voxelMat, debris: 0x6e5439 },
+  plank: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a7a52 },
+  post: { geo: GEO.bevel, mat: voxelMat, debris: 0x6e5439 },
+  trunk: { geo: GEO.cyl, mat: voxelMat, debris: 0x6e5439 },
+  canopy: { geo: GEO.bevel, mat: voxelMat, debris: 0x4d7a3a },
+  crate: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a7a52 },
+  sandbag: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a8f72 },
+  rock: { geo: GEO.rock, mat: voxelMat, debris: 0x8d8a84 },
+  glass: { geo: GEO.box, mat: glassMat, debris: 0xd8eef7 },
+  rubble: { geo: GEO.bevel, mat: voxelMat, debris: 0x847d72 },
+  metal: { geo: GEO.bevel, mat: voxelMat, debris: 0x8a949e },
 };
+
+const CANOPY_GREENS = [0x4e8a3c, 0x5f9c46, 0x3f7a34, 0x6fae52, 0x35703a];
+
+// The palette: deterministic per-piece color so a wall is a thousand subtly
+// different bricks, not a flat sheet.
+function pieceColor(def: PanelDef, out: THREE.Color): THREE.Color {
+  const h1 = hash01(def.id, 1);
+  const h2 = hash01(def.id, 2);
+  switch (def.material) {
+    case "brick": {
+      out.setHSL(0.024 + h1 * 0.022, 0.52 + h2 * 0.12, 0.4 + h1 * 0.12);
+      if (h2 < 0.08)
+        out.multiplyScalar(0.62); // the odd over-fired dark brick
+      else if (h2 > 0.94) out.multiplyScalar(1.28); // and the odd pale one
+      return out;
+    }
+    case "log":
+      return out.setHSL(0.07 + h1 * 0.02, 0.38 + h2 * 0.1, 0.33 + h1 * 0.1);
+    case "plank":
+      return out.setHSL(0.082 + h1 * 0.015, 0.4 + h2 * 0.08, 0.45 + h1 * 0.13);
+    case "post":
+      return out.setHSL(0.07 + h1 * 0.015, 0.38, 0.27 + h1 * 0.06);
+    case "trunk":
+      return out.setHSL(0.072 + h1 * 0.015, 0.42, 0.25 + h1 * 0.08);
+    case "canopy":
+      out.setHex(CANOPY_GREENS[Math.floor(h1 * CANOPY_GREENS.length)]);
+      return out.multiplyScalar(0.88 + h2 * 0.24);
+    case "crate":
+      return out.setHSL(0.088 + h1 * 0.012, 0.46 + h2 * 0.08, 0.5 + h1 * 0.1);
+    case "sandbag":
+      return out.setHSL(0.112 + h1 * 0.012, 0.2 + h2 * 0.06, 0.5 + h1 * 0.12);
+    case "rock":
+      return out.setHSL(0.085 + h1 * 0.02, 0.04 + h2 * 0.05, 0.4 + h1 * 0.2);
+    case "glass":
+      return out.setHex(0xd6eef7);
+    case "rubble":
+      return out.setHSL(0.07 + h1 * 0.03, 0.1 + h2 * 0.1, 0.36 + h1 * 0.14);
+    case "metal":
+      return out.setHSL(0.57 + h1 * 0.02, 0.07, 0.5 + h1 * 0.1);
+  }
+}
 
 let mapGroup = new THREE.Group();
 scene.add(mapGroup);
 
-// Static map pieces live in one InstancedMesh pool per material (3k pieces,
-// ~8 draw calls); deployed cover is added at runtime as individual meshes.
+// Static map pieces live in one InstancedMesh pool per material (~6k pieces,
+// ~12 draw calls); deployed cover and rubble chunks arrive at runtime as
+// individual meshes.
 interface PieceSlot {
   mesh: THREE.InstancedMesh;
   index: number;
-  shade: number;
+  base: number; // palette color, hex
 }
 const panelSlots = new Map<number, PieceSlot>();
 const builtMeshes = new Map<number, THREE.Mesh>();
@@ -191,7 +237,7 @@ const Z_AXIS = new THREE.Vector3(0, 0, 1);
 const ZERO_SCALE = new THREE.Matrix4().makeScale(0, 0, 0);
 
 // Logs lie on their side (cylinder axis along the wall), trunks stand up,
-// canopy clumps get a per-piece twist so the blobs don't read as tiled.
+// canopy cubes and rocks get a per-piece twist so they don't read as tiled.
 function pieceMatrix(def: PanelDef): THREE.Matrix4 {
   _pos.set(def.x, def.y, def.z);
   if (def.material === "log" && def.ex >= def.ez) {
@@ -201,44 +247,269 @@ function pieceMatrix(def: PanelDef): THREE.Matrix4 {
     _q.setFromAxisAngle(X_AXIS, Math.PI / 2);
     _scl.set(def.ex, def.ez, def.ey);
   } else {
-    if (def.material === "canopy") _q.setFromAxisAngle(Y_AXIS, (def.id % 7) * 0.9);
-    else _q.identity();
+    if (def.material === "canopy" || def.material === "rubble") {
+      _q.setFromAxisAngle(Y_AXIS, (def.id % 7) * 0.9);
+    } else if (def.material === "rock") {
+      _q.setFromAxisAngle(Y_AXIS, (hash01(def.id, 3) - 0.5) * 0.7);
+    } else {
+      _q.identity();
+    }
     _scl.set(def.ex, def.ey, def.ez);
   }
   return _m4.compose(_pos, _q, _scl);
 }
 
-// Deterministic per-piece brightness jitter: identical bricks sharing one
-// texture would otherwise read as a flat sheet.
-function shadeFor(id: number): number {
-  return 0.86 + (((Math.imul(id, 2654435761) >>> 16) % 100) / 100) * 0.26;
-}
+// --- Terrain: per-chunk faceted meshes from the shared heightfield (the
+// physics mesh chunks identically), low-poly flat-shaded with per-face color
+// jitter. Chunks rebuild when a crater message lands.
 
-// Terrain rendered from the same heightfield the physics mesh uses; grass
-// texture with a vertex-color elevation blend on top.
-function makeTerrainMesh(): THREE.Mesh {
-  const data = terrainMesh();
-  const geo = new THREE.BufferGeometry();
+const terrainChunkVisuals = new Map<number, THREE.Mesh>();
+const terrainMat = new THREE.MeshStandardMaterial({
+  vertexColors: true,
+  roughness: 1,
+  metalness: 0,
+  flatShading: true,
+});
+const TERRAIN_LOW = new THREE.Color(0x5e8a4a);
+const TERRAIN_HIGH = new THREE.Color(0x8aa763);
+const TERRAIN_SCORCH = new THREE.Color(0x4f463b);
+
+function makeTerrainChunkMesh(ci: number, cj: number): THREE.Mesh {
+  const data = terrainChunkMesh(ci, cj);
+  let geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.Float32BufferAttribute(data.vertices, 3));
   geo.setIndex(data.indices);
+  geo = geo.toNonIndexed(); // flat faceted normals + per-face color
   geo.computeVertexNormals();
+  const pos = geo.getAttribute("position");
   const colors: number[] = [];
-  const uvs: number[] = [];
-  const low = new THREE.Color(0.74, 0.82, 0.66);
-  const high = new THREE.Color(1.04, 1.04, 0.94);
-  for (let i = 0; i < data.vertices.length; i += 3) {
-    const t = Math.min(1, data.vertices[i + 1] / 1.1);
-    const c = low.clone().lerp(high, t);
-    colors.push(c.r, c.g, c.b);
-    uvs.push(data.vertices[i] / 2.5, data.vertices[i + 2] / 2.5);
+  const c = new THREE.Color();
+  for (let f = 0; f < pos.count; f += 3) {
+    const cx = (pos.getX(f) + pos.getX(f + 1) + pos.getX(f + 2)) / 3;
+    const cy = (pos.getY(f) + pos.getY(f + 1) + pos.getY(f + 2)) / 3;
+    const cz = (pos.getZ(f) + pos.getZ(f + 1) + pos.getZ(f + 2)) / 3;
+    const t = Math.max(0, Math.min(1, cy / 1.5));
+    c.copy(TERRAIN_LOW).lerp(TERRAIN_HIGH, t);
+    // Crater bowls read as scorched earth.
+    const dug = baseHeightAt(cx, cz) - cy;
+    if (dug > 0.08) c.lerp(TERRAIN_SCORCH, Math.min(1, dug / 0.6));
+    const j = 0.93 + hash01(Math.round(cx * 7 + cz * 131), 5) * 0.14;
+    colors.push(c.r * j, c.g * j, c.b * j, c.r * j, c.g * j, c.b * j, c.r * j, c.g * j, c.b * j);
   }
   geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
-  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
-  const mat = surface("grass", { rough: 1 });
-  mat.vertexColors = true;
-  const mesh = new THREE.Mesh(geo, mat);
+  const mesh = new THREE.Mesh(geo, terrainMat);
   mesh.receiveShadow = true;
   return mesh;
+}
+
+function rebuildTerrainChunk(ci: number, cj: number): void {
+  const key = ci * TERRAIN_CHUNKS + cj;
+  const old = terrainChunkVisuals.get(key);
+  if (old) {
+    mapGroup.remove(old);
+    old.geometry.dispose();
+  }
+  const mesh = makeTerrainChunkMesh(ci, cj);
+  terrainChunkVisuals.set(key, mesh);
+  mapGroup.add(mesh);
+}
+
+// --- Grass: per-chunk blade triangles with a wind-sway vertex shader,
+// tinted to the terrain. Blades resample the heightfield on crater rebuilds
+// (and skip scorched bowls).
+
+const GRASS_PER_CHUNK = 330;
+const grassChunkVisuals = new Map<number, THREE.Mesh>();
+const grassMat = new THREE.ShaderMaterial({
+  uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, { uTime: { value: 0 } }]),
+  vertexShader: `
+    #include <fog_pars_vertex>
+    uniform float uTime;
+    attribute float aTip;
+    attribute float aSway;
+    varying vec3 vColor;
+    attribute vec3 aColor;
+    void main() {
+      vec3 p = position;
+      p.x += sin(uTime * 1.9 + aSway * 6.2832 + position.x * 0.45 + position.z * 0.3)
+        * 0.14 * aTip;
+      p.z += cos(uTime * 1.4 + aSway * 6.2832) * 0.06 * aTip;
+      vColor = aColor;
+      vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
+      gl_Position = projectionMatrix * mvPosition;
+      #include <fog_vertex>
+    }
+  `,
+  fragmentShader: `
+    #include <fog_pars_fragment>
+    varying vec3 vColor;
+    void main() {
+      gl_FragColor = vec4(vColor, 1.0);
+      #include <fog_fragment>
+    }
+  `,
+  side: THREE.DoubleSide,
+  fog: true,
+});
+
+function makeGrassChunkMesh(ci: number, cj: number): THREE.Mesh | null {
+  const x0 = -MAP.size / 2 + ci * TERRAIN_CHUNK;
+  const z0 = -MAP.size / 2 + cj * TERRAIN_CHUNK;
+  const positions: number[] = [];
+  const colors: number[] = [];
+  const tips: number[] = [];
+  const sways: number[] = [];
+  const cLow = new THREE.Color(0x57843f);
+  const cHigh = new THREE.Color(0x9dba59);
+  const blade = new THREE.Color();
+  const seedBase = (ci * 31 + cj) * 7919;
+  for (let i = 0; i < GRASS_PER_CHUNK; i++) {
+    const x = x0 + hash01(seedBase + i, 11) * TERRAIN_CHUNK;
+    const z = z0 + hash01(seedBase + i, 12) * TERRAIN_CHUNK;
+    const baseH = baseHeightAt(x, z);
+    if (baseH < 0.04) continue; // pads, spawns, perimeter skirt
+    const y = heightAt(x, z);
+    if (baseH - y > 0.12) continue; // scorched crater bowl
+    const h = 0.22 + hash01(seedBase + i, 13) * 0.3;
+    const w = 0.05 + hash01(seedBase + i, 14) * 0.05;
+    const yaw = hash01(seedBase + i, 15) * Math.PI;
+    const dx = Math.cos(yaw) * w;
+    const dz = Math.sin(yaw) * w;
+    const sway = hash01(seedBase + i, 16);
+    blade.copy(cLow).lerp(cHigh, hash01(seedBase + i, 17));
+    // One triangle per blade: two roots, one tip.
+    positions.push(x - dx, y, z - dz, x + dx, y, z + dz, x, y + h, z);
+    const r = blade.clone().multiplyScalar(0.74);
+    colors.push(r.r, r.g, r.b, r.r, r.g, r.b, blade.r, blade.g, blade.b);
+    tips.push(0, 0, 1);
+    sways.push(sway, sway, sway);
+  }
+  if (positions.length === 0) return null;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("aColor", new THREE.Float32BufferAttribute(colors, 3));
+  geo.setAttribute("aTip", new THREE.Float32BufferAttribute(tips, 1));
+  geo.setAttribute("aSway", new THREE.Float32BufferAttribute(sways, 1));
+  return new THREE.Mesh(geo, grassMat);
+}
+
+function rebuildGrassChunk(ci: number, cj: number): void {
+  const key = ci * TERRAIN_CHUNKS + cj;
+  const old = grassChunkVisuals.get(key);
+  if (old) {
+    mapGroup.remove(old);
+    old.geometry.dispose();
+    grassChunkVisuals.delete(key);
+  }
+  const mesh = makeGrassChunkMesh(ci, cj);
+  if (mesh) {
+    grassChunkVisuals.set(key, mesh);
+    mapGroup.add(mesh);
+  }
+}
+
+// --- Voxel clouds: chunky white box clusters drifting over the arena. ---
+
+const cloudGroup = new THREE.Group();
+const cloudMat = new THREE.MeshStandardMaterial({
+  color: 0xf4f8fb,
+  roughness: 1,
+  transparent: true,
+  opacity: 0.92,
+  flatShading: true,
+});
+
+function makeClouds(): void {
+  const span = MAP.size * 0.85;
+  for (let k = 0; k < 11; k++) {
+    const cluster = new THREE.Group();
+    const n = 4 + Math.floor(hash01(k, 21) * 6);
+    for (let i = 0; i < n; i++) {
+      const m = new THREE.Mesh(GEO.box, cloudMat);
+      m.scale.set(
+        4 + hash01(k * 17 + i, 22) * 7,
+        1.4 + hash01(k * 17 + i, 23) * 1.8,
+        2.5 + hash01(k * 17 + i, 24) * 4,
+      );
+      m.position.set(
+        (hash01(k * 17 + i, 25) - 0.5) * 13,
+        (hash01(k * 17 + i, 26) - 0.5) * 1.6,
+        (hash01(k * 17 + i, 27) - 0.5) * 8,
+      );
+      cluster.add(m);
+    }
+    cluster.position.set(
+      (hash01(k, 28) - 0.5) * 2 * span,
+      30 + hash01(k, 29) * 14,
+      (hash01(k, 30) - 0.5) * 2 * span,
+    );
+    cluster.userData.drift = 0.5 + hash01(k, 31) * 0.7;
+    cloudGroup.add(cluster);
+  }
+  scene.add(cloudGroup);
+}
+makeClouds();
+
+function stepClouds(dt: number): void {
+  const limit = MAP.size * 0.95;
+  for (const cluster of cloudGroup.children) {
+    cluster.position.x += (cluster.userData.drift as number) * dt;
+    if (cluster.position.x > limit) cluster.position.x = -limit;
+  }
+}
+
+// --- Bullet decals: small dark marks where shots land, capped pool. ---
+
+const decalMat = new THREE.MeshBasicMaterial({
+  color: 0x191511,
+  transparent: true,
+  opacity: 0.8,
+  polygonOffset: true,
+  polygonOffsetFactor: -2,
+  depthWrite: false,
+});
+const decals: THREE.Mesh[] = [];
+const _decalN = new THREE.Vector3();
+const FORWARD_Z = new THREE.Vector3(0, 0, 1);
+
+// Approximate the surface normal at a hit: panels are axis-aligned boxes
+// (pick the face the point is on); anything else is treated as terrain.
+function surfaceNormalAt(body: Body | null, point: THREE.Vector3): THREE.Vector3 {
+  const tag = (body?.userData ?? {}) as { panelId?: number };
+  if (tag.panelId !== undefined) {
+    const def = panelDefs.get(tag.panelId);
+    if (def) {
+      const rx = (point.x - def.x) / (def.ex / 2 || 1);
+      const ry = (point.y - def.y) / (def.ey / 2 || 1);
+      const rz = (point.z - def.z) / (def.ez / 2 || 1);
+      const ax = Math.abs(rx);
+      const ay = Math.abs(ry);
+      const az = Math.abs(rz);
+      if (ax >= ay && ax >= az) return _decalN.set(Math.sign(rx), 0, 0);
+      if (ay >= az) return _decalN.set(0, Math.sign(ry), 0);
+      return _decalN.set(0, 0, Math.sign(rz));
+    }
+  }
+  // Terrain: gradient of the heightfield.
+  const e = 0.25;
+  const dhdx = (heightAt(point.x + e, point.z) - heightAt(point.x - e, point.z)) / (2 * e);
+  const dhdz = (heightAt(point.x, point.z + e) - heightAt(point.x, point.z - e)) / (2 * e);
+  return _decalN.set(-dhdx, 1, -dhdz).normalize();
+}
+
+function spawnBulletDecal(point: THREE.Vector3, normal: THREE.Vector3): void {
+  if (decals.length >= 240) {
+    const old = decals.shift()!;
+    old.parent?.remove(old);
+  }
+  const m = new THREE.Mesh(GEO.decal, decalMat);
+  const s = 0.07 + Math.random() * 0.08;
+  m.scale.set(s, s, 1);
+  m.position.copy(point).addScaledVector(normal, 0.012);
+  m.quaternion.setFromUnitVectors(FORWARD_Z, normal);
+  m.rotateZ(Math.random() * Math.PI * 2);
+  mapGroup.add(m); // dies with the map on round reset
+  decals.push(m);
 }
 
 function buildMapVisuals(): void {
@@ -251,8 +522,18 @@ function buildMapVisuals(): void {
   panelSlots.clear();
   builtMeshes.clear();
   panelDefs.clear();
+  terrainChunkVisuals.clear();
+  grassChunkVisuals.clear();
+  decals.length = 0;
+  ragdolls.length = 0;
+  corpses.length = 0; // their groups died with the old mapGroup
 
-  mapGroup.add(makeTerrainMesh());
+  for (let ci = 0; ci < TERRAIN_CHUNKS; ci++) {
+    for (let cj = 0; cj < TERRAIN_CHUNKS; cj++) {
+      rebuildTerrainChunk(ci, cj);
+      rebuildGrassChunk(ci, cj);
+    }
+  }
   for (const s of MAP.statics) {
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.w, s.h, s.d), MAT.wall);
     mesh.position.set(s.x, s.y, s.z);
@@ -271,13 +552,13 @@ function buildMapVisuals(): void {
   for (const [material, defs] of byMat) {
     const style = PIECE_STYLE[material];
     const mesh = new THREE.InstancedMesh(style.geo, style.mat, defs.length);
-    mesh.castShadow = true;
+    mesh.castShadow = material !== "glass";
     mesh.receiveShadow = true;
     for (let i = 0; i < defs.length; i++) {
-      const shade = shadeFor(defs[i].id);
+      pieceColor(defs[i], _col);
       mesh.setMatrixAt(i, pieceMatrix(defs[i]));
-      mesh.setColorAt(i, _col.setScalar(shade));
-      panelSlots.set(defs[i].id, { mesh, index: i, shade });
+      mesh.setColorAt(i, _col);
+      panelSlots.set(defs[i].id, { mesh, index: i, base: _col.getHex() });
     }
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
@@ -285,10 +566,14 @@ function buildMapVisuals(): void {
   }
 }
 
+// Deployed cover and rubble chunks arrive one at a time as individual meshes.
 function addBuiltPanelVisual(p: PanelDef): void {
-  const mesh = new THREE.Mesh(GEO.box, PIECE_STYLE.metal.mat);
-  mesh.scale.set(p.ex, p.ey, p.ez);
-  mesh.position.set(p.x, p.y, p.z);
+  const style = PIECE_STYLE[p.material];
+  const mesh = new THREE.Mesh(style.geo, (style.mat as THREE.MeshStandardMaterial).clone());
+  (mesh.material as THREE.MeshStandardMaterial).color.copy(pieceColor(p, _col));
+  mesh.userData.ownMat = true;
+  const m = pieceMatrix(p);
+  m.decompose(mesh.position, mesh.quaternion, mesh.scale);
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   mapGroup.add(mesh);
@@ -304,17 +589,16 @@ function tintPanelDamage(id: number, hp: number): void {
   const damage = 1 - Math.max(0, Math.min(1, hp / PANEL_HP[def.material]));
   const slot = panelSlots.get(id);
   if (slot) {
-    slot.mesh.setColorAt(slot.index, _col.setScalar(slot.shade * (1 - damage * 0.6)));
+    _col.setHex(slot.base).multiplyScalar(1 - damage * 0.6);
+    slot.mesh.setColorAt(slot.index, _col);
     if (slot.mesh.instanceColor) slot.mesh.instanceColor.needsUpdate = true;
     return;
   }
   const mesh = builtMeshes.get(id);
   if (!mesh) return;
-  if (!mesh.userData.ownMat) {
-    mesh.material = (mesh.material as THREE.MeshStandardMaterial).clone();
-    mesh.userData.ownMat = true;
-  }
-  (mesh.material as THREE.MeshStandardMaterial).color.setScalar(1 - damage * 0.6);
+  (mesh.material as THREE.MeshStandardMaterial).color
+    .copy(pieceColor(def, _col))
+    .multiplyScalar(1 - damage * 0.6);
 }
 
 function addRubbleVisual(buildingId: number): void {
@@ -808,6 +1092,8 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       builtList = [...msg.built];
       collapsedList = [...msg.collapsed];
       welcomeHp = [...msg.panelHp];
+      resetCraters();
+      for (const c of msg.craters) addCrater(c);
       lastAckTick = msg.serverTick;
       void buildWorlds();
       break;
@@ -859,11 +1145,20 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       }
       break;
     }
+    case "crater": {
+      addCrater(msg.crater);
+      if (gw) applyCraterBodies(gw, msg.crater);
+      for (const [ci, cj] of chunksTouching(msg.crater)) {
+        rebuildTerrainChunk(ci, cj);
+        rebuildGrassChunk(ci, cj);
+      }
+      break;
+    }
     case "build": {
       builtList.push(msg.panel);
       if (gw) addPanelBody(gw, msg.panel);
       addBuiltPanelVisual(msg.panel);
-      sounds.build();
+      if (msg.panel.material !== "rubble") sounds.build();
       break;
     }
     case "score": {
@@ -879,6 +1174,7 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
         destroyedSet.clear();
         builtList = [];
         collapsedList = [];
+        resetCraters();
         kd.clear();
         void buildWorlds();
       }
@@ -919,7 +1215,12 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
   lastSnapAtMs = receivedAt;
 
   noteArrival(receivedAt, snap.serverTick);
+  const prevSelfStatus = selfStatus;
   selfStatus = snap.self.status;
+  if ((prevSelfStatus & SS_DEAD) === 0 && (selfStatus & SS_DEAD) !== 0 && predState) {
+    const myTeam = roster.get(selfIdx)?.team ?? 0;
+    spawnRagdoll(new THREE.Vector3(predState.x, predState.y, predState.z), yaw, myTeam);
+  }
   selfHp = snap.self.hp;
   respawnTicks = snap.self.respawnTicks;
   phase = snap.phase === 0 ? "playing" : "results";
@@ -952,6 +1253,8 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
       };
       remotes.set(r.idx, rp);
     }
+    const prevFlags = rp.lastFlags;
+    const wasNew = rp.buffer.length === 0;
     rp.buffer.push({
       t: receivedAt,
       x: r.x,
@@ -963,6 +1266,11 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
     });
     if (rp.buffer.length > 40) rp.buffer.splice(0, rp.buffer.length - 40);
     rp.lastFlags = r.flags;
+    // Death transition: drop a ragdoll where viewers last saw them standing
+    // (the server has already parked the body at spawn).
+    if (!wasNew && (prevFlags & RF_DEAD) === 0 && (r.flags & RF_DEAD) !== 0) {
+      spawnRagdoll(rp.group.position, rp.group.rotation.y - Math.PI, rp.info.team);
+    }
   }
   for (const idx of remotes.keys()) {
     if (!seen.has(idx) && !roster.has(idx)) dropRemote(idx);
@@ -1194,6 +1502,10 @@ function predictionTick(): void {
           ? new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])
           : new THREE.Vector3(eye[0] + dir[0] * 90, eye[1] + dir[1] * 90, eye[2] + dir[2] * 90);
         spawnTracer(from, end);
+        const tag = (hit?.body.userData ?? {}) as { playerIdx?: number; grenadeId?: number };
+        if (hit && tag.playerIdx === undefined && tag.grenadeId === undefined) {
+          spawnBulletDecal(end, surfaceNormalAt(hit.body, end));
+        }
       }
     },
     onMelee: () => {
@@ -1220,42 +1532,81 @@ function predictionTick(): void {
 // ---------------------------------------------------------------------------
 // Soldiers (blocky humanoids).
 
+// Soldier palette: olive fatigues under a team-colored vest and helmet.
+const SOLDIER = {
+  skin: 0xd9b38c,
+  fatigue: 0x5a5f4e,
+  pants: 0x3e4239,
+  boot: 0x2c2c28,
+  visor: 0x20242a,
+  gun: 0x23262b,
+};
+
+function part(w: number, h: number, d: number, color: number): THREE.Mesh {
+  const m = new THREE.Mesh(
+    new THREE.BoxGeometry(w, h, d),
+    new THREE.MeshLambertMaterial({
+      color,
+    }),
+  );
+  m.castShadow = true;
+  return m;
+}
+
 function makeSoldier(team: number, name: string): THREE.Group {
   const g = new THREE.Group();
   const color = TEAM_COLORS[team];
-  const body = new THREE.Mesh(
-    new THREE.BoxGeometry(0.56, 0.62, 0.34),
-    new THREE.MeshLambertMaterial({ color }),
-  );
-  body.position.y = 0.86;
-  body.castShadow = true;
-  const legs = new THREE.Mesh(
-    new THREE.BoxGeometry(0.46, 0.55, 0.3),
-    new THREE.MeshLambertMaterial({ color: 0x3c4046 }),
-  );
-  legs.position.y = 0.28;
-  legs.castShadow = true;
+
+  // Legs pivot at the hip so they can swing while walking.
+  const mkLeg = (side: number): THREE.Group => {
+    const hip = new THREE.Group();
+    hip.position.set(0.13 * side, 0.84, 0);
+    const leg = part(0.18, 0.7, 0.24, SOLDIER.pants);
+    leg.position.y = -0.38;
+    const boot = part(0.2, 0.13, 0.32, SOLDIER.boot);
+    boot.position.set(0, -0.77, 0.04);
+    hip.add(leg, boot);
+    return hip;
+  };
+  const legL = mkLeg(-1);
+  const legR = mkLeg(1);
+
+  const torso = part(0.52, 0.6, 0.32, SOLDIER.fatigue);
+  torso.position.y = 1.0;
+  const vest = part(0.56, 0.36, 0.38, color);
+  vest.position.y = 1.04;
+
+  const mkArm = (side: number): THREE.Group => {
+    const shoulder = new THREE.Group();
+    shoulder.position.set(0.34 * side, 1.26, 0);
+    const arm = part(0.14, 0.52, 0.17, SOLDIER.fatigue);
+    arm.position.y = -0.24;
+    const hand = part(0.13, 0.12, 0.14, SOLDIER.skin);
+    hand.position.y = -0.55;
+    shoulder.add(arm, hand);
+    return shoulder;
+  };
+  const armL = mkArm(-1);
+  const armR = mkArm(1);
+
   const headHolder = new THREE.Group();
   headHolder.name = "head";
   headHolder.position.y = 1.36;
-  const head = new THREE.Mesh(
-    new THREE.BoxGeometry(0.34, 0.34, 0.34),
-    new THREE.MeshLambertMaterial({ color: 0xd9b38c }),
-  );
-  head.position.y = 0.17;
-  head.castShadow = true;
-  const helmet = new THREE.Mesh(
-    new THREE.BoxGeometry(0.38, 0.14, 0.38),
-    new THREE.MeshLambertMaterial({ color }),
-  );
+  const head = part(0.32, 0.32, 0.32, SOLDIER.skin);
+  head.position.y = 0.16;
+  const visor = part(0.26, 0.08, 0.03, SOLDIER.visor);
+  visor.position.set(0, 0.19, 0.17);
+  const helmet = part(0.38, 0.16, 0.38, color);
   helmet.position.y = 0.36;
-  const gun = new THREE.Mesh(
-    new THREE.BoxGeometry(0.09, 0.12, 0.75),
-    new THREE.MeshLambertMaterial({ color: 0x23262b }),
-  );
+  const brim = part(0.4, 0.05, 0.14, color);
+  brim.position.set(0, 0.27, 0.2);
+  const gun = part(0.09, 0.12, 0.75, SOLDIER.gun);
   gun.position.set(0.2, -0.28, 0.35);
-  headHolder.add(head, helmet, gun);
-  g.add(body, legs, headHolder);
+  headHolder.add(head, visor, helmet, brim, gun);
+
+  g.add(legL, legR, torso, vest, armL, armR, headHolder);
+  g.userData.limbs = { legL, legR, armL, armR };
+  g.userData.walkPhase = 0;
 
   // Name tag.
   const canvas = document.createElement("canvas");
@@ -1279,6 +1630,134 @@ function makeSoldier(team: number, name: string): THREE.Group {
 
   scene.add(g);
   return g;
+}
+
+// ---------------------------------------------------------------------------
+// Ragdolls: when a soldier dies, a cosmetic verlet ragdoll flops where they
+// fell and the body stays on the battlefield (capped FIFO, cleared with the
+// map on round reset). Pure visuals — the authoritative sim never sees it.
+
+interface RagPart {
+  mesh: THREE.Mesh;
+  pos: THREE.Vector3;
+  prev: THREE.Vector3;
+  r: number;
+  spin: THREE.Vector3;
+}
+
+interface Ragdoll {
+  parts: RagPart[];
+  links: Array<[number, number, number]>; // part i, part j, rest length
+  activeUntil: number;
+}
+
+const ragdolls: Ragdoll[] = [];
+const corpses: Array<{ group: THREE.Group; until: number }> = [];
+const CORPSE_CAP = 18;
+const CORPSE_TTL_MS = 50_000; // bodies linger, then quietly leave
+
+function spawnRagdoll(at: THREE.Vector3, yaw: number, team: number): void {
+  const color = TEAM_COLORS[team];
+  const group = new THREE.Group();
+  mapGroup.add(group);
+  const parts: RagPart[] = [];
+  const cy = Math.cos(yaw);
+  const sy = Math.sin(yaw);
+  const add = (w: number, h: number, d: number, c: number, ox: number, oy: number): void => {
+    const mesh = part(w, h, d, c);
+    group.add(mesh);
+    const pos = new THREE.Vector3(at.x + ox * cy, at.y + oy, at.z - ox * sy);
+    const kick = new THREE.Vector3(
+      (Math.random() - 0.5) * 2.4,
+      1.6 + Math.random() * 1.6,
+      (Math.random() - 0.5) * 2.4,
+    );
+    parts.push({
+      mesh,
+      pos,
+      prev: pos.clone().addScaledVector(kick, -1 / 30),
+      r: Math.max(w, h, d) / 2,
+      spin: new THREE.Vector3(Math.random() * 6 - 3, Math.random() * 6 - 3, 0),
+    });
+  };
+  add(0.3, 0.3, 0.3, SOLDIER.skin, 0, 1.45); // head
+  add(0.5, 0.55, 0.32, color, 0, 1.0); // torso (vest reads as the body)
+  add(0.14, 0.46, 0.16, SOLDIER.fatigue, -0.36, 1.05); // arms
+  add(0.14, 0.46, 0.16, SOLDIER.fatigue, 0.36, 1.05);
+  add(0.18, 0.6, 0.23, SOLDIER.pants, -0.13, 0.42); // legs
+  add(0.18, 0.6, 0.23, SOLDIER.pants, 0.13, 0.42);
+  const links: Array<[number, number, number]> = [];
+  const link = (i: number, j: number): void => {
+    links.push([i, j, parts[i].pos.distanceTo(parts[j].pos)]);
+  };
+  link(0, 1); // head-torso
+  link(1, 2);
+  link(1, 3); // arms
+  link(1, 4);
+  link(1, 5); // legs
+  link(4, 5); // knees apart
+  ragdolls.push({ parts, links, activeUntil: performance.now() + 2600 });
+  corpses.push({ group, until: performance.now() + CORPSE_TTL_MS });
+  if (corpses.length > CORPSE_CAP) {
+    const old = corpses.shift()!;
+    old.group.parent?.remove(old.group);
+  }
+}
+
+function stepRagdolls(dt: number): void {
+  const now = performance.now();
+  const h = Math.min(dt, 0.033);
+  while (corpses.length > 0 && now > corpses[0].until) {
+    const old = corpses.shift()!;
+    old.group.parent?.remove(old.group);
+  }
+  for (let i = ragdolls.length - 1; i >= 0; i--) {
+    const r = ragdolls[i];
+    if (now > r.activeUntil) {
+      ragdolls.splice(i, 1); // meshes stay — the corpse remains
+      continue;
+    }
+    for (const p of r.parts) {
+      const vx = (p.pos.x - p.prev.x) * 0.985;
+      const vy = (p.pos.y - p.prev.y) * 0.985 - 16 * h * h;
+      const vz = (p.pos.z - p.prev.z) * 0.985;
+      p.prev.copy(p.pos);
+      p.pos.x += vx;
+      p.pos.y += vy;
+      p.pos.z += vz;
+      const ground = heightAt(p.pos.x, p.pos.z) + p.r * 0.6;
+      if (p.pos.y < ground) {
+        p.pos.y = ground;
+        // Ground friction: bleed horizontal velocity hard on contact.
+        p.prev.x = p.pos.x - vx * 0.4;
+        p.prev.z = p.pos.z - vz * 0.4;
+        p.spin.multiplyScalar(0.82);
+      }
+    }
+    for (let it = 0; it < 2; it++) {
+      for (const [a, b, rest] of r.links) {
+        const pa = r.parts[a].pos;
+        const pb = r.parts[b].pos;
+        const dx = pb.x - pa.x;
+        const dy = pb.y - pa.y;
+        const dz = pb.z - pa.z;
+        const d = Math.hypot(dx, dy, dz) || 1;
+        const corr = ((d - rest) / d) * 0.5;
+        pa.x += dx * corr;
+        pa.y += dy * corr;
+        pa.z += dz * corr;
+        pb.x -= dx * corr;
+        pb.y -= dy * corr;
+        pb.z -= dz * corr;
+      }
+    }
+    for (const p of r.parts) {
+      p.mesh.position.copy(p.pos);
+      p.mesh.rotation.x += p.spin.x * h;
+      p.mesh.rotation.z += p.spin.y * h;
+      p.spin.multiplyScalar(1 - h * 1.2);
+    }
+  }
 }
 
 // Flash a soldier red for a beat — damage must read on the target, not just
@@ -1405,8 +1884,10 @@ function debrisMat(color: number): THREE.MeshLambertMaterial {
 function spawnDebris(at: THREE.Vector3, count: number, color = 0xa59c8e): void {
   for (let i = 0; i < count; i++) {
     const s = 0.1 + Math.random() * 0.2;
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(s, s, s), debrisMat(color));
+    const mesh = new THREE.Mesh(GEO.box, debrisMat(color));
+    mesh.scale.setScalar(s);
     mesh.userData.sharedMat = true;
+    mesh.userData.sharedGeo = true;
     mesh.position.set(
       at.x + (Math.random() - 0.5) * 0.8,
       at.y + (Math.random() - 0.5) * 0.8,
@@ -1443,15 +1924,11 @@ function stepEffects(dt: number): void {
     const e = effects[i];
     if (now > e.until) {
       scene.remove(e.obj);
-      if (
-        e.obj instanceof THREE.Mesh &&
-        !e.obj.userData.sharedMat &&
-        e.obj.material !== tracerMat
-      ) {
-        e.obj.geometry.dispose();
-        (e.obj.material as THREE.Material).dispose();
-      } else if (e.obj instanceof THREE.Mesh) {
-        e.obj.geometry.dispose();
+      if (e.obj instanceof THREE.Mesh) {
+        if (!e.obj.userData.sharedGeo) e.obj.geometry.dispose();
+        if (!e.obj.userData.sharedMat && e.obj.material !== tracerMat) {
+          (e.obj.material as THREE.Material).dispose();
+        }
       }
       effects.splice(i, 1);
       continue;
@@ -1459,8 +1936,9 @@ function stepEffects(dt: number): void {
     if (e.vel) {
       e.vel.y -= 12 * dt;
       e.obj.position.addScaledVector(e.vel, dt);
-      if (e.obj.position.y < 0.05) {
-        e.obj.position.y = 0.05;
+      const ground = heightAt(e.obj.position.x, e.obj.position.z) + 0.05;
+      if (e.obj.position.y < ground) {
+        e.obj.position.y = ground;
         e.vel.y *= -0.3;
         e.vel.x *= 0.7;
         e.vel.z *= 0.7;
@@ -1496,7 +1974,26 @@ function processEvents(list: GameEvent[]): void {
       case EV_TRACER: {
         if (e.a !== selfIdx) {
           const from = eyeOf(e.a);
-          if (from) spawnTracer(from, at);
+          if (from) {
+            spawnTracer(from, at);
+            // Decal where the remote shot landed (skip max-range whiffs):
+            // re-cast locally to learn what surface the endpoint sits on.
+            const d = at.clone().sub(from);
+            const len = d.length();
+            if (len > 0.5 && len < 89) {
+              d.divideScalar(len);
+              const hit = castLocal([from.x, from.y, from.z], [d.x, d.y, d.z], len + 0.4);
+              const tag = (hit?.body.userData ?? {}) as { playerIdx?: number };
+              if (
+                hit &&
+                tag.playerIdx === undefined &&
+                at.distanceToSquared(new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])) <
+                  0.36
+              ) {
+                spawnBulletDecal(at, surfaceNormalAt(hit.body, at));
+              }
+            }
+          }
         } else {
           dbgMyTracers++;
         }
@@ -1593,6 +2090,9 @@ function frame(): void {
   recoil *= Math.exp(-dt * 10);
   shake *= Math.exp(-dt * 5);
   if (meleeSwing > 0) meleeSwing = Math.max(0, meleeSwing - dt * 4);
+  stepClouds(dt);
+  stepRagdolls(dt);
+  (grassMat.uniforms.uTime as { value: number }).value = now / 1000;
 
   // Camera at the predicted eye, interpolated between the last two ticks so
   // 30 Hz simulation renders smoothly at any frame rate.
@@ -1660,6 +2160,21 @@ function frame(): void {
     rp.group.rotation.y = a.yaw + dyaw * u + Math.PI;
     const head = rp.group.getObjectByName("head");
     if (head) head.rotation.x = -(a.pitch + (b.pitch - a.pitch) * u);
+    // Walk cycle: legs and arms swing opposite, scaled by ground speed.
+    const speed = (Math.hypot(b.x - a.x, b.z - a.z) / span2) * 1000;
+    const limbs = rp.group.userData.limbs as {
+      legL: THREE.Group;
+      legR: THREE.Group;
+      armL: THREE.Group;
+      armR: THREE.Group;
+    };
+    const stride = Math.min(1, speed / 5);
+    rp.group.userData.walkPhase = (rp.group.userData.walkPhase as number) + speed * dt * 2.6;
+    const swing = Math.sin(rp.group.userData.walkPhase as number) * 0.62 * stride;
+    limbs.legL.rotation.x = swing;
+    limbs.legR.rotation.x = -swing;
+    limbs.armL.rotation.x = -swing * 0.7;
+    limbs.armR.rotation.x = swing * 0.7;
     const dead = (rp.lastFlags & RF_DEAD) !== 0;
     rp.group.visible = !dead;
     const prot = (rp.lastFlags & RF_PROTECTED) !== 0;

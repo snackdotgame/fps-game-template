@@ -4,9 +4,10 @@
 //     --platform=browser --external:module --outfile=/tmp/bp-physics-test.mjs \
 //     && node /tmp/bp-physics-test.mjs
 import { GRENADE_FUSE_TICKS, RIFLE_COOLDOWN_TICKS, RIFLE_MAG } from "../src/shared/constants.js";
-import { heightAt, MAP, spawnPoint } from "../src/shared/map.js";
+import { addCrater, heightAt, MAP, resetCraters, spawnPoint } from "../src/shared/map.js";
 import { quantizeAngle, quantizeMove } from "../src/shared/netCodec.js";
 import {
+  applyCraterBodies,
   type Body,
   buildPlacement,
   castWallDistance,
@@ -73,14 +74,14 @@ async function main(): Promise<void> {
 
   // --- Walk + sprint speeds. ---
   {
-    // Head +x along the south edge — the only long open lane from spawn.
-    const r = await rig(spawn);
-    const east = quantizeAngle(Math.PI / 2);
-    for (let t = 0; t < 45; t++) step(r, cmd(t + 1, { moveX: quantizeMove(1), yaw: east }));
+    // Head north up the east duel corridor — kept clear of placements.
+    const r = await rig([24, heightAt(24, -32) + 0.1, -32]);
+    const north = quantizeAngle(0);
+    for (let t = 0; t < 45; t++) step(r, cmd(t + 1, { moveZ: quantizeMove(1), yaw: north }));
     const walk = Math.hypot(r.s.vx, r.s.vz);
     check("walk speed ~5.2", walk > 4.6 && walk < 5.4, `v=${walk}`);
     for (let t = 45; t < 90; t++) {
-      step(r, cmd(t + 1, { moveX: quantizeMove(1), sprint: true, yaw: east }));
+      step(r, cmd(t + 1, { moveZ: quantizeMove(1), sprint: true, yaw: north }));
     }
     const sprint = Math.hypot(r.s.vx, r.s.vz);
     check("sprint speed ~7.6", sprint > 6.9 && sprint < 7.9, `v=${sprint}`);
@@ -186,7 +187,7 @@ async function main(): Promise<void> {
   // --- Grenade body flies and bounces. ---
   {
     const gw = await createGameWorld();
-    const body = createGrenadeBody(gw, 1, [-22, 1.5, -20], [8, 2, 0]);
+    const body = createGrenadeBody(gw, 1, [24, 2.5, -32], [0, 2, 8]);
     let minY = 10;
     let bounced = false;
     let prevVy = 0;
@@ -199,7 +200,7 @@ async function main(): Promise<void> {
       prevVy = vel.y;
     }
     const end = body.translation();
-    check("grenade travels", end.x > -16, `x=${end.x}`);
+    check("grenade travels", end.z > -26, `z=${end.z}`);
     check("grenade bounces", bounced, `minY=${minY}`);
     destroyGameWorld(gw);
   }
@@ -285,9 +286,13 @@ async function main(): Promise<void> {
   {
     const houses = MAP.buildings.filter((b) => b.kind === "building");
     const trees = MAP.buildings.filter((b) => b.kind === "tree");
-    let ok = houses.length === 5 && trees.length >= 8;
+    let ok = houses.length === 9 && trees.length >= 16;
     for (const b of houses) ok &&= b.wallPanelIds.length >= 130 && b.roofPanelIds.length >= 40;
-    for (const b of trees) ok &&= b.wallPanelIds.length === 4 && b.roofPanelIds.length === 4;
+    for (const b of trees) {
+      ok &&= b.wallPanelIds.length >= 3 && b.wallPanelIds.length <= 6 && b.roofPanelIds.length >= 4;
+      // Two trunk segments always fell a tree, regardless of its height.
+      ok &&= Math.ceil(b.wallPanelIds.length * b.collapseFraction) === 2;
+    }
     for (const b of MAP.buildings) {
       ok &&= b.wallPanelIds.every((id) => MAP.panels.find((p) => p.id === id)?.buildingId === b.id);
     }
@@ -335,7 +340,7 @@ async function main(): Promise<void> {
     check("terrain has relief", maxH > 0.5, `maxH=${maxH.toFixed(2)}`);
     check(
       "spawns and pads are flat",
-      Math.abs(heightAt(0, -23)) < 0.05 && Math.abs(heightAt(0, 0)) < 0.05,
+      Math.abs(heightAt(0, -35)) < 0.05 && Math.abs(heightAt(0, 0)) < 0.05,
       "",
     );
   }
@@ -353,6 +358,56 @@ async function main(): Promise<void> {
       drift < 3,
       `drift=${drift.toFixed(1)} at (${end.x.toFixed(1)},${end.z.toFixed(1)})`,
     );
+    destroyGameWorld(gw);
+  }
+
+  // --- Terrain destruction: a crater lowers both heightAt and the rebuilt
+  // chunk collision, deterministically. ---
+  {
+    const gw = await createGameWorld();
+    const x = 24;
+    const z = -20; // open corridor, clear of pieces
+    const h0 = heightAt(x, z);
+    const rayDown = (): number => {
+      const hit = gw.world.castRay([x, 6, z], [0, -12, 0]);
+      return hit ? 6 - 12 * hit.fraction : -99;
+    };
+    const ground0 = rayDown();
+    const crater = { x, z, r: 2.6, d: 0.85 };
+    addCrater(crater);
+    applyCraterBodies(gw, crater);
+    // Near a pad skirt the dig is faded — the contract is that collision
+    // matches the dug heightfield exactly, whatever the depth.
+    const dugHeight = h0 - heightAt(x, z);
+    const dugRay = ground0 - rayDown();
+    check("crater digs heightAt", dugHeight > 0.4, `dug=${dugHeight}`);
+    check(
+      "chunk collision matches the dug heightfield",
+      Math.abs(dugRay - dugHeight) < 0.03,
+      `ray=${dugRay} height=${dugHeight}`,
+    );
+    resetCraters();
+    destroyGameWorld(gw);
+  }
+
+  // --- Glass: panes fill window openings and shatter to a single hit. ---
+  {
+    const glass = MAP.panels.filter((p) => p.material === "glass");
+    check(
+      "buildings have windowpanes",
+      glass.length >= 20 && glass.every((p) => Math.min(p.ex, p.ez) < 0.1),
+      `glass=${glass.length}`,
+    );
+    const gw = await createGameWorld();
+    // The center building's windows: doorSide 0 means walls 1,2,3 are glazed.
+    const pane = glass.find((p) => p.buildingId === 0 && p.z < 0)!;
+    const hit = gw.world.castRay([pane.x, pane.y, pane.z - 2], [0, 0, 2.5]);
+    const tag = (hit?.body?.userData ?? {}) as { panelId?: number };
+    check("glass blocks shots until shattered", tag.panelId === pane.id, JSON.stringify(tag));
+    removePanelBody(gw, pane.id);
+    const hit2 = gw.world.castRay([pane.x, pane.y, pane.z - 2], [0, 0, 2.5]);
+    const tag2 = (hit2?.body?.userData ?? {}) as { panelId?: number };
+    check("shattered pane lets shots through", tag2.panelId !== pane.id, "");
     destroyGameWorld(gw);
   }
 

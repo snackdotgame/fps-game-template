@@ -77,31 +77,49 @@ for (let i = 0; i < 40 && (await a.fps("phase")) !== "playing"; i++) {
 }
 
 // --- Roster, teams, and bot fill (bots leave one-for-one as humans join). ---
-const rosterA = await a.fps("roster");
+const BOT_FILL = 8; // mirrors shared/constants.ts
+// The bot swap happens within a tick or two of the welcome — poll briefly
+// instead of asserting against a join race.
+let rosterA = await a.fps("roster");
 const botCount = (r) => r.filter((p) => p.name.startsWith("BOT")).length;
+let humans = 0;
+for (let i = 0; i < 20; i++) {
+  rosterA = await a.fps("roster");
+  humans = rosterA.length - botCount(rosterA);
+  if (humans >= 2 && rosterA.length === Math.max(BOT_FILL, humans)) break;
+  await a.page.waitForTimeout(400);
+}
 // Guests from a previous run may linger until the runtime reaps them, so
 // check the fill INVARIANT rather than absolute counts: bots top the lobby
-// up to 6 total, one bot per missing human.
-const humans = rosterA.length - botCount(rosterA);
+// up to BOT_FILL total, one bot per missing human.
 check(
-  "lobby filled to 6 with bots",
-  rosterA.length === Math.max(6, humans),
+  `lobby filled to ${BOT_FILL} with bots`,
+  rosterA.length === Math.max(BOT_FILL, humans),
   `total=${rosterA.length}`,
 );
 check(
   "each human replaced a bot",
-  botCount(rosterA) === Math.max(0, 6 - humans),
+  botCount(rosterA) === Math.max(0, BOT_FILL - humans),
   `bots=${botCount(rosterA)} humans=${humans}`,
 );
 const teams = new Set(rosterA.map((p) => p.team));
 check("players split across teams", teams.size === 2, JSON.stringify([...teams]));
 
-// --- Movement + cross-client sync. ---
-const aStart = await a.fps("playerPosition");
-await a.fps("drive", { moveX: 1, moveZ: 0, sprint: true }, 45);
-await a.page.waitForTimeout(2200);
-const aPos = await a.fps("playerPosition");
-check("A moved", Math.hypot(aPos[0] - aStart[0], aPos[2] - aStart[2]) > 3, JSON.stringify(aPos));
+// --- Movement + cross-client sync (retry — a bot may gun A down mid-walk,
+// which parks the body back at spawn). ---
+let aMoved = false;
+for (let attempt = 0; attempt < 4 && !aMoved; attempt++) {
+  if (((await a.fps("selfStatus")) & 1) !== 0) {
+    await a.page.waitForTimeout(2000);
+    continue;
+  }
+  const aStart = await a.fps("playerPosition");
+  await a.fps("drive", { moveX: 1, moveZ: 0, sprint: true }, 45);
+  await a.page.waitForTimeout(2200);
+  const aPos = await a.fps("playerPosition");
+  aMoved = Math.hypot(aPos[0] - aStart[0], aPos[2] - aStart[2]) > 3;
+}
+check("A moved", aMoved, "");
 
 // --- Destruction: build our own targets, then shoot and bomb them — works
 // regardless of how war-torn the map already is, and proves the full
@@ -158,12 +176,14 @@ check("built cover appears for B", Math.abs(panelsB - panelsA1) <= 2, `B=${panel
     }
   }
   check("gunfire destroys a panel", destroyed, `destroyed=${await a.fps("destroyedCount")}`);
-  await a.page.waitForTimeout(800);
-  check(
-    "destruction propagates to B",
-    (await b.fps("destroyedCount")) === (await a.fps("destroyedCount")),
-    "",
-  );
+  // Bots demolish things concurrently, so the counters move while we read
+  // them — poll for a moment of equality instead of one racy comparison.
+  let synced = false;
+  for (let i = 0; i < 12 && !synced; i++) {
+    await a.page.waitForTimeout(400);
+    synced = (await b.fps("destroyedCount")) === (await a.fps("destroyedCount"));
+  }
+  check("destruction propagates to B", synced, "");
 }
 
 // Grenade demolition: build another target and chuck grenades steeply at the
@@ -251,7 +271,7 @@ let backfilled = false;
 for (let i = 0; i < 45 && !backfilled; i++) {
   await a.page.waitForTimeout(1000);
   const r = await a.fps("roster");
-  backfilled = r.length === 6 && botCount(r) === botsBefore + 1;
+  backfilled = r.length === BOT_FILL && botCount(r) === botsBefore + 1;
 }
 check("leaving human is replaced by a bot", backfilled, JSON.stringify(await a.fps("roster")));
 
