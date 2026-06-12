@@ -49,6 +49,9 @@ export interface PanelDef {
   // support cascade and re-frozen where physics left them). Absent = axis
   // aligned, as generated.
   rot?: [number, number, number, number];
+  // Palette seed for runtime pieces: a fallen brick keeps the color it had
+  // on the wall (its original id), whatever runtime id it ends up with.
+  seed?: number;
 }
 
 // Max HP per material. Rifle hits chip 10, sledge swings 50.
@@ -86,11 +89,23 @@ export const LOG = { l: 2.0, h: 0.25, t: 0.26 };
 export const PLANK = { l: 2.0, h: 0.07, w: 0.5 };
 export const SANDBAG = { l: 0.55, h: 0.32, t: 0.42 };
 
+// A SLAB is the physics unit: one structural face/sheet/stack of pieces
+// that shares ONE static body (a wall per story, a roof level, a tree, a
+// sandbag emplacement...). Pieces are generated with sequential ids, so a
+// slab is just an id range. Collision boxes are greedy-merged from the
+// slab's ALIVE pieces and rebuilt when its damage set changes; hits resolve
+// to individual pieces analytically from the hit position.
+export interface Slab {
+  first: number; // piece id range, inclusive
+  last: number;
+}
+
 export interface MapDef {
   size: number; // arena is size x size, centered on origin
   statics: StaticBox[];
   panels: PanelDef[];
   buildings: BuildingDef[];
+  slabs: Slab[];
   spawns: [[number, number, number], [number, number, number]];
 }
 
@@ -269,6 +284,12 @@ interface Gen {
   statics: StaticBox[];
   panels: PanelDef[];
   buildings: BuildingDef[];
+  slabs: Slab[];
+}
+
+// Close a slab over every piece generated since `first` (ids are sequential).
+function endSlab(g: Gen, first: number): void {
+  if (nextPanelId > first) g.slabs.push({ first, last: nextPanelId - 1 });
 }
 
 // A wall opening: along-axis interval + height range.
@@ -297,8 +318,11 @@ function clipAgainstGaps(
         next.push([lo, hi]);
         continue;
       }
-      if (gap.lo - lo >= 0.18) next.push([lo, gap.lo]);
-      if (hi - gap.hi >= 0.18) next.push([gap.hi, hi]);
+      // Keep even thin cut fragments: every course then ends exactly at the
+      // opening's edge, which keeps jambs straight (and lets the collision
+      // merger stack courses into single boxes).
+      if (gap.lo - lo >= 0.08) next.push([lo, gap.lo]);
+      if (hi - gap.hi >= 0.08) next.push([gap.hi, hi]);
     }
     frags = next;
   }
@@ -321,6 +345,7 @@ function masonryRun(
   buildingId: number | undefined,
   gaps: GapRect[] = [],
 ): void {
+  const slabFirst = nextPanelId;
   const n = Math.round((a1 - a0) / unit.l);
   for (let row = 0; row < rows; row++) {
     const y = baseY + (row + 0.5) * unit.h;
@@ -348,6 +373,7 @@ function masonryRun(
       }
     }
   }
+  endSlab(g, slabFirst);
 }
 
 function building(
@@ -380,6 +406,7 @@ function building(
   ];
   const glassIds: number[] = [];
   const pane = (axis: "x" | "z", mid: number, fixed: number, baseY: number): void => {
+    const slabFirst = nextPanelId;
     glassIds.push(nextPanelId);
     g.panels.push({
       id: nextPanelId++,
@@ -392,6 +419,7 @@ function building(
       material: "glass",
       buildingId: id,
     });
+    endSlab(g, slabFirst);
   };
 
   const walls: Array<[axis: "x" | "z", mid: number, fixed: number]> = [
@@ -413,6 +441,7 @@ function building(
   }
 
   // Structural corner posts — destructible like everything else, just tough.
+  const postsFirst = nextPanelId;
   for (const [px, pz] of [
     [x0, z0],
     [x1, z0],
@@ -431,6 +460,7 @@ function building(
       buildingId: id,
     });
   }
+  endSlab(g, postsFirst);
 
   // The stairwell hole (multi-story only): a column along the west wall that
   // every upper floor leaves open, with switchback flights of floating
@@ -441,6 +471,7 @@ function building(
   const STAIR_RISE = WALL_HEIGHT / 10;
   const STAIR_RUN = 0.42;
   for (let flight = 0; flight < stories - 1; flight++) {
+    const flightFirst = nextPanelId;
     const baseY = flight * WALL_HEIGHT;
     const up = flight % 2 === 0; // switchback: alternate +z / -z
     for (let k = 0; k < 10; k++) {
@@ -458,6 +489,7 @@ function building(
         buildingId: id,
       });
     }
+    endSlab(g, flightFirst);
   }
 
   // Floors between stories and the roof: staggered planks laid across the
@@ -465,6 +497,7 @@ function building(
   const strips = Math.round(d / PLANK.w);
   const npl = Math.round(w / PLANK.l);
   for (let level = 1; level <= stories; level++) {
+    const levelFirst = nextPanelId;
     const y = level * WALL_HEIGHT + PLANK.h / 2;
     const isRoof = level === stories;
     for (let s = 0; s < strips; s++) {
@@ -502,6 +535,7 @@ function building(
         }
       }
     }
+    endSlab(g, levelFirst);
   }
 
   const mine = g.panels.filter((p) => p.id >= firstPanel);
@@ -526,6 +560,7 @@ function building(
 // crown. Pines: a tall thin trunk with stacked, shrinking foliage tiers.
 // Either way the trunk is the structure — break two segments and it falls.
 function tree(g: Gen, x: number, z: number, rng: () => number): void {
+  const slabFirst = nextPanelId;
   const id = nextBuildingId++;
   const base = baseHeightAt(x, z);
   const pine = rng() < 0.4;
@@ -595,10 +630,12 @@ function tree(g: Gen, x: number, z: number, rng: () => number): void {
     // ceil(segs * 1.5/segs) = 2 exactly: two trunk segments fell it.
     collapseFraction: 1.5 / segs,
   });
+  endSlab(g, slabFirst);
 }
 
 // Boulder clusters: 1-3 destructible rocks, partially sunk into the ground.
 function rocks(g: Gen, x: number, z: number, rng: () => number): void {
+  const slabFirst = nextPanelId;
   const n = 1 + Math.floor(rng() * 3);
   for (let i = 0; i < n; i++) {
     const ox = i === 0 ? 0 : (rng() - 0.5) * 2.4;
@@ -616,6 +653,7 @@ function rocks(g: Gen, x: number, z: number, rng: () => number): void {
       material: "rock",
     });
   }
+  endSlab(g, slabFirst);
 }
 
 // ---------------------------------------------------------------------------
@@ -624,7 +662,7 @@ function buildMap(): MapDef {
   nextPanelId = 1;
   nextBuildingId = 0;
   const rng = mulberry32(MAP_SEED);
-  const g: Gen = { statics: [], panels: [], buildings: [] };
+  const g: Gen = { statics: [], panels: [], buildings: [], slabs: [] };
   const half = SIZE / 2;
 
   // Perimeter walls (terrain fades to 0 at the edge so these seat flush).
@@ -717,6 +755,7 @@ function buildMap(): MapDef {
       const x = (rng() * 2 - 1) * (half - 5);
       const z = (rng() * 2 - 1) * (half - 5);
       if (!clearOf(x, z, 1.6)) continue;
+      const crateFirst = nextPanelId;
       const s = 0.9 + rng() * 0.5;
       const base = baseHeightAt(x, z);
       g.panels.push({
@@ -742,6 +781,7 @@ function buildMap(): MapDef {
           material: "crate",
         });
       }
+      endSlab(g, crateFirst);
       placed.push([x, z, 1.6]);
       break;
     }
@@ -752,6 +792,7 @@ function buildMap(): MapDef {
     statics: g.statics,
     panels: g.panels,
     buildings: g.buildings,
+    slabs: g.slabs,
     spawns: [
       [0, 0.1, -35],
       [0, 0.1, 35],
@@ -760,6 +801,20 @@ function buildMap(): MapDef {
 }
 
 export const MAP = buildMap();
+
+// Slab index for a map piece id (binary search over the sorted id ranges).
+export function slabOfPiece(pieceId: number): number {
+  let lo = 0;
+  let hi = MAP.slabs.length - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const s = MAP.slabs[mid];
+    if (pieceId < s.first) hi = mid - 1;
+    else if (pieceId > s.last) lo = mid + 1;
+    else return mid;
+  }
+  return -1;
+}
 
 // ---------------------------------------------------------------------------
 // Structural support: which pieces rest on which. The server consults this

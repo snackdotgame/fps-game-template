@@ -74,3 +74,8 @@ export const TEAM_NAMES = ["Orange", "Blue"];
 // something to fight; each joining human replaces one bot (and bots return
 // as humans leave).
 export const BOT_FILL = 8;
+
+// Destruction/procgen test environment: no bots, no damage, bottomless
+// ammo/grenades/supply. Flip on locally to iterate on the world without
+// getting shot; MUST be false in commits (the playtest asserts bot fill).
+export const SANDBOX = false;

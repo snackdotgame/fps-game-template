@@ -16,11 +16,13 @@ import {
   type PanelDef,
   type PanelMaterial,
   resetCraters,
+  slabOfPiece,
   TERRAIN_CHUNK,
   TERRAIN_CHUNKS,
   terrainChunkMesh,
 } from "./shared/map.js";
 import { RUBBLE_HEIGHT } from "./shared/constants.js";
+import { BUILT_PANEL_ID_BASE } from "./shared/map.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 import { parseServerMsg, type PlayerInfo } from "./shared/messages.js";
 import {
@@ -58,6 +60,8 @@ import {
   PLAYER_HALF_HEIGHT,
   readChar,
   removeGrenadeBody,
+  pieceIdFromHit,
+  rebuildSlabBody,
   removePanelBody,
   stepPlayerController,
   writeChar,
@@ -176,8 +180,11 @@ const CANOPY_GREENS = [0x4e8a3c, 0x5f9c46, 0x3f7a34, 0x6fae52, 0x35703a];
 // The palette: deterministic per-piece color so a wall is a thousand subtly
 // different bricks, not a flat sheet.
 function pieceColor(def: PanelDef, out: THREE.Color): THREE.Color {
-  const h1 = hash01(def.id, 1);
-  const h2 = hash01(def.id, 2);
+  // Runtime pieces (fallen, rubble) keep the palette of the piece they came
+  // from via `seed` — a brick doesn't change color by falling off the wall.
+  const basis = def.seed ?? def.id;
+  const h1 = hash01(basis, 1);
+  const h2 = hash01(basis, 2);
   switch (def.material) {
     case "brick": {
       out.setHSL(0.024 + h1 * 0.022, 0.52 + h2 * 0.12, 0.4 + h1 * 0.12);
@@ -537,9 +544,9 @@ const FORWARD_Z = new THREE.Vector3(0, 0, 1);
 // Approximate the surface normal at a hit: panels are axis-aligned boxes
 // (pick the face the point is on); anything else is treated as terrain.
 function surfaceNormalAt(body: Body | null, point: THREE.Vector3): THREE.Vector3 {
-  const tag = (body?.userData ?? {}) as { panelId?: number };
-  if (tag.panelId !== undefined) {
-    const def = panelDefs.get(tag.panelId);
+  const pieceId = body ? hitPieceId(body, [point.x, point.y, point.z]) : null;
+  if (pieceId !== null) {
+    const def = panelDefs.get(pieceId);
     if (def) {
       const rx = (point.x - def.x) / (def.ex / 2 || 1);
       const ry = (point.y - def.y) / (def.ey / 2 || 1);
@@ -615,7 +622,7 @@ function buildMapVisuals(): void {
   decals.length = 0;
   ragdolls.length = 0;
   corpses.length = 0; // their groups died with the old mapGroup
-  fallingFx.clear(); // ditto
+  fallingChunks.clear(); // ditto
 
   for (let ci = 0; ci < TERRAIN_CHUNKS; ci++) {
     for (let cj = 0; cj < TERRAIN_CHUNKS; cj++) {
@@ -1039,6 +1046,13 @@ let needHardAdopt = true;
 const errOffset = new THREE.Vector3();
 let lastEventSeq = 0;
 let destroyedSet = new Set<number>();
+const pieceAlive = (id: number): boolean => !destroyedSet.has(id);
+
+// Resolve a mirror-world raycast hit to the piece under it (map slabs
+// resolve analytically by position; runtime pieces carry their id).
+function hitPieceId(body: Body, point: readonly number[]): number | null {
+  return pieceIdFromHit(body, point, pieceAlive);
+}
 let builtList: PanelDef[] = [];
 let collapsedList: number[] = [];
 let welcomeHp: Array<[number, number]> = [];
@@ -1131,7 +1145,7 @@ async function buildWorlds(): Promise<void> {
   const buildId = ++worldBuildSeq;
   needHardAdopt = true;
   buildMapVisuals();
-  const next = await createGameWorld();
+  const next = await createGameWorld(destroyedSet);
   if (buildId !== worldBuildSeq) {
     destroyGameWorld(next);
     return;
@@ -1146,10 +1160,7 @@ async function buildWorlds(): Promise<void> {
     addPanelBody(gw, p);
     addBuiltPanelVisual(p);
   }
-  for (const id of destroyedSet) {
-    removePanelBody(gw, id);
-    removePanelVisual(id, false);
-  }
+  for (const id of destroyedSet) removePanelVisual(id, false);
   for (const buildingId of collapsedList) {
     if (MAP.buildings[buildingId]?.kind === "tree") continue;
     addRubbleVisual(buildingId);
@@ -1245,24 +1256,35 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
     case "destroy": {
       // Collapses destroy hundreds of pieces at once — cap the debris shower.
       let debrisLeft = 50;
+      const dirty = new Set<number>();
       for (const id of msg.panelIds) {
         destroyedSet.add(id);
         builtList = builtList.filter((p) => p.id !== id);
-        if (gw) removePanelBody(gw, id);
+        if (id < BUILT_PANEL_ID_BASE) {
+          const slabIdx = slabOfPiece(id);
+          if (slabIdx >= 0) dirty.add(slabIdx);
+        } else if (gw) {
+          removePanelBody(gw, id);
+        }
         removePanelVisual(id, debrisLeft-- > 0);
+      }
+      if (gw) {
+        for (const slabIdx of dirty) rebuildSlabBody(gw, slabIdx, pieceAlive);
       }
       removeDecalsForPanels(new Set(msg.panelIds));
       break;
     }
     case "fall": {
-      startFallFx(msg.piece);
+      startChunkView(msg.chunkId, msg.origin, msg.pieces);
       break;
     }
     case "settle": {
-      endFallFx(msg.piece.id);
-      builtList.push(msg.piece);
-      if (gw) addPanelBody(gw, msg.piece);
-      addBuiltPanelVisual(msg.piece);
+      endChunkView(msg.chunkId);
+      for (const piece of msg.pieces) {
+        builtList.push(piece);
+        if (gw) addPanelBody(gw, piece);
+        addBuiltPanelVisual(piece);
+      }
       break;
     }
     case "crater": {
@@ -1336,6 +1358,7 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
   lastSnapAtMs = receivedAt;
 
   noteArrival(receivedAt, snap.serverTick);
+  noteChunkPoses(snap, receivedAt);
   const prevSelfStatus = selfStatus;
   selfStatus = snap.self.status;
   if ((prevSelfStatus & SS_DEAD) === 0 && (selfStatus & SS_DEAD) !== 0 && predState) {
@@ -1584,13 +1607,17 @@ function predictionPump(): void {
   lastPumpAt = now;
   const rate = 1 + Math.max(-0.06, Math.min(0.06, (TARGET_DEPTH - depthEma) * 0.025));
   tickAccum += dtMs * rate;
+  // Catch up across the whole missed window (dtMs is already clamped to
+  // 250ms): on a starved main thread — software rendering, background tab —
+  // the pump fires rarely, and discarding the remainder used to collapse
+  // input production to a trickle.
   let steps = 0;
-  while (tickAccum >= TICK_MS && steps < 4) {
+  while (tickAccum >= TICK_MS && steps < 8) {
     tickAccum -= TICK_MS;
     predictionTick();
     steps++;
   }
-  if (steps === 4) tickAccum = 0; // tab slept: don't spiral
+  if (steps === 8) tickAccum = Math.min(tickAccum, TICK_MS); // don't spiral
 }
 let lastPumpAt = performance.now();
 setInterval(predictionPump, 8);
@@ -1624,13 +1651,10 @@ function predictionTick(): void {
           ? new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])
           : new THREE.Vector3(eye[0] + dir[0] * 90, eye[1] + dir[1] * 90, eye[2] + dir[2] * 90);
         spawnTracer(from, end);
-        const tag = (hit?.body.userData ?? {}) as {
-          playerIdx?: number;
-          grenadeId?: number;
-          panelId?: number;
-        };
+        const tag = (hit?.body.userData ?? {}) as { playerIdx?: number; grenadeId?: number };
         if (hit && tag.playerIdx === undefined && tag.grenadeId === undefined) {
-          spawnBulletDecal(end, surfaceNormalAt(hit.body, end), tag.panelId);
+          const pieceId = hitPieceId(hit.body, hit.point) ?? undefined;
+          spawnBulletDecal(end, surfaceNormalAt(hit.body, end), pieceId);
         }
       }
     },
@@ -1759,69 +1783,94 @@ function makeSoldier(team: number, name: string): THREE.Group {
 }
 
 // ---------------------------------------------------------------------------
-// Falling pieces: the server simulates released pieces; clients play a
-// cosmetic tumble (gravity + ground bounce + spin) and snap-ease to the
-// authoritative pose when the settle message lands.
+// Falling chunks: a released cluster is ONE rigid body on the server; its
+// pose streams inside snapshots, and we render the cluster's pieces parented
+// to an interpolated group — what you see is the authoritative tumble.
 
-interface FallingFx {
-  mesh: THREE.Mesh;
-  def: PanelDef;
-  vel: THREE.Vector3;
-  spin: THREE.Vector3;
+interface FallingChunkView {
+  group: THREE.Group;
+  origin: [number, number, number];
+  buffer: Array<{ t: number; x: number; y: number; z: number; q: THREE.Quaternion }>;
   bornAt: number;
 }
 
-const fallingFx = new Map<number, FallingFx>();
+const fallingChunks = new Map<number, FallingChunkView>();
 
-function startFallFx(piece: PanelDef): void {
-  const style = PIECE_STYLE[piece.material];
-  const mesh = new THREE.Mesh(style.geo, voxelMat);
-  mesh.userData.sharedGeo = true;
-  mesh.userData.sharedMat = true;
-  pieceMatrix(piece).decompose(mesh.position, mesh.quaternion, mesh.scale);
-  mesh.castShadow = true;
-  mapGroup.add(mesh);
-  fallingFx.set(piece.id, {
-    mesh,
-    def: piece,
-    vel: new THREE.Vector3((Math.random() - 0.5) * 0.6, 0, (Math.random() - 0.5) * 0.6),
-    spin: new THREE.Vector3(
-      (Math.random() - 0.5) * 4,
-      (Math.random() - 0.5) * 2,
-      (Math.random() - 0.5) * 4,
-    ),
-    bornAt: performance.now(),
-  });
+function startChunkView(
+  chunkId: number,
+  origin: [number, number, number],
+  pieces: PanelDef[],
+): void {
+  const group = new THREE.Group();
+  group.position.set(origin[0], origin[1], origin[2]);
+  for (const p of pieces) {
+    const style = PIECE_STYLE[p.material];
+    const mesh = new THREE.Mesh(style.geo, (style.mat as THREE.MeshStandardMaterial).clone());
+    (mesh.material as THREE.MeshStandardMaterial).color.copy(pieceColor(p, _col));
+    mesh.userData.sharedGeo = true;
+    const m = pieceMatrix(p);
+    m.decompose(mesh.position, mesh.quaternion, mesh.scale);
+    mesh.position.x -= origin[0];
+    mesh.position.y -= origin[1];
+    mesh.position.z -= origin[2];
+    mesh.castShadow = true;
+    group.add(mesh);
+  }
+  mapGroup.add(group);
+  fallingChunks.set(chunkId, { group, origin, buffer: [], bornAt: performance.now() });
 }
 
-function endFallFx(id: number): void {
-  const fx = fallingFx.get(id);
-  if (!fx) return;
-  fx.mesh.parent?.remove(fx.mesh);
-  fallingFx.delete(id);
+function endChunkView(chunkId: number): void {
+  const view = fallingChunks.get(chunkId);
+  if (!view) return;
+  for (const child of view.group.children) {
+    if (child instanceof THREE.Mesh) (child.material as THREE.Material).dispose();
+  }
+  view.group.parent?.remove(view.group);
+  fallingChunks.delete(chunkId);
 }
 
-function stepFallingFx(dt: number): void {
+// Buffer poses from snapshots (same delayed-interpolation as remotes).
+function noteChunkPoses(snap: Snapshot, receivedAt: number): void {
+  for (const c of snap.chunks) {
+    const view = fallingChunks.get(c.id);
+    if (!view) continue;
+    view.buffer.push({
+      t: receivedAt,
+      x: c.x,
+      y: c.y,
+      z: c.z,
+      q: new THREE.Quaternion(c.qx, c.qy, c.qz, c.qw),
+    });
+    if (view.buffer.length > 40) view.buffer.splice(0, view.buffer.length - 40);
+  }
+}
+
+const _chunkQ = new THREE.Quaternion();
+
+function renderFallingChunks(renderT: number): void {
   const now = performance.now();
-  for (const [id, fx] of fallingFx) {
-    if (now - fx.bornAt > 8000) {
-      endFallFx(id); // settle never arrived (lost stream?) — give up quietly
+  for (const [id, view] of fallingChunks) {
+    if (now - view.bornAt > 10000) {
+      endChunkView(id); // settle lost — give up quietly
       continue;
     }
-    fx.vel.y -= 16 * dt;
-    fx.mesh.position.addScaledVector(fx.vel, dt);
-    const r = Math.min(fx.def.ex, fx.def.ey, fx.def.ez) / 2;
-    const ground = heightAt(fx.mesh.position.x, fx.mesh.position.z) + r;
-    if (fx.mesh.position.y < ground) {
-      fx.mesh.position.y = ground;
-      fx.vel.y *= -0.25;
-      fx.vel.x *= 0.7;
-      fx.vel.z *= 0.7;
-      fx.spin.multiplyScalar(0.7);
+    const buf = view.buffer;
+    if (buf.length === 0) continue;
+    let a = buf[0];
+    let b = buf[buf.length - 1];
+    for (let i = buf.length - 1; i >= 0; i--) {
+      if (buf[i].t <= renderT) {
+        a = buf[i];
+        b = buf[Math.min(i + 1, buf.length - 1)];
+        break;
+      }
     }
-    fx.mesh.rotation.x += fx.spin.x * dt;
-    fx.mesh.rotation.y += fx.spin.y * dt;
-    fx.mesh.rotation.z += fx.spin.z * dt;
+    const span = Math.max(1, b.t - a.t);
+    const u = Math.max(0, Math.min(1, (renderT - a.t) / span));
+    view.group.position.set(a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u, a.z + (b.z - a.z) * u);
+    _chunkQ.slerpQuaternions(a.q, b.q, u);
+    view.group.quaternion.copy(_chunkQ);
   }
 }
 
@@ -2198,14 +2247,15 @@ function processEvents(list: GameEvent[]): void {
             if (len > 0.5 && len < 89) {
               d.divideScalar(len);
               const hit = castLocal([from.x, from.y, from.z], [d.x, d.y, d.z], len + 0.4);
-              const tag = (hit?.body.userData ?? {}) as { playerIdx?: number; panelId?: number };
+              const tag = (hit?.body.userData ?? {}) as { playerIdx?: number };
               if (
                 hit &&
                 tag.playerIdx === undefined &&
                 at.distanceToSquared(new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])) <
                   0.36
               ) {
-                spawnBulletDecal(at, surfaceNormalAt(hit.body, at), tag.panelId);
+                const pieceId = hitPieceId(hit.body, hit.point) ?? undefined;
+                spawnBulletDecal(at, surfaceNormalAt(hit.body, at), pieceId);
               }
             }
           }
@@ -2330,7 +2380,6 @@ function frame(): void {
   if (meleeSwing > 0) meleeSwing = Math.max(0, meleeSwing - dt * 4);
   stepClouds(dt);
   stepRagdolls(dt);
-  stepFallingFx(dt);
   (grassMat.uniforms.uTime as { value: number }).value = now / 1000;
 
   // Camera at the predicted eye, interpolated between the last two ticks so
@@ -2390,6 +2439,7 @@ function frame(): void {
 
   // Remotes (interpolated in the past).
   const renderT = now - interpDelayMs;
+  renderFallingChunks(renderT);
   for (const rp of remotes.values()) {
     if (rp.buffer.length === 0) continue;
     const buf = rp.buffer;
@@ -2634,8 +2684,7 @@ window.__fps = {
     const dir = [Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
     const eye = [predState.x, predState.y + EYE_HEIGHT, predState.z];
     const hit = castLocal(eye, dir, 30);
-    const tag = (hit?.body.userData ?? {}) as { panelId?: number };
-    return tag.panelId ?? null;
+    return hit ? hitPieceId(hit.body, hit.point) : null;
   },
   dbgEvents: () => [dbgEvents, dbgMyTracers, dbgHitEvents] as [number, number, number],
   remotePos: (idx) => {

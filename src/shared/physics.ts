@@ -24,6 +24,7 @@ import {
   RELOAD_TICKS,
   RIFLE_COOLDOWN_TICKS,
   RIFLE_MAG,
+  SANDBOX,
   TICK_RATE,
 } from "./constants.js";
 import {
@@ -151,22 +152,26 @@ export function joltModule(): Promise<unknown> {
 // Game world.
 
 interface BodyTag {
-  panelId?: number;
+  panelId?: number; // a single runtime piece (deployed cover, rubble, settled)
+  slabIdx?: number; // a map structure slab (one body, many pieces)
   playerIdx?: number;
   grenadeId?: number;
-  fallingId?: number; // a released piece mid-tumble (server-side dynamic)
+  fallingId?: number; // a released chunk mid-tumble (server-side dynamic)
   static?: boolean;
 }
 
 export interface GameWorld {
   world: World;
-  panels: Map<number, Body>; // destructible, by panel id (map + built)
+  slabs: Map<number, Body>; // map structure slabs, by slab index
+  panels: Map<number, Body>; // runtime single pieces, by panel id
   players: Map<number, Body>; // by player idx
   grenades: Map<number, Body>; // by grenade id
   terrain: Map<number, Body>; // by chunk key ci * TERRAIN_CHUNKS + cj
 }
 
-export async function createGameWorld(): Promise<GameWorld> {
+export type AliveFn = (pieceId: number) => boolean;
+
+export async function createGameWorld(destroyed?: ReadonlySet<number>): Promise<GameWorld> {
   const raw = await joltModule();
   const world = await World.create({
     raw: raw as never,
@@ -175,11 +180,13 @@ export async function createGameWorld(): Promise<GameWorld> {
   });
   const gw: GameWorld = {
     world,
+    slabs: new Map(),
     panels: new Map(),
     players: new Map(),
     grenades: new Map(),
     terrain: new Map(),
   };
+  const alive: AliveFn = destroyed ? (id) => !destroyed.has(id) : () => true;
 
   // Terrain: chunked triangle meshes from the shared heightfield (chunked so
   // crater digs only rebuild the touched tiles), plus a safety slab
@@ -206,12 +213,15 @@ export async function createGameWorld(): Promise<GameWorld> {
       userData: { static: true } satisfies BodyTag,
     });
   }
-  for (const p of MAP.panels) addPanelBody(gw, p);
+  for (let slabIdx = 0; slabIdx < MAP.slabs.length; slabIdx++) {
+    rebuildSlabBody(gw, slabIdx, alive);
+  }
   return gw;
 }
 
 export function destroyGameWorld(gw: GameWorld): void {
   gw.world.dispose();
+  gw.slabs.clear();
   gw.panels.clear();
   gw.players.clear();
   gw.grenades.clear();
@@ -243,6 +253,155 @@ export function applyCraterBodies(gw: GameWorld, c: Crater): void {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Slab collision: one static body per structure face/sheet/stack. The shape
+// is a compound of boxes GREEDY-MERGED from the slab's alive pieces — a
+// pristine wall is a handful of boxes, not 750 — rebuilt whenever the
+// slab's damage set changes. Deterministic (stable sorts over exact piece
+// coordinates), so server and prediction worlds build identical shapes.
+
+interface MergeBox {
+  x0: number;
+  y0: number;
+  z0: number;
+  x1: number;
+  y1: number;
+  z1: number;
+}
+
+const TOUCH = 1e-3;
+
+// One pass: merge boxes that touch along `axis` and match exactly on the
+// other two. Returns true if anything merged.
+function mergeAlong(boxes: MergeBox[], axis: 0 | 1 | 2): boolean {
+  const lo = ["x0", "y0", "z0"] as const;
+  const hi = ["x1", "y1", "z1"] as const;
+  const a = lo[axis];
+  const b = hi[axis];
+  const others: Array<0 | 1 | 2> = axis === 0 ? [1, 2] : axis === 1 ? [0, 2] : [0, 1];
+  const key = (m: MergeBox): string =>
+    `${m[lo[others[0]]].toFixed(4)},${m[hi[others[0]]].toFixed(4)},${m[lo[others[1]]].toFixed(4)},${m[hi[others[1]]].toFixed(4)}`;
+  const groups = new Map<string, MergeBox[]>();
+  for (const m of boxes) {
+    const k = key(m);
+    const list = groups.get(k);
+    if (list) list.push(m);
+    else groups.set(k, [m]);
+  }
+  let merged = false;
+  boxes.length = 0;
+  for (const group of groups.values()) {
+    group.sort((p, q) => p[a] - q[a]);
+    let cur = group[0];
+    for (let i = 1; i < group.length; i++) {
+      const next = group[i];
+      if (next[a] <= cur[b] + TOUCH) {
+        cur[b] = Math.max(cur[b], next[b]);
+        merged = true;
+      } else {
+        boxes.push(cur);
+        cur = next;
+      }
+    }
+    boxes.push(cur);
+  }
+  return merged;
+}
+
+export function mergeSlabBoxes(pieces: readonly PanelDef[], alive: AliveFn): MergeBox[] {
+  const boxes: MergeBox[] = [];
+  for (const p of pieces) {
+    if (!alive(p.id)) continue;
+    boxes.push({
+      x0: p.x - p.ex / 2,
+      y0: p.y - p.ey / 2,
+      z0: p.z - p.ez / 2,
+      x1: p.x + p.ex / 2,
+      y1: p.y + p.ey / 2,
+      z1: p.z + p.ez / 2,
+    });
+  }
+  // Row runs first, then stack runs vertically, then across; repeat once to
+  // catch merges the first ordering missed.
+  for (let round = 0; round < 2; round++) {
+    let any = false;
+    any = mergeAlong(boxes, 0) || any;
+    any = mergeAlong(boxes, 2) || any;
+    any = mergeAlong(boxes, 1) || any;
+    if (!any) break;
+  }
+  return boxes;
+}
+
+// (Re)build a slab's body from its alive pieces. No alive pieces = no body.
+export function rebuildSlabBody(gw: GameWorld, slabIdx: number, alive: AliveFn): void {
+  const old = gw.slabs.get(slabIdx);
+  if (old) {
+    gw.world.removeBody(old);
+    gw.slabs.delete(slabIdx);
+  }
+  const slab = MAP.slabs[slabIdx];
+  const pieces = MAP.panels.slice(slab.first - 1, slab.last); // ids are 1-based & sequential
+  const boxes = mergeSlabBoxes(pieces, alive);
+  if (boxes.length === 0) return;
+  const body = gw.world.createBody({
+    type: "static",
+    shape: Shape.compound(
+      boxes.map((m) => ({
+        shape: Shape.box({
+          halfExtents: [(m.x1 - m.x0) / 2, (m.y1 - m.y0) / 2, (m.z1 - m.z0) / 2],
+        }),
+        position: [(m.x0 + m.x1) / 2, (m.y0 + m.y1) / 2, (m.z0 + m.z1) / 2] as [
+          number,
+          number,
+          number,
+        ],
+      })),
+    ),
+    position: [0, 0, 0],
+    layer: "static",
+    friction: 0.6,
+    userData: { slabIdx } satisfies BodyTag,
+  });
+  gw.slabs.set(slabIdx, body);
+}
+
+// Which alive piece of a slab contains this (surface) point? Hits land on
+// faces, so accept the piece whose box the point is closest to inside a
+// small tolerance.
+export function pieceAt(slabIdx: number, point: readonly number[], alive: AliveFn): number | null {
+  const slab = MAP.slabs[slabIdx];
+  let best = -1;
+  let bestD = 0.06;
+  for (let id = slab.first; id <= slab.last; id++) {
+    if (!alive(id)) continue;
+    const p = MAP.panels[id - 1];
+    const d = Math.max(
+      Math.abs(point[0] - p.x) - p.ex / 2,
+      Math.abs(point[1] - p.y) - p.ey / 2,
+      Math.abs(point[2] - p.z) - p.ez / 2,
+    );
+    if (d < bestD) {
+      bestD = d;
+      best = id;
+    }
+  }
+  return best >= 0 ? best : null;
+}
+
+// Resolve a raycast hit to a piece id: runtime pieces carry their id; slab
+// hits resolve analytically from the hit position.
+export function pieceIdFromHit(
+  body: Body,
+  point: readonly number[],
+  alive: AliveFn,
+): number | null {
+  const tag = body.userData as BodyTag;
+  if (tag.panelId !== undefined) return tag.panelId;
+  if (tag.slabIdx !== undefined) return pieceAt(tag.slabIdx, point, alive);
+  return null;
+}
+
 export function addPanelBody(gw: GameWorld, p: PanelDef): Body {
   const body = gw.world.createBody({
     type: "static",
@@ -257,25 +416,34 @@ export function addPanelBody(gw: GameWorld, p: PanelDef): Body {
   return body;
 }
 
-// A piece released by the support cascade: same box, but dynamic — it
-// tumbles under the server's simulation until it settles (server-only;
-// clients play the fall cosmetically and get the resting pose).
-export function createFallingBody(
+// A connected cluster of released pieces as ONE rigid dynamic body: a
+// compound of boxes at their offsets from the cluster origin. The slab tips
+// and tumbles coherently under the server's simulation (server-only; clients
+// render the streamed pose and get the resting split on settle).
+export function createFallingChunkBody(
   gw: GameWorld,
   id: number,
-  p: PanelDef,
+  origin: readonly number[],
+  pieces: readonly PanelDef[],
   vel: readonly number[],
 ): Body {
   return gw.world.createBody({
     type: "dynamic",
-    shape: Shape.box({ halfExtents: [p.ex / 2, p.ey / 2, p.ez / 2] }),
-    position: [p.x, p.y, p.z],
-    rotation: p.rot ?? [0, 0, 0, 1],
+    shape: Shape.compound(
+      pieces.map((p) => ({
+        shape: Shape.box({ halfExtents: [p.ex / 2, p.ey / 2, p.ez / 2] }),
+        position: [p.x - origin[0], p.y - origin[1], p.z - origin[2]] as [number, number, number],
+      })),
+    ),
+    position: [origin[0], origin[1], origin[2]],
     layer: "moving",
     friction: 0.85,
-    restitution: 0.08,
-    linearDamping: 0.12,
-    angularDamping: 0.4,
+    restitution: 0.05,
+    linearDamping: 0.15,
+    angularDamping: 0.6,
+    // Continuous collision: thin pieces falling a few meters tunnel through
+    // the terrain mesh with discrete steps and vanish below the world.
+    motionQuality: "linearCast",
     linearVelocity: [vel[0], vel[1], vel[2]],
     userData: { fallingId: id } satisfies BodyTag,
   });
@@ -537,6 +705,13 @@ export function stepPlayerController(
   }
 
   // --- Weapons (deterministic state; effects via hooks). ---
+  if (SANDBOX) {
+    // Bottomless supplies in the test environment (shared constant, so
+    // prediction and server still agree exactly).
+    s.ammo = Math.max(s.ammo, RIFLE_MAG);
+    s.grenades = Math.max(s.grenades, GRENADE_COUNT);
+    s.supply = Math.max(s.supply, BUILD_SUPPLY);
+  }
   if (s.cooldownTicks > 0) s.cooldownTicks--;
   if (s.reloadTicks > 0) {
     s.reloadTicks--;
