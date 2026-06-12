@@ -354,6 +354,7 @@ function building(
   d: number,
   doorSide: 0 | 1 | 2 | 3,
   style: "brick" | "log",
+  stories = 1,
 ): void {
   const id = nextBuildingId++;
   const firstPanel = nextPanelId;
@@ -362,37 +363,24 @@ function building(
   const z0 = cz - d / 2;
   const z1 = cz + d / 2;
   const unit = style === "brick" ? BRICK : LOG;
-  const rows = Math.round(WALL_HEIGHT / unit.h);
+  const rowsPerStory = Math.round(WALL_HEIGHT / unit.h);
+  const height = stories * WALL_HEIGHT;
 
-  // Door: 1.3m x 2.05m, centered. Windows: 2.1m wide at sill height, on
-  // every other wall. Pieces are clipped, so brick walls get cut bricks
-  // around openings and log walls get sawed log ends.
+  // Door: 1.3m x 2.05m, centered, ground floor only. Windows: 2.1m wide at
+  // sill height on every other ground wall and on EVERY upper-story wall.
+  // Pieces are clipped, so brick walls get cut bricks around openings and
+  // log walls get sawed log ends.
   const door = (mid: number): GapRect[] => [{ lo: mid - 0.65, hi: mid + 0.65, y0: 0, y1: 2.05 }];
-  const win = (mid: number): GapRect[] => [{ lo: mid - 1.05, hi: mid + 1.05, y0: 1.3, y1: 2.05 }];
-  const pick = (side: number, mid: number) => (doorSide === side ? door(mid) : win(mid));
-
-  masonryRun(g, "x", x0, x1, z1, 0, rows, unit, style, id, pick(0, cx));
-  masonryRun(g, "x", x0, x1, z0, 0, rows, unit, style, id, pick(1, cx));
-  masonryRun(g, "z", z0, z1, x1, 0, rows, unit, style, id, pick(2, cz));
-  masonryRun(g, "z", z0, z1, x0, 0, rows, unit, style, id, pick(3, cz));
-
-  // Windowpanes fill the window openings: one hit shatters them. They fall
-  // with the building but don't count toward its integrity.
-  const glassIds: number[] = [];
-  const walls: Array<[axis: "x" | "z", mid: number, fixed: number]> = [
-    ["x", cx, z1],
-    ["x", cx, z0],
-    ["z", cz, x1],
-    ["z", cz, x0],
+  const win = (mid: number, baseY: number): GapRect[] => [
+    { lo: mid - 1.05, hi: mid + 1.05, y0: baseY + 1.3, y1: baseY + 2.05 },
   ];
-  for (let side = 0; side < 4; side++) {
-    if (side === doorSide) continue;
-    const [axis, mid, fixed] = walls[side];
+  const glassIds: number[] = [];
+  const pane = (axis: "x" | "z", mid: number, fixed: number, baseY: number): void => {
     glassIds.push(nextPanelId);
     g.panels.push({
       id: nextPanelId++,
       x: axis === "x" ? mid : fixed,
-      y: (1.3 + 2.05) / 2,
+      y: baseY + (1.3 + 2.05) / 2,
       z: axis === "x" ? fixed : mid,
       ex: axis === "x" ? 2.1 : 0.06,
       ey: 2.05 - 1.3,
@@ -400,6 +388,24 @@ function building(
       material: "glass",
       buildingId: id,
     });
+  };
+
+  const walls: Array<[axis: "x" | "z", mid: number, fixed: number]> = [
+    ["x", cx, z1],
+    ["x", cx, z0],
+    ["z", cz, x1],
+    ["z", cz, x0],
+  ];
+  for (let story = 0; story < stories; story++) {
+    const baseY = story * WALL_HEIGHT;
+    for (let side = 0; side < 4; side++) {
+      const [axis, mid, fixed] = walls[side];
+      const a0 = axis === "x" ? x0 : z0;
+      const a1 = axis === "x" ? x1 : z1;
+      const gaps = story === 0 && side === doorSide ? door(mid) : win(mid, baseY);
+      masonryRun(g, axis, a0, a1, fixed, baseY, rowsPerStory, unit, style, id, gaps);
+      if (!(story === 0 && side === doorSide)) pane(axis, mid, fixed, baseY);
+    }
   }
 
   // Structural corner posts — destructible like everything else, just tough.
@@ -412,46 +418,85 @@ function building(
     g.panels.push({
       id: nextPanelId++,
       x: px,
-      y: WALL_HEIGHT / 2,
+      y: height / 2,
       z: pz,
       ex: 0.3,
-      ey: WALL_HEIGHT,
+      ey: height,
       ez: 0.3,
       material: "post",
       buildingId: id,
     });
   }
 
-  // Roof: staggered planks laid across the footprint.
+  // The stairwell hole (multi-story only): a column along the west wall that
+  // every upper floor leaves open, with switchback flights of floating
+  // treads inside it. Step-up assist walks them like real stairs.
   const roofIds: number[] = [];
-  const roofY = WALL_HEIGHT + PLANK.h / 2;
-  const strips = Math.round(d / PLANK.w);
-  const npl = Math.round(w / PLANK.l);
-  for (let s = 0; s < strips; s++) {
-    const z = z0 + (s + 0.5) * PLANK.w;
-    const segs: Array<[number, number]> = [];
-    if (s % 2 === 0) {
-      for (let i = 0; i < npl; i++) segs.push([x0 + (i + 0.5) * PLANK.l, PLANK.l]);
-    } else {
-      segs.push([x0 + PLANK.l / 4, PLANK.l / 2]);
-      for (let i = 0; i < npl - 1; i++) {
-        segs.push([x0 + PLANK.l / 2 + (i + 0.5) * PLANK.l, PLANK.l]);
-      }
-      segs.push([x1 - PLANK.l / 4, PLANK.l / 2]);
-    }
-    for (const [c, l] of segs) {
+  const stairHole: GapRect | null =
+    stories > 1 ? { lo: x0 + 0.55, hi: x0 + 1.8, y0: z0 + 1.0, y1: z0 + 5.35 } : null;
+  const STAIR_RISE = WALL_HEIGHT / 10;
+  const STAIR_RUN = 0.42;
+  for (let flight = 0; flight < stories - 1; flight++) {
+    const baseY = flight * WALL_HEIGHT;
+    const up = flight % 2 === 0; // switchback: alternate +z / -z
+    for (let k = 0; k < 10; k++) {
+      const z = up ? z0 + 1.3 + k * STAIR_RUN : z0 + 5.05 - k * STAIR_RUN;
       roofIds.push(nextPanelId);
       g.panels.push({
         id: nextPanelId++,
-        x: c,
-        y: roofY,
+        x: x0 + 1.17,
+        y: baseY + (k + 1) * STAIR_RISE - 0.06,
         z,
-        ex: l,
-        ey: PLANK.h,
-        ez: PLANK.w,
+        ex: 1.15,
+        ey: 0.12,
+        ez: 0.5,
         material: "plank",
         buildingId: id,
       });
+    }
+  }
+
+  // Floors between stories and the roof: staggered planks laid across the
+  // footprint; upper floors keep the stairwell column open.
+  const strips = Math.round(d / PLANK.w);
+  const npl = Math.round(w / PLANK.l);
+  for (let level = 1; level <= stories; level++) {
+    const y = level * WALL_HEIGHT + PLANK.h / 2;
+    const isRoof = level === stories;
+    for (let s = 0; s < strips; s++) {
+      const z = z0 + (s + 0.5) * PLANK.w;
+      const inHoleZ = !isRoof && stairHole !== null && z > stairHole.y0 && z < stairHole.y1;
+      const segs: Array<[number, number]> = [];
+      if (s % 2 === 0) {
+        for (let i = 0; i < npl; i++) segs.push([x0 + (i + 0.5) * PLANK.l, PLANK.l]);
+      } else {
+        segs.push([x0 + PLANK.l / 4, PLANK.l / 2]);
+        for (let i = 0; i < npl - 1; i++) {
+          segs.push([x0 + PLANK.l / 2 + (i + 0.5) * PLANK.l, PLANK.l]);
+        }
+        segs.push([x1 - PLANK.l / 4, PLANK.l / 2]);
+      }
+      for (const [c, l] of segs) {
+        // Clip floor planks against the stairwell column (x interval).
+        const frags =
+          inHoleZ && stairHole !== null
+            ? clipAgainstGaps(c, l, 0.5, 1, [{ lo: stairHole.lo, hi: stairHole.hi, y0: 0, y1: 1 }])
+            : ([[c, l]] as Array<[number, number]>);
+        for (const [fc, fl] of frags) {
+          roofIds.push(nextPanelId);
+          g.panels.push({
+            id: nextPanelId++,
+            x: fc,
+            y,
+            z,
+            ex: fl,
+            ey: PLANK.h,
+            ez: PLANK.w,
+            material: "plank",
+            buildingId: id,
+          });
+        }
+      }
     }
   }
 
@@ -583,15 +628,16 @@ function buildMap(): MapDef {
   g.statics.push({ x: half, y: 1.5, z: 0, w: 1, h: 3, d: SIZE, kind: "wall" });
 
   // Buildings on their flat pads (positions match FLAT_PADS): six brick,
-  // three log cabins.
-  building(g, 0, 0, 10, 8, 0, "brick");
+  // three log cabins. The center house and the north house are two-story;
+  // the east building is a three-story tower overlooking the duel lane.
+  building(g, 0, 0, 10, 8, 0, "brick", 2);
   building(g, -15, -12, 8, 8, 2, "brick");
   building(g, 15, 12, 8, 8, 3, "log");
   building(g, 16, -14, 8, 6, 0, "log");
   building(g, -16, 14, 8, 6, 1, "brick");
-  building(g, 32, 4, 8, 8, 3, "brick");
+  building(g, 32, 4, 8, 8, 3, "brick", 3);
   building(g, -32, -25, 8, 6, 0, "log");
-  building(g, -31, 27, 8, 6, 1, "brick");
+  building(g, -31, 27, 8, 6, 1, "brick", 2);
   building(g, 14, -30, 8, 6, 0, "brick");
 
   // Procedural placement for everything else, rejected against keep-outs.

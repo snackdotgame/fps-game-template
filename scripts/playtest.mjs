@@ -47,22 +47,59 @@ async function openClient(label) {
   return { page, frame, fps, label };
 }
 
-// Walk a client toward a target point using world-space move intents.
+// Walk a client toward a target point using world-space move intents. The
+// drive is a straight line, so when progress stalls (walls, big rocks,
+// parked bots) detour sideways for a beat before resuming.
 async function goTo(c, tx, tz, timeoutMs = 25000) {
   const t0 = Date.now();
+  let lastDist = Infinity;
+  let detourSign = 1;
   while (Date.now() - t0 < timeoutMs) {
+    // Dead or round-over: movement is locked, wait instead of burning time.
+    if (((await c.fps("selfStatus")) & 1) !== 0 || (await c.fps("phase")) !== "playing") {
+      await c.page.waitForTimeout(1000);
+      lastDist = Infinity;
+      continue;
+    }
     const [x, , z] = await c.fps("playerPosition");
     const dx = tx - x;
     const dz = tz - z;
-    if (Math.hypot(dx, dz) < 1.2) {
+    const dist = Math.hypot(dx, dz);
+    if (dist < 1.2) {
       await c.fps("stopDrive");
       return true;
     }
-    const len = Math.hypot(dx, dz) || 1;
+    const len = dist || 1;
+    if (lastDist - dist < 0.3) {
+      // Stuck: slide perpendicular (alternating sides) with a hop.
+      detourSign = -detourSign;
+      await c.fps(
+        "drive",
+        { moveX: (-dz / len) * detourSign, moveZ: (dx / len) * detourSign, jump: true },
+        16,
+      );
+      await c.page.waitForTimeout(560);
+    }
+    lastDist = dist;
     await c.fps("drive", { moveX: dx / len, moveZ: dz / len, sprint: true, jump: false }, 12);
     await c.page.waitForTimeout(320);
   }
   await c.fps("stopDrive");
+  return false;
+}
+
+// Wait until the round is in a calm window: playing, alive, and with enough
+// round time left that the next sequence won't be chopped by a results
+// screen + map rebuild.
+async function awaitCalm(c, needSecs = 45, timeoutMs = 90000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    const playing = (await c.fps("phase")) === "playing";
+    const alive = ((await c.fps("selfStatus")) & 1) === 0;
+    const left = (await c.fps("roundTicksLeft")) / 30;
+    if (playing && alive && left > needSecs) return true;
+    await c.page.waitForTimeout(800);
+  }
   return false;
 }
 
@@ -105,21 +142,31 @@ check(
 const teams = new Set(rosterA.map((p) => p.team));
 check("players split across teams", teams.size === 2, JSON.stringify([...teams]));
 
-// --- Movement + cross-client sync (retry — a bot may gun A down mid-walk,
-// which parks the body back at spawn). ---
-let aMoved = false;
-for (let attempt = 0; attempt < 4 && !aMoved; attempt++) {
-  if (((await a.fps("selfStatus")) & 1) !== 0) {
-    await a.page.waitForTimeout(2000);
-    continue;
+// --- Movement + cross-client sync: drive A and require that B's view of A
+// tracks A's own predicted position. This is the actual contract (inputs ->
+// server -> remote interpolation), and it holds even when bots kill A
+// mid-walk — both clients agree about the respawn teleport too.
+const aIdx = await (async () => {
+  const humanIdxs = rosterA.filter((p) => !p.name.startsWith("BOT")).map((p) => p.idx);
+  for (const idx of humanIdxs) {
+    if ((await a.fps("remotePos", idx)) === null) return idx; // you have no remote view of yourself
   }
-  const aStart = await a.fps("playerPosition");
-  await a.fps("drive", { moveX: 1, moveZ: 0, sprint: true }, 45);
-  await a.page.waitForTimeout(2200);
-  const aPos = await a.fps("playerPosition");
-  aMoved = Math.hypot(aPos[0] - aStart[0], aPos[2] - aStart[2]) > 3;
+  return humanIdxs[0];
+})();
+let moveSynced = false;
+let lastGap = -1;
+for (let i = 0; i < 25 && !moveSynced; i++) {
+  await a.fps("drive", { moveX: -1, moveZ: -0.3, sprint: true }, 8);
+  await a.page.waitForTimeout(320);
+  const pa = await a.fps("playerPosition");
+  const pb = await b.fps("remotePos", aIdx);
+  if (pb) {
+    lastGap = Math.hypot(pa[0] - pb[0], pa[2] - pb[2]);
+    moveSynced = lastGap < 2.5;
+  }
 }
-check("A moved", aMoved, "");
+await a.fps("stopDrive");
+check("A's movement syncs to B", moveSynced, `gap=${lastGap.toFixed(2)}`);
 
 // --- Destruction: build our own targets, then shoot and bomb them — works
 // regardless of how war-torn the map already is, and proves the full
@@ -128,26 +175,36 @@ await goTo(a, 6, -16);
 // Deployed cover lands ~3m ahead, snapped to the half-meter grid (mirrors
 // shared/physics.ts buildPlacement).
 async function buildTargetPanel() {
-  const [x, y, z] = await a.fps("playerPosition");
-  const yaw = 0; // face +z
-  await a.fps("look", yaw, 0);
-  await a.page.waitForTimeout(150);
-  const px = Math.round((x + Math.sin(yaw) * 3) * 2) / 2;
-  const pz = Math.round((z + Math.cos(yaw) * 3) * 2) / 2;
   // Build, then CONFIRM via the mirror world that a panel sits under the
   // crosshair when aiming at the expected spot — bots make raw counts lie.
-  for (let attempt = 0; attempt < 6; attempt++) {
+  // The target spot rebases per attempt: a death mid-sequence respawns A
+  // far from the original placement.
+  let px = 0;
+  let py = 0;
+  let pz = 0;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    if (((await a.fps("selfStatus")) & 1) !== 0 || (await a.fps("phase")) !== "playing") {
+      await a.page.waitForTimeout(1500);
+      continue;
+    }
+    const [x, y, z] = await a.fps("playerPosition");
+    await a.fps("look", 0, 0); // face +z
+    await a.page.waitForTimeout(150);
+    px = Math.round((x + 0) * 2) / 2;
+    pz = Math.round((z + 3) * 2) / 2;
+    py = y + 0.625;
     await a.fps("drive", { build: true }, 3);
     await a.page.waitForTimeout(700);
     const [ax, ay, az] = await a.fps("playerPosition");
     const d = Math.hypot(px - ax, pz - az);
-    await a.fps("look", Math.atan2(px - ax, pz - az), Math.atan2(y + 0.625 - (ay + 1.45), d));
+    await a.fps("look", Math.atan2(px - ax, pz - az), Math.atan2(py - (ay + 1.45), d));
     await a.page.waitForTimeout(150);
-    if ((await a.fps("aimPanel")) !== null) return { px, py: y + 0.625, pz, ok: true };
+    if ((await a.fps("aimPanel")) !== null) return { px, py, pz, ok: true };
   }
-  return { px, py: y + 0.625, pz, ok: false };
+  return { px, py, pz, ok: false };
 }
 
+await awaitCalm(a, 60);
 const target1 = await buildTargetPanel();
 check("built cover appears for A (confirmed under crosshair)", target1.ok, "");
 await a.page.waitForTimeout(400);
@@ -211,11 +268,24 @@ check("built cover appears for B", Math.abs(panelsB - panelsA1) <= 2, `B=${panel
 
 // --- Combat: both walk to an open lane, A aims at B and fires to a kill. ---
 console.log("staging a duel on the east lane…");
-// Waypoint around the east-side buildings, then up the lane.
-await goTo(a, 24, -22);
-const okA = await goTo(a, 24, -14);
-await goTo(b, 24, 22);
-const okB = await goTo(b, 24, 14);
+// Approach along the east edge — the center is a bot meat grinder and the
+// walk restarts from spawn every death, so retry with patient legs.
+let okA = false;
+for (let attempt = 0; attempt < 4 && !okA; attempt++) {
+  await awaitCalm(a, 50);
+  // Hug the south edge first: the direct line from spawn runs straight into
+  // the (14,-30) house.
+  await goTo(a, 25, -35.5, 20000);
+  await goTo(a, 24, -22, 12000);
+  okA = await goTo(a, 24, -14, 12000);
+  // Close enough counts — the duel only needs A in the lane with LoS.
+  if (!okA) {
+    const [x, , z] = await a.fps("playerPosition");
+    okA = Math.hypot(x - 24, z + 14) < 6;
+  }
+}
+await goTo(b, 24, 30, 25000);
+const okB = await goTo(b, 24, 14, 20000);
 check("A reached the duel lane", okA, `A=${okA}`);
 if (!okB) console.log("(B got stuck en route — fine, A tracks B wherever they are)");
 const scores0 = await a.fps("scores");

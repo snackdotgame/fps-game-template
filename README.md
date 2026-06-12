@@ -18,9 +18,21 @@ grenades blow buildings open — and you can deploy fresh cover of your own.
   and explosions delete pieces up close while cracking them in an outer falloff ring.
 - **Everything is destructible, piece by material-shaped piece**: brick walls are
   individual clay bricks in running bond (gunfire knocks out single bricks), cabins
-  are stacked logs, roofs are planks, trees are trunk segments and foliage clumps,
-  and sandbags, crates, and corner posts all break too. Only the ground and the
-  arena's perimeter can't be destroyed.
+  are stacked logs, roofs and floors are planks, windowpanes shatter to a single
+  hit, trees are trunk segments and foliage cubes, and sandbags, crates, boulders,
+  and corner posts all break too. Only the bedrock and the arena's perimeter can't
+  be destroyed.
+- **Multi-story buildings**: the center house and north house are two-story, and a
+  three-story tower overlooks the east lane — switchback staircases of floating
+  plank treads (destructible, naturally), upper-floor windows, and a shared
+  **step-up assist** in the controller so stairs and low cover walk smoothly.
+- **Terrain destruction**: ground-level explosions dig real craters — the shared
+  heightfield drops, chunked Jolt terrain tiles rebuild on both sides, crater bowls
+  render scorched, and the grass clears out. Pads and spawns can't be undermined.
+- **The level keeps evolving**: destroyed pieces chance-shed persistent rubble
+  chunks that collide, obstruct, and are destructible in turn; felled trees leave
+  their trunks; craters accumulate; bullet decals mark the walls; and dead
+  soldiers' ragdolls linger on the field (~50s) before fading away.
 - **Uneven terrain**: rolling noise-generated ground (one shared height function drives
   both Jolt collision and the rendered mesh), with ridgelines as natural cover and
   buildings on flat pads.
@@ -34,7 +46,7 @@ grenades blow buildings open — and you can deploy fresh cover of your own.
   preview). Deployed cover is destructible like everything else.
 - Health regen after 6s, 3s respawns with brief spawn protection, kill feed, Tab
   scoreboard.
-- **Bots** fill the server to 6 combatants, so there's a war on from the first click.
+- **Bots** fill the server to 8 combatants, so there's a war on from the first click.
   Each joining human replaces a bot (and a bot returns when a human leaves). Bots play
   through the exact same controller and weapon hooks as humans — they patrol, acquire
   targets with real line-of-sight raycasts, strafe and burst-fire with distance-scaled
@@ -54,16 +66,19 @@ shoot through the hole your grenade just made, and prediction collides with the 
 breached geometry the server does.
 
 - `src/shared/map.ts` — a **procedurally generated battlefield** from a fixed seed
-  (change `MAP_SEED` for a new layout): value-noise terrain with real relief
-  (flattened under buildings and spawns, identical Jolt mesh collision and rendered
-  geometry from one height function), and **~3,100 material-shaped destructible
-  pieces**: three brick houses laid brick-by-brick in running bond (with cut bricks
-  around the door and window openings), two log cabins of stacked 2m logs, plank
-  roofs, timber corner posts, sandbag emplacements, supply crates, and
-  **destructible trees** (four trunk segments + foliage clumps — two sledge swings
-  or a blast to the trunk fells the whole tree). Per-material HP: a brick dies to
-  one sledge swing, a log takes two, posts are tough. Deployed cover becomes a
-  steel piece at runtime.
+  (change `MAP_SEED` for a new layout): an 84m arena of value-noise terrain with
+  real relief (flattened under buildings and spawns, identical chunked Jolt mesh
+  collision and rendered geometry from one height function, craters subtracted by
+  the same function on both sides), and **~9,000 material-shaped destructible
+  pieces**: nine buildings (six brick laid brick-by-brick in running bond with cut
+  bricks around openings, three log cabins of stacked 2m logs; three of them
+  multi-story with plank floors and switchback stairs), glass windowpanes, plank
+  roofs, timber corner posts, sandbag emplacements, supply crates, boulder
+  clusters, and **two species of procedural destructible trees** (oak cube-crowns
+  and tiered pines, 3-6 trunk segments — two breaks fell any tree). Per-material
+  HP: a brick dies to one sledge swing, a log takes two, glass shatters to
+  anything, posts and rocks are tough. Deployed cover becomes a steel piece at
+  runtime.
 - `src/shared/physics.ts` — world construction and the deterministic FPS controller:
   walk/sprint/jump movement, plus the **deterministic weapon state machine** (ammo,
   cooldowns, reload, grenade/supply counts) that runs identically in prediction and on
@@ -73,13 +88,18 @@ breached geometry the server does.
 - `src/server.ts` — hitscan raycasts (Jolt `castRay` with view angles carried in every
   input), panel HP, explosion AoE (players, panels, other grenades), kill/score/respawn
   flow, and round resets that rebuild the world.
-- `src/client.ts` — first-person rendering: the ~3,100 pieces draw as one
-  `InstancedMesh` pool per material (≈8 draw calls for the whole battlefield) with
-  per-instance brightness jitter and damage tinting, surfaced with **CC0 PBR
-  textures from [ambientCG](https://ambientcg.com)** (brick, bark, planks, grass,
-  moss, fabric, corrugated steel — see `assets/textures/CREDITS.txt`), ACES tone
-  mapping, prediction mirror world, view-model rifle with recoil, tracers, explosion
-  debris, build preview, HUD, and synthesized sounds.
+- `src/client.ts` — first-person rendering in a **texture-free voxel style**: the
+  ~9,000 pieces draw as one `InstancedMesh` pool per material (~12 draw calls for
+  the whole battlefield) of beveled solids with deterministic per-piece palette
+  variation (terracotta brick variance, wood tones, canopy greens) and damage
+  tinting via instance colors; faceted flat-shaded terrain with per-face jitter and
+  scorched crater bowls; **wind-swaying shader grass** (chunked, crater-aware);
+  drifting voxel cloud clusters; bullet decals; soldiers with pivoted limbs, vests,
+  helmets, and a speed-scaled walk cycle; **verlet ragdolls** that settle where
+  soldiers die; ACES tone mapping; prediction mirror world; view-model rifle with
+  recoil; tracers; explosion debris; build preview; HUD; synthesized sounds. Hot
+  paths reuse shared geometries, cached materials, and flat ring buffers — effects
+  never allocate GPU resources per spawn.
 
 ### Netcode
 
