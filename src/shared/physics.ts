@@ -154,6 +154,7 @@ interface BodyTag {
   panelId?: number;
   playerIdx?: number;
   grenadeId?: number;
+  fallingId?: number; // a released piece mid-tumble (server-side dynamic)
   static?: boolean;
 }
 
@@ -247,12 +248,37 @@ export function addPanelBody(gw: GameWorld, p: PanelDef): Body {
     type: "static",
     shape: Shape.box({ halfExtents: [p.ex / 2, p.ey / 2, p.ez / 2] }),
     position: [p.x, p.y, p.z],
+    rotation: p.rot ?? [0, 0, 0, 1],
     layer: "static",
     friction: 0.6,
     userData: { panelId: p.id } satisfies BodyTag,
   });
   gw.panels.set(p.id, body);
   return body;
+}
+
+// A piece released by the support cascade: same box, but dynamic — it
+// tumbles under the server's simulation until it settles (server-only;
+// clients play the fall cosmetically and get the resting pose).
+export function createFallingBody(
+  gw: GameWorld,
+  id: number,
+  p: PanelDef,
+  vel: readonly number[],
+): Body {
+  return gw.world.createBody({
+    type: "dynamic",
+    shape: Shape.box({ halfExtents: [p.ex / 2, p.ey / 2, p.ez / 2] }),
+    position: [p.x, p.y, p.z],
+    rotation: p.rot ?? [0, 0, 0, 1],
+    layer: "moving",
+    friction: 0.85,
+    restitution: 0.08,
+    linearDamping: 0.12,
+    angularDamping: 0.4,
+    linearVelocity: [vel[0], vel[1], vel[2]],
+    userData: { fallingId: id } satisfies BodyTag,
+  });
 }
 
 // A collapsed building leaves a low rubble mound over its footprint —
@@ -605,8 +631,8 @@ export function castWallDistance(
     );
     if (!hit || !hit.body) break;
     const hitDist = traveled + remaining * hit.fraction;
-    const tag = hit.body.userData as { playerIdx?: number };
-    if (tag.playerIdx === undefined) {
+    const tag = hit.body.userData as { playerIdx?: number; fallingId?: number };
+    if (tag.playerIdx === undefined && tag.fallingId === undefined) {
       return {
         dist: hitDist,
         body: hit.body,

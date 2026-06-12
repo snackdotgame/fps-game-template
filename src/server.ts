@@ -90,6 +90,7 @@ import {
   joltModule,
   makeChar,
   castWallDistance,
+  createFallingBody,
   PLAYER_HALF_HEIGHT,
   rayVsCapsule,
   readChar,
@@ -196,6 +197,24 @@ let pendingDestroys: number[] = [];
 let grenades: Grenade[] = [];
 let nextGrenadeId = 1;
 
+// Pieces released by the support cascade: intact, dynamic, tumbling under
+// the server's sim until they settle and re-freeze as static pieces.
+interface FallingPiece {
+  id: number;
+  def: PanelDef;
+  body: Body;
+  calmTicks: number;
+  bornTick: number;
+}
+
+const falling = new Map<number, FallingPiece>();
+const FALLING_CAP = 350;
+const FALL_TIMEOUT_TICKS = 6 * TICK_RATE;
+
+// Set for the duration of one explosion so released pieces inherit a blast
+// impulse and fly outward instead of dropping straight down.
+let blastCtx: { x: number; y: number; z: number; tick: number } | null = null;
+
 const events: GameEvent[] = [];
 let nextEventSeq = 1;
 let rng = mulberry32(0xbeac4);
@@ -244,8 +263,10 @@ async function stepServer(): Promise<void> {
   for (const p of players.values()) applyPlayerInput(p);
   const t1 = server.elapsedMs();
 
+  drainReleases();
   stepGrenades();
   gw.world.step(1 / TICK_RATE);
+  stepFalling();
   const t2 = server.elapsedMs();
 
   stepLifecycles();
@@ -466,9 +487,9 @@ function botThink(p: Player, b: BotBrain): InputCmd {
       moveZ -= nz * 0.8;
     }
     if (rng() < 0.008) jump = true;
-    if (dist > 9 && dist < 26 && tick >= b.grenadeReadyAt && s.grenades > 0 && rng() < 0.02) {
+    if (dist > 9 && dist < 26 && tick >= b.grenadeReadyAt && s.grenades > 0 && rng() < 0.012) {
       grenade = true;
-      b.grenadeReadyAt = tick + 450;
+      b.grenadeReadyAt = tick + 900;
     }
   } else {
     // Wander between random points; sprint there; reload while safe.
@@ -939,15 +960,170 @@ const panelById = new Map(MAP.panels.map((p) => [p.id, p]));
 // map regenerates identically every round.
 const SUPPORT = buildSupportIndex();
 
-// A destroyed piece drops whatever was resting on it (unless something else
-// still holds it up). Recursion is bounded by destroyedPanels idempotency
-// and wall height; fallen pieces shed rubble like any other destruction.
+// A destroyed piece RELEASES whatever was resting on it (unless something
+// else still holds it up): the intact piece becomes a dynamic body, tumbles,
+// and settles back into the world wherever it lands. Recursion is bounded by
+// destroyedPanels idempotency and wall height.
 function cascadeUnsupported(panelId: number): void {
   for (const aboveId of SUPPORT.above.get(panelId) ?? []) {
-    if (destroyedPanels.has(aboveId) || SUPPORT.grounded.has(aboveId)) continue;
-    const supports = SUPPORT.below.get(aboveId);
-    if (supports && supports.some((id) => !destroyedPanels.has(id))) continue;
-    destroyPanel(aboveId, true);
+    if (destroyedPanels.has(aboveId) || isSupported(aboveId)) continue;
+    queueRelease(aboveId);
+  }
+  // A dying plank can strand the rest of its sheet: re-check neighbors.
+  for (const adjId of SUPPORT.plankAdj.get(panelId) ?? []) {
+    if (destroyedPanels.has(adjId) || isSupported(adjId)) continue;
+    queueRelease(adjId);
+  }
+}
+
+// Releases are budgeted per tick: a grenade that unsupports a hundred pieces
+// crumbles them over a few ticks instead of spiking one (and it reads better
+// — structures progressively shear away rather than popping at once).
+const releaseQueue: number[] = [];
+const RELEASES_PER_TICK = 40;
+
+function queueRelease(id: number): void {
+  releaseQueue.push(id);
+}
+
+function drainReleases(): void {
+  let n = 0;
+  while (releaseQueue.length > 0 && n < RELEASES_PER_TICK) {
+    const id = releaseQueue.shift()!;
+    if (destroyedPanels.has(id)) continue;
+    releasePiece(id);
+    n++;
+  }
+}
+
+function isSupported(id: number): boolean {
+  if (SUPPORT.grounded.has(id)) return true;
+  const belows = SUPPORT.below.get(id);
+  if (belows && belows.some((b) => !destroyedPanels.has(b))) return true;
+  // Planks hang off their sheet as long as it still reaches an anchor.
+  if (SUPPORT.plankAdj.has(id)) return plankSheetAnchored(id);
+  return false;
+}
+
+// BFS across the alive plank sheet looking for any plank that still has a
+// live direct support. Bounded by one roof (~100 planks).
+const _sheetSeen = new Set<number>();
+
+function plankSheetAnchored(startId: number): boolean {
+  _sheetSeen.clear();
+  _sheetSeen.add(startId);
+  const queue = [startId];
+  while (queue.length > 0) {
+    const id = queue.pop()!;
+    const belows = SUPPORT.below.get(id);
+    if (belows && belows.some((b) => !destroyedPanels.has(b))) return true;
+    for (const n of SUPPORT.plankAdj.get(id) ?? []) {
+      if (_sheetSeen.has(n) || destroyedPanels.has(n)) continue;
+      _sheetSeen.add(n);
+      queue.push(n);
+    }
+  }
+  return false;
+}
+
+// Settled pieces aren't in the static support graph — when something is
+// destroyed near them, probe whether their perch is gone and re-release the
+// ones left hanging.
+function recheckSettledNear(x: number, y: number, z: number): void {
+  // Snapshot: releasing mutates builtPanels mid-iteration.
+  const candidates = [...builtPanels];
+  for (const [id, def] of candidates) {
+    if (Math.abs(def.x - x) > 3 || Math.abs(def.z - z) > 3 || def.y < y - 0.3) continue;
+    const halfH = (def.rot ? Math.max(def.ex, def.ey, def.ez) : def.ey) / 2;
+    if (def.y - halfH < heightAt(def.x, def.z) + 0.2) continue; // on the ground
+    const hit = gw.world.castRay([def.x, def.y - halfH - 0.03, def.z], [0, -0.35, 0]);
+    if (!hit) queueRelease(id);
+  }
+}
+
+// Turn a still-alive static piece into a falling dynamic one. The original
+// id is retired (it counts toward structure integrity — the wall really did
+// lose that piece); the airborne piece lives under a fresh runtime id and
+// re-enters play when it settles.
+function releasePiece(panelId: number): void {
+  if (destroyedPanels.has(panelId)) return;
+  const src = panelById.get(panelId) ?? builtPanels.get(panelId);
+  if (!src) return;
+  // Glass doesn't tumble — it shatters.
+  if (src.material === "glass" || falling.size >= FALLING_CAP) {
+    destroyPanel(panelId, true);
+    return;
+  }
+  // Retire the static piece (no rubble — the piece itself survives).
+  destroyedPanels.add(panelId);
+  panelHp.delete(panelId);
+  builtPanels.delete(panelId);
+  removePanelBody(gw, panelId);
+  pendingDestroys.push(panelId);
+
+  const id = nextBuiltPanelId++;
+  const def: PanelDef = {
+    id,
+    x: src.x,
+    y: src.y,
+    z: src.z,
+    ex: src.ex,
+    ey: src.ey,
+    ez: src.ez,
+    material: src.material,
+    rot: src.rot,
+  };
+  // Blast-released pieces fly outward; cascade-released ones just slump.
+  let vel: [number, number, number] = [(rng() - 0.5) * 0.6, 0.1, (rng() - 0.5) * 0.6];
+  if (blastCtx && blastCtx.tick === tick) {
+    const dx = def.x - blastCtx.x;
+    const dy = def.y - blastCtx.y;
+    const dz = def.z - blastCtx.z;
+    const d = Math.hypot(dx, dy, dz) || 1;
+    const kick = Math.min(9, 14 / (1 + d));
+    vel = [(dx / d) * kick, Math.abs(dy / d) * kick * 0.5 + 2.5, (dz / d) * kick];
+  }
+  falling.set(id, {
+    id,
+    def,
+    body: createFallingBody(gw, id, def, vel),
+    calmTicks: 0,
+    bornTick: tick,
+  });
+  broadcast({ type: "fall", piece: def, fromId: panelId });
+  // The piece left its slot — whatever rested on IT falls next.
+  if (panelId < BUILT_PANEL_ID_BASE) cascadeUnsupported(panelId);
+}
+
+// Settle check: a released piece that has stopped moving (or timed out)
+// re-freezes as a static, destructible piece at its resting pose.
+function stepFalling(): void {
+  // Snapshot first: settling mutates the map mid-iteration.
+  const active = [...falling.values()];
+  for (const f of active) {
+    const pos = f.body.translation();
+    if (pos.y < -2) {
+      // Slipped out of the world: quietly gone.
+      falling.delete(f.id);
+      gw.world.removeBody(f.body);
+      continue;
+    }
+    const v = f.body.linearVelocity();
+    const w = f.body.angularVelocity();
+    const calm = Math.hypot(v.x, v.y, v.z) < 0.15 && Math.hypot(w.x, w.y, w.z) < 0.35;
+    f.calmTicks = calm ? f.calmTicks + 1 : 0;
+    if (f.calmTicks < 8 && tick - f.bornTick < FALL_TIMEOUT_TICKS) continue;
+
+    const rot = f.body.rotation();
+    falling.delete(f.id);
+    gw.world.removeBody(f.body);
+    f.def.x = pos.x;
+    f.def.y = pos.y;
+    f.def.z = pos.z;
+    f.def.rot = [rot.x, rot.y, rot.z, rot.w];
+    addPanelBody(gw, f.def);
+    builtPanels.set(f.id, f.def);
+    broadcast({ type: "settle", piece: f.def });
   }
 }
 
@@ -976,6 +1152,7 @@ function destroyPanel(panelId: number, leaveRubble = true): void {
   pendingDestroys.push(panelId);
   if (leaveRubble && src) maybeLeaveRubble(src);
   if (leaveRubble && panelId < BUILT_PANEL_ID_BASE) cascadeUnsupported(panelId);
+  if (leaveRubble && src) recheckSettledNear(src.x, src.y, src.z);
   // BattleBit-style critical health: enough wall damage fells the building.
   const buildingId = src?.buildingId;
   if (buildingId !== undefined && !collapsedBuildings.has(buildingId)) {
@@ -1031,9 +1208,14 @@ function collapseBuilding(buildingId: number): void {
   collapsedBuildings.add(buildingId); // before the cascade, so it can't recurse
   const b = MAP.buildings[buildingId];
   broadcast({ type: "collapse", buildingId });
-  // The cascade itself doesn't shed per-piece rubble (the mound covers it) —
-  // except trees, whose felled trunk chunks read as the fallen log.
-  for (const id of [...b.wallPanelIds, ...b.roofPanelIds]) destroyPanel(id, b.kind === "tree");
+  if (b.kind === "tree") {
+    // The rest of the tree topples: every still-standing piece is released
+    // intact and lands wherever physics takes it.
+    for (const id of [...b.wallPanelIds, ...b.roofPanelIds]) releasePiece(id);
+    return;
+  }
+  // Buildings implode: the dramatic full-structure drop with a rubble mound.
+  for (const id of [...b.wallPanelIds, ...b.roofPanelIds]) destroyPanel(id, false);
   addRubbleBody(gw, b, RUBBLE_HEIGHT);
 }
 
@@ -1070,6 +1252,7 @@ function stepGrenades(): void {
 
 function explode(at: [number, number, number], ownerIdx: number): void {
   pushEvent(EV_EXPLOSION, 0, at);
+  blastCtx = { x: at[0], y: at[1], z: at[2], tick };
   const owner = playerByIdx(ownerIdx);
 
   // Players: radial damage (friendly fire off, self damage on) + impulse.
@@ -1185,6 +1368,8 @@ async function stepPhase(): Promise<void> {
 
 async function resetRound(): Promise<void> {
   destroyGameWorld(gw);
+  falling.clear();
+  releaseQueue.length = 0;
   resetCraters();
   gw = await createGameWorld();
   panelHp.clear();

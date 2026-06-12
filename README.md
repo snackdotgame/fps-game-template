@@ -29,10 +29,19 @@ grenades blow buildings open — and you can deploy fresh cover of your own.
 - **Terrain destruction**: ground-level explosions dig real craters — the shared
   heightfield drops, chunked Jolt terrain tiles rebuild on both sides, crater bowls
   render scorched, and the grass clears out. Pads and spawns can't be undermined.
+- **Real structural physics**: every piece knows what it rests on. Knock out a
+  wall's bottom course and the intact bricks above RELEASE — they become dynamic
+  bodies on the server, tumble, and re-freeze wherever they land as repositioned,
+  still-destructible pieces (clients play the fall cosmetically and receive the
+  authoritative resting pose). Roof sheets hang together until their last anchor
+  dies, then the whole sheet comes down; felled trees topple piece by piece;
+  blast-released pieces fly outward from the explosion. Releases are budgeted
+  per tick so big shears crumble progressively.
 - **The level keeps evolving**: destroyed pieces chance-shed persistent rubble
-  chunks that collide, obstruct, and are destructible in turn; felled trees leave
-  their trunks; craters accumulate; bullet decals mark the walls; and dead
-  soldiers' ragdolls linger on the field (~50s) before fading away.
+  chunks that collide, obstruct, and are destructible in turn (rendered through
+  pooled instancing — a thousand loose pieces is two draw calls); craters
+  accumulate; bullet decals mark the walls (and die with the surface they're
+  on); and dead soldiers' ragdolls linger on the field (~50s) before fading.
 - **Uneven terrain**: rolling noise-generated ground (one shared height function drives
   both Jolt collision and the rendered mesh), with ridgelines as natural cover and
   buildings on flat pads.
