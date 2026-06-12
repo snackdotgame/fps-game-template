@@ -148,7 +148,7 @@ interface Player {
   // Feet positions for the last few ticks (ring, newest last) — hit
   // registration rewinds against these so shots land where shooters SAW
   // their targets, not where targets are now.
-  history: Array<[number, number, number]>;
+  history: PositionHistory;
   respawnAtTick: number;
   protectUntilTick: number;
   lastDamageTick: number;
@@ -374,7 +374,7 @@ function addBot(): void {
     lastDepth: 0,
     hp: MAX_HP,
     dead: false,
-    history: [],
+    history: new PositionHistory(),
     respawnAtTick: 0,
     protectUntilTick: tick + PROTECT_TICKS,
     lastDamageTick: 0,
@@ -477,6 +477,11 @@ function botThink(p: Player, b: BotBrain): InputCmd {
       const half = MAP.size / 2 - 6;
       b.wanderX = (rng() * 2 - 1) * half;
       b.wanderZ = (rng() * 2 - 1) * half;
+      // Don't camp the enemy spawn zone — keep the fight in the field.
+      const enemySpawnZ = p.team === 0 ? 35 : -35;
+      if (Math.abs(b.wanderZ - enemySpawnZ) < 13 && Math.abs(b.wanderX) < 13) {
+        b.wanderZ = enemySpawnZ - Math.sign(enemySpawnZ) * (14 + rng() * 10);
+      }
       b.repathAtTick = tick + 240 + Math.floor(rng() * 240);
     }
     const len = Math.hypot(toX, toZ) || 1;
@@ -599,7 +604,7 @@ function addPlayer(conn: Connection): void {
     lastDepth: 0,
     hp: MAX_HP,
     dead: false,
-    history: [],
+    history: new PositionHistory(),
     respawnAtTick: 0,
     protectUntilTick: tick + PROTECT_TICKS,
     lastDamageTick: 0,
@@ -750,10 +755,44 @@ function castIgnoring(
 
 // Where this player's capsule was `rewindTicks` ago (clamped to what we
 // know) — the position the shooter actually saw on their screen.
+// Per-player rewind history as a flat ring buffer: one reused Float64Array
+// per player instead of 30 short-lived arrays a second, and one stable
+// hidden class for V8. `rewound` returns a reused scratch — consume it
+// before the next call.
+const HISTORY_TICKS = 12;
+
+class PositionHistory {
+  private readonly data = new Float64Array(HISTORY_TICKS * 3);
+  private readonly out: [number, number, number] = [0, 0, 0];
+  private head = 0;
+  private count = 0;
+
+  push(x: number, y: number, z: number): void {
+    const i = this.head * 3;
+    this.data[i] = x;
+    this.data[i + 1] = y;
+    this.data[i + 2] = z;
+    this.head = (this.head + 1) % HISTORY_TICKS;
+    if (this.count < HISTORY_TICKS) this.count++;
+  }
+
+  clear(): void {
+    this.count = 0;
+  }
+
+  rewound(rewindTicks: number): readonly number[] | null {
+    if (this.count === 0) return null;
+    const back = Math.max(1, Math.min(rewindTicks, this.count));
+    const i = ((this.head - back + HISTORY_TICKS) % HISTORY_TICKS) * 3;
+    this.out[0] = this.data[i];
+    this.out[1] = this.data[i + 1];
+    this.out[2] = this.data[i + 2];
+    return this.out;
+  }
+}
+
 function rewoundFeet(q: Player, rewindTicks: number): readonly number[] | null {
-  if (q.history.length === 0) return null;
-  const back = Math.max(1, Math.min(rewindTicks, q.history.length));
-  return q.history[q.history.length - back];
+  return q.history.rewound(rewindTicks);
 }
 
 interface AttackHit {
@@ -1084,7 +1123,6 @@ function explode(at: [number, number, number], ownerIdx: number): void {
 
 // --- Lifecycle ------------------------------------------------------------------------
 
-const HISTORY_TICKS = 12;
 // Cap on the CLIENT-attributable rewind (interp delay + transit): 120ms.
 // The server's own input-buffer wait is added on top uncapped — that delay
 // is ours, not the shooter's ping, and exists even on LAN.
@@ -1093,9 +1131,8 @@ const VIEW_REWIND_CAP_TICKS = Math.round(120 / TICK_MS);
 function stepLifecycles(): void {
   for (const p of players.values()) {
     readChar(p.body, p.state);
-    p.history.push([p.state.x, p.state.y, p.state.z]);
-    if (p.history.length > HISTORY_TICKS) p.history.shift();
-    if (p.dead) p.history.length = 0; // don't rewind into a corpse
+    p.history.push(p.state.x, p.state.y, p.state.z);
+    if (p.dead) p.history.clear(); // don't rewind into a corpse
 
     if (p.dead && tick >= p.respawnAtTick && phase === "playing") {
       const spawn = spawnPoint(p.team, p.idx);

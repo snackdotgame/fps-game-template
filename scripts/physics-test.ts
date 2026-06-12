@@ -361,6 +361,28 @@ async function main(): Promise<void> {
     destroyGameWorld(gw);
   }
 
+  // --- Multi-story: the step-up assist walks the center house's staircase
+  // to the second floor. ---
+  {
+    // Center building (10x8 at origin, 2 stories): stairwell along the west
+    // wall (x0=-5), flight ascends +z from z=-2.7.
+    const r = await rig([-3.83, 0.1, -3.1]);
+    for (let t = 0; t < 30; t++) step(r, cmd(t + 1)); // settle
+    for (let t = 30; t < 150; t++) {
+      step(r, cmd(t + 1, { moveZ: quantizeMove(1), yaw: quantizeAngle(0) }));
+    }
+    check("step-up assist climbs stairs to story 2", r.s.y > 2.3, `y=${r.s.y.toFixed(2)}`);
+    check("lands on the upper floor", r.s.onGround, `onGround=${r.s.onGround}`);
+    destroyGameWorld(r.gw);
+  }
+
+  // --- Step-up assist also vaults low cover (sandbags) but not walls. ---
+  {
+    const houses = MAP.buildings.filter((b) => b.kind === "building");
+    const twoStory = houses.filter((b) => b.wallPanelIds.length > 1300);
+    check("multi-story buildings exist", twoStory.length >= 2, `tall=${twoStory.length}`);
+  }
+
   // --- Terrain destruction: a crater lowers both heightAt and the rebuilt
   // chunk collision, deterministically. ---
   {

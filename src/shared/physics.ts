@@ -112,6 +112,7 @@ const GROUND_FRICTION = 50;
 const JUMP_VEL = 6.8;
 const COYOTE_TICKS = 4;
 const GROUND_PROBE = 0.16; // generous: uneven terrain underfoot
+const STEP_MAX = 0.55; // tallest ledge the step-up assist climbs
 
 export function makeChar(spawn: readonly number[]): CharState {
   return {
@@ -472,6 +473,42 @@ export function stepPlayerController(
   s.jumpHeld = input.jump;
 
   body.setLinearVelocity(vx, vy, vz);
+
+  // --- Step-up assist: stairs and low ledges walk up smoothly instead of
+  // stopping the capsule. Pure raycasts on shared state, so prediction and
+  // server agree exactly. Rays start outside our own capsule (rays that
+  // start inside a convex body hit it at fraction 0).
+  if (grounded && !locked && (mx !== 0 || mz !== 0)) {
+    const mlen = Math.hypot(mx, mz) || 1;
+    const dx = mx / mlen;
+    const dz = mz / mlen;
+    const edge = PLAYER_RADIUS + 0.02;
+    const reach = 0.3;
+    const shin = gw.world.castRay(
+      [pos.x + dx * edge, feetY + 0.13, pos.z + dz * edge],
+      [dx * reach, 0, dz * reach],
+    );
+    if (shin && shin.body && shin.body !== body) {
+      const head = gw.world.castRay(
+        [pos.x + dx * edge, feetY + STEP_MAX + 0.05, pos.z + dz * edge],
+        [dx * reach, 0, dz * reach],
+      );
+      if (!head) {
+        const downFrom = STEP_MAX + 0.05;
+        const down = gw.world.castRay(
+          [pos.x + dx * (edge + reach), feetY + downFrom, pos.z + dz * (edge + reach)],
+          [0, -(downFrom - 0.01), 0],
+        );
+        if (down && down.body && down.body !== body) {
+          const ledgeY = feetY + downFrom - (downFrom - 0.01) * down.fraction;
+          const rise = ledgeY - feetY;
+          if (rise > 0.04 && rise <= STEP_MAX) {
+            body.setTranslation([pos.x, ledgeY + PLAYER_HALF_HEIGHT + 0.02, pos.z]);
+          }
+        }
+      }
+    }
+  }
 
   // --- Weapons (deterministic state; effects via hooks). ---
   if (s.cooldownTicks > 0) s.cooldownTicks--;

@@ -9,6 +9,7 @@ import {
   addCrater,
   baseHeightAt,
   chunksTouching,
+  craterList,
   heightAt,
   MAP,
   PANEL_HP,
@@ -621,9 +622,11 @@ function collapseFx(buildingId: number): void {
   if (!b) return;
   for (let i = 0; i < 5; i++) {
     const dust = new THREE.Mesh(
-      new THREE.SphereGeometry(1.2, 10, 8),
+      FX_GEO.puff,
       new THREE.MeshBasicMaterial({ color: 0x9a948a, transparent: true, opacity: 0.55 }),
     );
+    dust.scale.setScalar(1.2);
+    dust.userData.sharedGeo = true;
     dust.position.set(
       b.cx + (Math.random() - 0.5) * b.w,
       0.8 + Math.random() * 1.5,
@@ -906,6 +909,7 @@ interface RemotePlayer {
     flags: number;
   }>;
   lastFlags: number;
+  lastProt: boolean;
 }
 
 let selfIdx = -1;
@@ -1250,6 +1254,7 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
         group: makeSoldier((r.flags & RF_TEAM) !== 0 ? 1 : 0, nameOf(r.idx)),
         buffer: [],
         lastFlags: 0,
+        lastProt: false,
       };
       remotes.set(r.idx, rp);
     }
@@ -1496,7 +1501,7 @@ function predictionTick(): void {
       // Predicted tracer from a local raycast — instant feedback; the
       // server's events remain authoritative for hits and damage.
       if (gw && selfBody) {
-        const from = new THREE.Vector3(eye[0], eye[1] - 0.05, eye[2]);
+        const from = muzzleWorld().clone();
         const hit = castLocal(eye, dir, 90);
         const end = hit
           ? new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])
@@ -1843,22 +1848,44 @@ function addEffect(
 
 const tracerMat = new THREE.MeshBasicMaterial({ color: 0xffe9a8 });
 
+// Effects reuse shared unit geometries (scaled per instance) and cached
+// materials — spawning a tracer or spark allocates a Mesh wrapper, never new
+// GPU buffers. Meshes flag sharedGeo/sharedMat so stepEffects skips dispose.
+const FX_GEO = {
+  sphere: new THREE.SphereGeometry(1, 12, 8),
+  puff: new THREE.SphereGeometry(1, 6, 4),
+};
+const sparkMats = new Map<number, THREE.MeshBasicMaterial>();
+const grenadeMat = new THREE.MeshLambertMaterial({ color: 0x2f5e2f });
+
+function sparkMat(color: number): THREE.MeshBasicMaterial {
+  let m = sparkMats.get(color);
+  if (!m) {
+    m = new THREE.MeshBasicMaterial({ color });
+    sparkMats.set(color, m);
+  }
+  return m;
+}
+
 function spawnTracer(from: THREE.Vector3, to: THREE.Vector3): void {
   const dir = to.clone().sub(from);
   const len = dir.length();
   if (len < 0.5) return;
-  const geo = new THREE.BoxGeometry(0.025, 0.025, len);
-  const mesh = new THREE.Mesh(geo, tracerMat);
-  mesh.position.copy(from).add(dir.clone().multiplyScalar(0.5));
+  const mesh = new THREE.Mesh(GEO.box, tracerMat);
+  mesh.scale.set(0.025, 0.025, len);
+  mesh.userData.sharedGeo = true;
+  mesh.position.copy(from).add(dir.multiplyScalar(0.5));
   mesh.lookAt(to);
   addEffect(mesh, 70);
 }
 
 function spawnExplosion(at: THREE.Vector3): void {
   const ball = new THREE.Mesh(
-    new THREE.SphereGeometry(0.6, 12, 8),
+    FX_GEO.sphere,
     new THREE.MeshBasicMaterial({ color: 0xffb03a, transparent: true, opacity: 0.9 }),
   );
+  ball.scale.setScalar(0.6);
+  ball.userData.sharedGeo = true;
   ball.position.copy(at);
   ball.userData.grow = true;
   addEffect(ball, 240);
@@ -1908,10 +1935,10 @@ function spawnDebris(at: THREE.Vector3, count: number, color = 0xa59c8e): void {
 }
 
 function spawnSpark(at: THREE.Vector3, color = 0xffd27a): void {
-  const mesh = new THREE.Mesh(
-    new THREE.SphereGeometry(0.07, 6, 4),
-    new THREE.MeshBasicMaterial({ color }),
-  );
+  const mesh = new THREE.Mesh(FX_GEO.puff, sparkMat(color));
+  mesh.scale.setScalar(0.07);
+  mesh.userData.sharedGeo = true;
+  mesh.userData.sharedMat = true;
   mesh.position.copy(at);
   addEffect(mesh, 120);
 }
@@ -1973,7 +2000,7 @@ function processEvents(list: GameEvent[]): void {
     switch (e.kind) {
       case EV_TRACER: {
         if (e.a !== selfIdx) {
-          const from = eyeOf(e.a);
+          const from = muzzleOf(e.a);
           if (from) {
             spawnTracer(from, at);
             // Decal where the remote shot landed (skip max-range whiffs):
@@ -2039,6 +2066,32 @@ function processEvents(list: GameEvent[]): void {
   }
 }
 
+// Distance at which the view-model barrel converges with the crosshair.
+const VIEWMODEL_CONVERGE_Z = -24;
+const _muzzle = new THREE.Vector3();
+
+// World-space barrel tip of the first-person rifle — tracers leave the gun,
+// not the middle of the screen.
+function muzzleWorld(): THREE.Vector3 {
+  _muzzle.set(0, 0.01, -0.64);
+  viewModel.updateWorldMatrix(true, false);
+  return viewModel.localToWorld(_muzzle);
+}
+
+// World-space gun muzzle of a remote soldier's rifle (falls back to the eye
+// if the rig isn't available).
+function muzzleOf(idx: number): THREE.Vector3 | null {
+  const rp = remotes.get(idx);
+  if (rp && rp.group.visible) {
+    const head = rp.group.getObjectByName("head");
+    if (head) {
+      head.updateWorldMatrix(true, false);
+      return head.localToWorld(new THREE.Vector3(0.2, -0.28, 0.73));
+    }
+  }
+  return eyeOf(idx);
+}
+
 function eyeOf(idx: number): THREE.Vector3 | null {
   if (idx === selfIdx) {
     return predState ? new THREE.Vector3(predState.x, predState.y + EYE_HEIGHT, predState.z) : null;
@@ -2058,10 +2111,8 @@ function updateGrenadeViews(snap: Snapshot): void {
   for (const e of snap.entities) {
     seen.add(e.id);
     if (!grenadeViews.has(e.id)) {
-      const mesh = new THREE.Mesh(
-        new THREE.SphereGeometry(0.14, 10, 8),
-        new THREE.MeshLambertMaterial({ color: 0x2f5e2f }),
-      );
+      const mesh = new THREE.Mesh(FX_GEO.sphere, grenadeMat);
+      mesh.scale.setScalar(0.14);
       mesh.castShadow = true;
       scene.add(mesh);
       grenadeViews.set(e.id, mesh);
@@ -2070,7 +2121,6 @@ function updateGrenadeViews(snap: Snapshot): void {
   for (const [id, mesh] of grenadeViews) {
     if (!seen.has(id)) {
       scene.remove(mesh);
-      mesh.geometry.dispose();
       grenadeViews.delete(id);
     }
   }
@@ -2117,7 +2167,17 @@ function frame(): void {
     -0.22 - meleeSwing * 0.12,
     -0.45 + recoil * 0.06 + meleeSwing * -0.25,
   );
-  viewModel.rotation.x = recoil * 0.25 + meleeSwing * 0.9;
+  // Converge the barrel on the crosshair: aim at a point down the view ray
+  // (camera space) so the gun points where bullets land, instead of sitting
+  // parallel to the view axis.
+  {
+    const dx = -viewModel.position.x;
+    const dy = -viewModel.position.y - 0.01;
+    const dz = VIEWMODEL_CONVERGE_Z - viewModel.position.z;
+    viewModel.rotation.order = "YXZ";
+    viewModel.rotation.y = Math.atan2(-dx, -dz);
+    viewModel.rotation.x = Math.atan2(dy, Math.hypot(dx, dz)) + recoil * 0.25 + meleeSwing * 0.9;
+  }
   viewModel.visible = (selfStatus & SS_DEAD) === 0;
 
   // Build preview while holding Q-able state (always shown when alive + supply).
@@ -2177,13 +2237,18 @@ function frame(): void {
     limbs.armR.rotation.x = swing * 0.7;
     const dead = (rp.lastFlags & RF_DEAD) !== 0;
     rp.group.visible = !dead;
+    // Spawn-protection ghosting: only touch materials when the state flips,
+    // not every frame for every soldier.
     const prot = (rp.lastFlags & RF_PROTECTED) !== 0;
-    rp.group.traverse((o) => {
-      if (o instanceof THREE.Mesh && o.material instanceof THREE.MeshLambertMaterial) {
-        o.material.transparent = prot;
-        o.material.opacity = prot ? 0.55 : 1;
-      }
-    });
+    if (prot !== rp.lastProt) {
+      rp.lastProt = prot;
+      rp.group.traverse((o) => {
+        if (o instanceof THREE.Mesh && o.material instanceof THREE.MeshLambertMaterial) {
+          o.material.transparent = prot;
+          o.material.opacity = prot ? 0.55 : 1;
+        }
+      });
+    }
   }
 
   // Grenades render from the mirror world bodies.
@@ -2346,6 +2411,11 @@ declare global {
       remotePos(idx: number): [number, number, number] | null;
       destroyedCount(): number;
       collapsedCount(): number;
+      craterCount(): number;
+      roundTicksLeft(): number;
+      groundHeightAt(x: number, z: number): number;
+      rubbleCount(): number;
+      corpseCount(): number;
       perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
       drive(over: Partial<Omit<InputCmd, "seq">> & { trackIdx?: number }, ticks: number): void;
@@ -2386,6 +2456,11 @@ window.__fps = {
   },
   destroyedCount: () => destroyedSet.size,
   collapsedCount: () => collapsedCount,
+  craterCount: () => craterList().length,
+  roundTicksLeft: () => Math.max(0, phaseEndTick - estServerTick()),
+  groundHeightAt: (x: number, z: number) => heightAt(x, z),
+  rubbleCount: () => builtList.filter((p) => p.material === "rubble").length,
+  corpseCount: () => corpses.length,
   perf: () => ({
     fps: perf.fps,
     avgFrameMs: perf.avgFrameMs,
