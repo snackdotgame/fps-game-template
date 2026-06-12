@@ -137,7 +137,7 @@ const panelsA1 = await a.fps("panelCount");
 const panelsB = await b.fps("panelCount");
 check("built cover appears for B", Math.abs(panelsB - panelsA1) <= 2, `B=${panelsB} A=${panelsA1}`);
 
-// Shoot our own panel to death (100 HP / 10 per rifle hit).
+// Shoot our own panel to death (deployed steel: 120 HP / 10 per rifle hit).
 {
   const d0 = await a.fps("destroyedCount");
   const [x, y, z] = await a.fps("playerPosition");

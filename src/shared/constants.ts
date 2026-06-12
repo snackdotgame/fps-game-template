@@ -44,7 +44,7 @@ export const GRENADE_RADIUS = 0.14;
 export const EXPLOSION_RADIUS = 4.5;
 export const EXPLOSION_MAX_DAMAGE = 95;
 export const EXPLOSION_MIN_DAMAGE = 15;
-export const EXPLOSION_PANEL_RADIUS = 3.2;
+export const EXPLOSION_PANEL_RADIUS = 2.2;
 export const EXPLOSION_IMPULSE = 11;
 
 // Sledgehammer (melee, demolition).
@@ -58,13 +58,13 @@ export const BUILD_SUPPLY = 6; // per life
 export const BUILD_RANGE = 3.0;
 export const BUILD_COOLDOWN_TICKS = 12;
 
-// Panels are 1m x 0.625m pieces now: 6 rifle hits or 2 sledge swings each.
-// Collapse fractions live per-structure in map.ts (buildings 0.4, trees 0.5).
-export const PANEL_HP = 60;
-// Explosions delete panels inside EXPLOSION_PANEL_RADIUS and chip panels in
-// an outer falloff ring.
-export const EXPLOSION_PANEL_OUTER_RADIUS = 5.2;
-export const EXPLOSION_PANEL_OUTER_DAMAGE = 50;
+// Piece HP is per material (map.ts PANEL_HP); collapse fractions live
+// per-structure in map.ts (buildings 0.35, trees 0.5).
+// Explosions delete pieces inside EXPLOSION_PANEL_RADIUS and chip pieces in
+// an outer falloff ring. With brick-sized pieces the inner sphere already
+// takes out ~100 bricks, so the radii are tighter than the player blast.
+export const EXPLOSION_PANEL_OUTER_RADIUS = 3.6;
+export const EXPLOSION_PANEL_OUTER_DAMAGE = 30;
 export const RUBBLE_HEIGHT = 0.55;
 
 export type Team = 0 | 1;

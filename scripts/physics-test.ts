@@ -148,7 +148,9 @@ async function main(): Promise<void> {
     const placement = buildPlacement(r.s, 0);
     check(
       "build placement in front",
-      Math.abs(placement.z - (r.s.z + 3)) < 0.6 && placement.orient === "bx",
+      Math.abs(placement.z - (r.s.z + 3)) < 0.6 &&
+        placement.material === "metal" &&
+        placement.ex === 2,
       JSON.stringify(placement),
     );
     let built = 0;
@@ -284,15 +286,43 @@ async function main(): Promise<void> {
     const houses = MAP.buildings.filter((b) => b.kind === "building");
     const trees = MAP.buildings.filter((b) => b.kind === "tree");
     let ok = houses.length === 5 && trees.length >= 8;
-    for (const b of houses) ok &&= b.wallPanelIds.length >= 60 && b.roofPanelIds.length >= 6;
-    for (const b of trees) ok &&= b.wallPanelIds.length === 2 && b.roofPanelIds.length === 1;
+    for (const b of houses) ok &&= b.wallPanelIds.length >= 130 && b.roofPanelIds.length >= 40;
+    for (const b of trees) ok &&= b.wallPanelIds.length === 4 && b.roofPanelIds.length === 4;
     for (const b of MAP.buildings) {
       ok &&= b.wallPanelIds.every((id) => MAP.panels.find((p) => p.id === id)?.buildingId === b.id);
     }
     check(
-      "structures group their panels",
+      "structures group their pieces",
       ok,
       JSON.stringify(MAP.buildings.map((b) => `${b.kind}:${b.wallPanelIds.length}`)),
+    );
+  }
+
+  // --- Pieces are material-shaped, and only the perimeter is indestructible. ---
+  {
+    const byMat = new Map<string, number>();
+    for (const p of MAP.panels) byMat.set(p.material, (byMat.get(p.material) ?? 0) + 1);
+    const bricks = MAP.panels.filter((p) => p.material === "brick");
+    const fullBrick = bricks.filter((p) => Math.max(p.ex, p.ez) === 0.5).length;
+    const halfBrick = bricks.filter((p) => Math.abs(Math.max(p.ex, p.ez) - 0.25) < 1e-9).length;
+    const logs = MAP.panels.filter((p) => p.material === "log");
+    check(
+      "brick walls are bricks in running bond (full + half closers)",
+      bricks.length > 1500 && fullBrick > 1000 && halfBrick > 50,
+      `bricks=${bricks.length} full=${fullBrick} half=${halfBrick}`,
+    );
+    check(
+      "log cabins are stacked logs",
+      logs.length > 200 && logs.every((p) => p.ey === 0.25 && Math.max(p.ex, p.ez) <= 2),
+      `logs=${logs.length}`,
+    );
+    check(
+      "everything but the perimeter is destructible",
+      MAP.statics.length === 4 &&
+        ["plank", "post", "trunk", "canopy", "crate", "sandbag"].every(
+          (m) => (byMat.get(m) ?? 0) > 0,
+        ),
+      JSON.stringify([...byMat.entries()]),
     );
   }
 

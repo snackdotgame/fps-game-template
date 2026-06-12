@@ -1,10 +1,11 @@
 // The battlefield, procedurally generated from a fixed seed so client and
 // server build identical worlds. Terrain is a value-noise heightfield
-// (flattened under buildings and spawns); buildings are fine-grained grids of
-// destructible PANELS (1m x 0.625m pieces — gunfire chips them, explosions
-// blow holes, enough wall loss collapses the whole structure); trees are
-// destructible too — break the trunk and the tree comes down. Deployed cover
-// becomes a panel at runtime.
+// (flattened under buildings and spawns); every structure is masonry of
+// material-shaped destructible PIECES — clay bricks laid in running bond,
+// stacked cabin logs, roof planks, tree trunks and foliage clumps, sandbags,
+// supply crates. Gunfire chips out single bricks, explosions blow holes, and
+// enough structural loss collapses the whole building. The only things that
+// can't be destroyed are the ground and the arena's perimeter walls.
 
 export const MAP_SEED = 0xb17b17;
 
@@ -15,23 +16,46 @@ export interface StaticBox {
   w: number; // full extents
   h: number;
   d: number;
-  kind: "wall" | "crate";
+  kind: "wall";
 }
 
-// "x"/"z": wall pieces along an axis. "flat": roof slab. "bx"/"bz": deployed
-// cover (wider). "trunk": tree trunk segment. "canopy": tree foliage block.
-export type PanelOrient = "x" | "z" | "flat" | "bx" | "bz" | "trunk" | "canopy";
+export type PanelMaterial =
+  | "brick" // clay brick in a running-bond wall
+  | "log" // stacked cabin log
+  | "plank" // roof plank
+  | "post" // structural timber corner post (tough)
+  | "trunk" // tree trunk segment
+  | "canopy" // foliage clump
+  | "crate" // supply crate
+  | "sandbag" // freestanding bag cover
+  | "metal"; // deployed cover sheet (built at runtime)
 
 export interface PanelDef {
   id: number;
   x: number; // center
   y: number;
   z: number;
-  orient: PanelOrient;
-  // Panels belonging to a structure share its id; enough structural damage
+  ex: number; // full extents
+  ey: number;
+  ez: number;
+  material: PanelMaterial;
+  // Pieces belonging to a structure share its id; enough structural damage
   // brings the whole thing down (BattleBit-style critical health).
   buildingId?: number;
 }
+
+// Max HP per material. Rifle hits chip 10, sledge swings 50.
+export const PANEL_HP: Record<PanelMaterial, number> = {
+  brick: 45,
+  log: 70,
+  plank: 30,
+  post: 150,
+  trunk: 50, // one sledge swing per segment; two segments fell the tree
+  canopy: 30,
+  crate: 90,
+  sandbag: 60,
+  metal: 120,
+};
 
 export interface BuildingDef {
   id: number;
@@ -40,35 +64,17 @@ export interface BuildingDef {
   cz: number;
   w: number;
   d: number;
-  wallPanelIds: number[]; // the structural panels that count toward collapse
+  wallPanelIds: number[]; // the structural pieces that count toward collapse
   roofPanelIds: number[]; // fall with the structure but don't count
-  collapseFraction: number; // fraction of structural panels lost -> collapse
+  collapseFraction: number; // fraction of structural pieces lost -> collapse
 }
 
-// Panel dimensions by orientation (full extents).
-export const PANEL_W = 1;
-export const PANEL_H = 0.625;
-export const PANEL_T = 0.22;
-export const WALL_ROWS = 4; // 2.5m walls
-
-export function panelExtents(orient: PanelOrient): [number, number, number] {
-  switch (orient) {
-    case "x":
-      return [PANEL_W, PANEL_H, PANEL_T];
-    case "z":
-      return [PANEL_T, PANEL_H, PANEL_W];
-    case "flat":
-      return [PANEL_W, PANEL_T, PANEL_W];
-    case "bx":
-      return [2, 1.25, PANEL_T];
-    case "bz":
-      return [PANEL_T, 1.25, 2];
-    case "trunk":
-      return [0.5, 1.0, 0.5];
-    case "canopy":
-      return [2.0, 1.6, 2.0];
-  }
-}
+// Masonry units (full extents: length along the wall, height, thickness).
+export const WALL_HEIGHT = 2.5;
+export const BRICK = { l: 0.5, h: WALL_HEIGHT / 12, t: 0.24 };
+export const LOG = { l: 2.0, h: 0.25, t: 0.26 };
+export const PLANK = { l: 2.0, h: 0.07, w: 0.5 };
+export const SANDBAG = { l: 0.55, h: 0.32, t: 0.42 };
 
 export interface MapDef {
   size: number; // arena is size x size, centered on origin
@@ -147,7 +153,7 @@ export function heightAt(x: number, z: number): number {
 
 // Triangle grid for the physics mesh. The client renders its own geometry
 // from the same heightAt, so collision matches visuals exactly.
-export const TERRAIN_CELL = 2;
+export const TERRAIN_CELL = 1;
 
 export function terrainMesh(): { vertices: number[]; indices: number[] } {
   const half = SIZE / 2;
@@ -186,29 +192,81 @@ interface Gen {
   buildings: BuildingDef[];
 }
 
-function wallRun(
+// A wall opening: along-axis interval + height range.
+interface GapRect {
+  lo: number;
+  hi: number;
+  y0: number;
+  y1: number;
+}
+
+// Cut a masonry piece against wall openings. Fragments that survive outside
+// the opening become the cut bricks you see around a real doorway.
+function clipAgainstGaps(
+  c: number,
+  l: number,
+  y: number,
+  h: number,
+  gaps: GapRect[],
+): Array<[number, number]> {
+  let frags: Array<[number, number]> = [[c - l / 2, c + l / 2]];
+  for (const gap of gaps) {
+    if (y + h / 2 <= gap.y0 || y - h / 2 >= gap.y1) continue;
+    const next: Array<[number, number]> = [];
+    for (const [lo, hi] of frags) {
+      if (hi <= gap.lo || lo >= gap.hi) {
+        next.push([lo, hi]);
+        continue;
+      }
+      if (gap.lo - lo >= 0.18) next.push([lo, gap.lo]);
+      if (hi - gap.hi >= 0.18) next.push([gap.hi, hi]);
+    }
+    frags = next;
+  }
+  return frags.map(([lo, hi]) => [(lo + hi) / 2, hi - lo]);
+}
+
+// A run of stacked masonry: `rows` courses of `unit`-sized pieces between
+// a0..a1 along the given axis, odd courses offset half a unit (running bond)
+// with half pieces closing the ends.
+function masonryRun(
   g: Gen,
-  orient: "x" | "z",
+  axis: "x" | "z",
   a0: number,
   a1: number,
   fixed: number,
+  baseY: number,
+  rows: number,
+  unit: { l: number; h: number; t: number },
+  material: PanelMaterial,
   buildingId: number | undefined,
-  gaps: (col: number, row: number) => boolean = () => false,
+  gaps: GapRect[] = [],
 ): void {
-  const cols = Math.round((a1 - a0) / PANEL_W);
-  for (let col = 0; col < cols; col++) {
-    for (let row = 0; row < WALL_ROWS; row++) {
-      if (gaps(col, row)) continue;
-      const along = a0 + (col + 0.5) * PANEL_W;
-      const y = (row + 0.5) * PANEL_H;
-      g.panels.push({
-        id: nextPanelId++,
-        x: orient === "x" ? along : fixed,
-        y,
-        z: orient === "x" ? fixed : along,
-        orient,
-        buildingId,
-      });
+  const n = Math.round((a1 - a0) / unit.l);
+  for (let row = 0; row < rows; row++) {
+    const y = baseY + (row + 0.5) * unit.h;
+    const segs: Array<[number, number]> = [];
+    if (row % 2 === 0) {
+      for (let i = 0; i < n; i++) segs.push([a0 + (i + 0.5) * unit.l, unit.l]);
+    } else {
+      segs.push([a0 + unit.l / 4, unit.l / 2]);
+      for (let i = 0; i < n - 1; i++) segs.push([a0 + unit.l / 2 + (i + 0.5) * unit.l, unit.l]);
+      segs.push([a1 - unit.l / 4, unit.l / 2]);
+    }
+    for (const [c, l] of segs) {
+      for (const [fc, fl] of clipAgainstGaps(c, l, y, unit.h, gaps)) {
+        g.panels.push({
+          id: nextPanelId++,
+          x: axis === "x" ? fc : fixed,
+          y,
+          z: axis === "x" ? fixed : fc,
+          ex: axis === "x" ? fl : unit.t,
+          ey: unit.h,
+          ez: axis === "x" ? unit.t : fl,
+          material,
+          buildingId,
+        });
+      }
     }
   }
 }
@@ -220,6 +278,7 @@ function building(
   w: number,
   d: number,
   doorSide: 0 | 1 | 2 | 3,
+  style: "brick" | "log",
 ): void {
   const id = nextBuildingId++;
   const firstPanel = nextPanelId;
@@ -227,50 +286,72 @@ function building(
   const x1 = cx + w / 2;
   const z0 = cz - d / 2;
   const z1 = cz + d / 2;
+  const unit = style === "brick" ? BRICK : LOG;
+  const rows = Math.round(WALL_HEIGHT / unit.h);
 
-  // Door: a 1-col x 3-row opening centered on its wall. Windows: a 2-col x
-  // 1-row opening (row 2) centered on every other wall.
-  const doorGap = (cols: number) => {
-    const c = Math.floor(cols / 2);
-    return (col: number, row: number) => col === c && row < 3;
-  };
-  const windowGap = (cols: number) => {
-    const c = Math.floor(cols / 2);
-    return (col: number, row: number) => (col === c || col === c - 1) && row === 2;
-  };
-  const pick = (side: number, cols: number) =>
-    doorSide === side ? doorGap(cols) : windowGap(cols);
+  // Door: 1.3m x 2.05m, centered. Windows: 2.1m wide at sill height, on
+  // every other wall. Pieces are clipped, so brick walls get cut bricks
+  // around openings and log walls get sawed log ends.
+  const door = (mid: number): GapRect[] => [{ lo: mid - 0.65, hi: mid + 0.65, y0: 0, y1: 2.05 }];
+  const win = (mid: number): GapRect[] => [{ lo: mid - 1.05, hi: mid + 1.05, y0: 1.3, y1: 2.05 }];
+  const pick = (side: number, mid: number) => (doorSide === side ? door(mid) : win(mid));
 
-  wallRun(g, "x", x0, x1, z1, id, pick(0, Math.round(w)));
-  wallRun(g, "x", x0, x1, z0, id, pick(1, Math.round(w)));
-  wallRun(g, "z", z0, z1, x1, id, pick(2, Math.round(d)));
-  wallRun(g, "z", z0, z1, x0, id, pick(3, Math.round(d)));
+  masonryRun(g, "x", x0, x1, z1, 0, rows, unit, style, id, pick(0, cx));
+  masonryRun(g, "x", x0, x1, z0, 0, rows, unit, style, id, pick(1, cx));
+  masonryRun(g, "z", z0, z1, x1, 0, rows, unit, style, id, pick(2, cz));
+  masonryRun(g, "z", z0, z1, x0, 0, rows, unit, style, id, pick(3, cz));
 
-  const roofY = WALL_ROWS * PANEL_H + PANEL_T / 2;
-  const roofIds: number[] = [];
-  for (let x = x0 + PANEL_W / 2; x <= x1 - PANEL_W / 2 + 0.01; x += PANEL_W) {
-    for (let z = z0 + PANEL_W / 2; z <= z1 - PANEL_W / 2 + 0.01; z += PANEL_W) {
-      roofIds.push(nextPanelId);
-      g.panels.push({ id: nextPanelId++, x, y: roofY, z, orient: "flat", buildingId: id });
-    }
-  }
-
-  // Indestructible corner posts keep the silhouette until collapse.
+  // Structural corner posts — destructible like everything else, just tough.
   for (const [px, pz] of [
     [x0, z0],
     [x1, z0],
     [x0, z1],
     [x1, z1],
   ]) {
-    g.statics.push({
+    g.panels.push({
+      id: nextPanelId++,
       x: px,
-      y: (WALL_ROWS * PANEL_H) / 2,
+      y: WALL_HEIGHT / 2,
       z: pz,
-      w: 0.3,
-      h: WALL_ROWS * PANEL_H,
-      d: 0.3,
-      kind: "wall",
+      ex: 0.3,
+      ey: WALL_HEIGHT,
+      ez: 0.3,
+      material: "post",
+      buildingId: id,
     });
+  }
+
+  // Roof: staggered planks laid across the footprint.
+  const roofIds: number[] = [];
+  const roofY = WALL_HEIGHT + PLANK.h / 2;
+  const strips = Math.round(d / PLANK.w);
+  const npl = Math.round(w / PLANK.l);
+  for (let s = 0; s < strips; s++) {
+    const z = z0 + (s + 0.5) * PLANK.w;
+    const segs: Array<[number, number]> = [];
+    if (s % 2 === 0) {
+      for (let i = 0; i < npl; i++) segs.push([x0 + (i + 0.5) * PLANK.l, PLANK.l]);
+    } else {
+      segs.push([x0 + PLANK.l / 4, PLANK.l / 2]);
+      for (let i = 0; i < npl - 1; i++) {
+        segs.push([x0 + PLANK.l / 2 + (i + 0.5) * PLANK.l, PLANK.l]);
+      }
+      segs.push([x1 - PLANK.l / 4, PLANK.l / 2]);
+    }
+    for (const [c, l] of segs) {
+      roofIds.push(nextPanelId);
+      g.panels.push({
+        id: nextPanelId++,
+        x: c,
+        y: roofY,
+        z,
+        ex: l,
+        ey: PLANK.h,
+        ez: PLANK.w,
+        material: "plank",
+        buildingId: id,
+      });
+    }
   }
 
   const mine = g.panels.filter((p) => p.id >= firstPanel);
@@ -281,29 +362,53 @@ function building(
     cz,
     w,
     d,
-    wallPanelIds: mine.filter((p) => p.orient !== "flat").map((p) => p.id),
+    wallPanelIds: mine.filter((p) => p.material !== "plank").map((p) => p.id),
     roofPanelIds: roofIds,
-    collapseFraction: 0.4,
+    collapseFraction: 0.35,
   });
 }
 
-function tree(g: Gen, x: number, z: number): void {
+function tree(g: Gen, x: number, z: number, rng: () => number): void {
   const id = nextBuildingId++;
   const base = heightAt(x, z);
+  const SEG = 0.8;
   const trunkIds: number[] = [];
-  for (let seg = 0; seg < 2; seg++) {
+  for (let seg = 0; seg < 4; seg++) {
     trunkIds.push(nextPanelId);
     g.panels.push({
       id: nextPanelId++,
       x,
-      y: base + 0.5 + seg,
+      y: base + (seg + 0.5) * SEG,
       z,
-      orient: "trunk",
+      ex: 0.45,
+      ey: SEG,
+      ez: 0.45,
+      material: "trunk",
       buildingId: id,
     });
   }
-  const canopyIds = [nextPanelId];
-  g.panels.push({ id: nextPanelId++, x, y: base + 2.8, z, orient: "canopy", buildingId: id });
+  // Canopy: a crown clump on top, smaller clumps ringed around it.
+  const canopyIds: number[] = [];
+  const clumps: Array<[number, number, number, number]> = [[0, 3.55, 0, 1.7]];
+  for (let i = 0; i < 3; i++) {
+    const ang = rng() * Math.PI * 2;
+    const r = 0.55 + rng() * 0.4;
+    clumps.push([Math.sin(ang) * r, 2.75 + rng() * 0.5, Math.cos(ang) * r, 1.25 + rng() * 0.5]);
+  }
+  for (const [ox, oy, oz, s] of clumps) {
+    canopyIds.push(nextPanelId);
+    g.panels.push({
+      id: nextPanelId++,
+      x: x + ox,
+      y: base + oy,
+      z: z + oz,
+      ex: s,
+      ey: s * 0.85,
+      ez: s,
+      material: "canopy",
+      buildingId: id,
+    });
+  }
   g.buildings.push({
     id,
     kind: "tree",
@@ -313,7 +418,7 @@ function tree(g: Gen, x: number, z: number): void {
     d: 0.9,
     wallPanelIds: trunkIds,
     roofPanelIds: canopyIds,
-    collapseFraction: 0.5, // one trunk segment fells it
+    collapseFraction: 0.5, // two trunk segments fell it
   });
 }
 
@@ -332,12 +437,13 @@ function buildMap(): MapDef {
   g.statics.push({ x: -half, y: 1.5, z: 0, w: 1, h: 3, d: SIZE, kind: "wall" });
   g.statics.push({ x: half, y: 1.5, z: 0, w: 1, h: 3, d: SIZE, kind: "wall" });
 
-  // Buildings on their flat pads (positions match FLAT_PADS).
-  building(g, 0, 0, 10, 8, 0);
-  building(g, -15, -12, 8, 8, 2);
-  building(g, 15, 12, 8, 8, 3);
-  building(g, 16, -14, 8, 6, 0);
-  building(g, -16, 14, 8, 6, 1);
+  // Buildings on their flat pads (positions match FLAT_PADS): three brick,
+  // two log cabins.
+  building(g, 0, 0, 10, 8, 0, "brick");
+  building(g, -15, -12, 8, 8, 2, "brick");
+  building(g, 15, 12, 8, 8, 3, "log");
+  building(g, 16, -14, 8, 6, 0, "log");
+  building(g, -16, 14, 8, 6, 1, "brick");
 
   // Procedural placement for everything else, rejected against keep-outs.
   const placed: Array<[number, number, number]> = []; // x, z, radius
@@ -353,26 +459,28 @@ function buildMap(): MapDef {
     return true;
   };
 
-  // Freestanding cover walls (2 cols x 2 rows of panels).
+  // Sandbag emplacements (three staggered courses of bags).
   for (let i = 0; i < 8; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const x = (rng() * 2 - 1) * (half - 6);
       const z = (rng() * 2 - 1) * (half - 6);
       if (!clearOf(x, z, 2.2)) continue;
-      const along: "x" | "z" = rng() < 0.5 ? "x" : "z";
+      const axis: "x" | "z" = rng() < 0.5 ? "x" : "z";
       const base = heightAt(x, z);
-      for (let col = 0; col < 2; col++) {
-        for (let row = 0; row < 2; row++) {
-          const a = (col - 0.5) * PANEL_W;
-          g.panels.push({
-            id: nextPanelId++,
-            x: along === "x" ? x + a : x,
-            y: base + (row + 0.5) * PANEL_H,
-            z: along === "x" ? z : z + a,
-            orient: along,
-          });
-        }
-      }
+      const len = 4 * SANDBAG.l;
+      const a0 = (axis === "x" ? x : z) - len / 2;
+      masonryRun(
+        g,
+        axis,
+        a0,
+        a0 + len,
+        axis === "x" ? z : x,
+        base,
+        3,
+        SANDBAG,
+        "sandbag",
+        undefined,
+      );
       placed.push([x, z, 2.2]);
       break;
     }
@@ -384,20 +492,43 @@ function buildMap(): MapDef {
       const x = (rng() * 2 - 1) * (half - 5);
       const z = (rng() * 2 - 1) * (half - 5);
       if (!clearOf(x, z, 2.4)) continue;
-      tree(g, x, z);
+      tree(g, x, z, rng);
       placed.push([x, z, 2.4]);
       break;
     }
   }
 
-  // Crates.
+  // Crates, some with a smaller crate stacked on top.
   for (let i = 0; i < 10; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const x = (rng() * 2 - 1) * (half - 5);
       const z = (rng() * 2 - 1) * (half - 5);
       if (!clearOf(x, z, 1.6)) continue;
-      const s = 1.0 + rng() * 0.7;
-      g.statics.push({ x, y: heightAt(x, z) + s / 2, z, w: s, h: s, d: s, kind: "crate" });
+      const s = 0.9 + rng() * 0.5;
+      const base = heightAt(x, z);
+      g.panels.push({
+        id: nextPanelId++,
+        x,
+        y: base + s / 2,
+        z,
+        ex: s,
+        ey: s,
+        ez: s,
+        material: "crate",
+      });
+      if (rng() < 0.4) {
+        const s2 = s * 0.65;
+        g.panels.push({
+          id: nextPanelId++,
+          x: x + (rng() - 0.5) * 0.25,
+          y: base + s + s2 / 2,
+          z: z + (rng() - 0.5) * 0.25,
+          ex: s2,
+          ey: s2,
+          ez: s2,
+          material: "crate",
+        });
+      }
       placed.push([x, z, 1.6]);
       break;
     }
