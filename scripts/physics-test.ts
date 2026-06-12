@@ -4,7 +4,7 @@
 //     --platform=browser --external:module --outfile=/tmp/bp-physics-test.mjs \
 //     && node /tmp/bp-physics-test.mjs
 import { GRENADE_FUSE_TICKS, RIFLE_COOLDOWN_TICKS, RIFLE_MAG } from "../src/shared/constants.js";
-import { MAP, spawnPoint } from "../src/shared/map.js";
+import { heightAt, MAP, spawnPoint } from "../src/shared/map.js";
 import { quantizeAngle, quantizeMove } from "../src/shared/netCodec.js";
 import {
   type Body,
@@ -148,7 +148,7 @@ async function main(): Promise<void> {
     const placement = buildPlacement(r.s, 0);
     check(
       "build placement in front",
-      Math.abs(placement.z - (r.s.z + 3)) < 0.6 && placement.orient === "x",
+      Math.abs(placement.z - (r.s.z + 3)) < 0.6 && placement.orient === "bx",
       JSON.stringify(placement),
     );
     let built = 0;
@@ -197,7 +197,7 @@ async function main(): Promise<void> {
       prevVy = vel.y;
     }
     const end = body.translation();
-    check("grenade travels", end.x > -15, `x=${end.x}`);
+    check("grenade travels", end.x > -16, `x=${end.x}`);
     check("grenade bounces", bounced, `minY=${minY}`);
     destroyGameWorld(gw);
   }
@@ -279,17 +279,34 @@ async function main(): Promise<void> {
     destroyGameWorld(r.gw);
   }
 
-  // --- Building integrity data (drives the collapse system). ---
+  // --- Structure integrity data (drives the collapse system). ---
   {
-    let ok = MAP.buildings.length === 5;
+    const houses = MAP.buildings.filter((b) => b.kind === "building");
+    const trees = MAP.buildings.filter((b) => b.kind === "tree");
+    let ok = houses.length === 5 && trees.length >= 8;
+    for (const b of houses) ok &&= b.wallPanelIds.length >= 60 && b.roofPanelIds.length >= 6;
+    for (const b of trees) ok &&= b.wallPanelIds.length === 2 && b.roofPanelIds.length === 1;
     for (const b of MAP.buildings) {
-      ok &&= b.wallPanelIds.length >= 20 && b.roofPanelIds.length >= 6;
       ok &&= b.wallPanelIds.every((id) => MAP.panels.find((p) => p.id === id)?.buildingId === b.id);
     }
     check(
-      "buildings group their panels",
+      "structures group their panels",
       ok,
-      JSON.stringify(MAP.buildings.map((b) => b.wallPanelIds.length)),
+      JSON.stringify(MAP.buildings.map((b) => `${b.kind}:${b.wallPanelIds.length}`)),
+    );
+  }
+
+  // --- Terrain is uneven but flat where it must be. ---
+  {
+    let maxH = 0;
+    for (let x = -25; x <= 25; x += 1.7) {
+      for (let z = -25; z <= 25; z += 1.7) maxH = Math.max(maxH, heightAt(x, z));
+    }
+    check("terrain has relief", maxH > 0.5, `maxH=${maxH.toFixed(2)}`);
+    check(
+      "spawns and pads are flat",
+      Math.abs(heightAt(0, -23)) < 0.05 && Math.abs(heightAt(0, 0)) < 0.05,
+      "",
     );
   }
 

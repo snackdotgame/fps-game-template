@@ -5,7 +5,7 @@
 import { client } from "minion:client";
 import * as THREE from "three";
 import { INPUT_REDUNDANCY, MAX_HP, TEAM_NAMES, TICK_MS, TICK_RATE } from "./shared/constants.js";
-import { MAP, type PanelDef, panelExtents } from "./shared/map.js";
+import { MAP, type PanelDef, panelExtents, terrainMesh } from "./shared/map.js";
 import { PANEL_HP, RUBBLE_HEIGHT } from "./shared/constants.js";
 import { parseServerMsg, type PlayerInfo } from "./shared/messages.js";
 import {
@@ -94,27 +94,75 @@ window.addEventListener("resize", () => {
 // Map visuals.
 
 const MAT = {
-  ground: new THREE.MeshLambertMaterial({ color: 0x8a9a6b }),
   wall: new THREE.MeshLambertMaterial({ color: 0x9b958a }),
   crate: new THREE.MeshLambertMaterial({ color: 0x8a6f4d }),
   panel: new THREE.MeshLambertMaterial({ color: 0xb9b2a6 }),
   panelRoof: new THREE.MeshLambertMaterial({ color: 0xa39a8a }),
   built: new THREE.MeshLambertMaterial({ color: 0x7d8a96 }),
+  trunk: new THREE.MeshLambertMaterial({ color: 0x6e4f30 }),
+  canopy: new THREE.MeshLambertMaterial({ color: 0x4d7a3a }),
   debris: new THREE.MeshLambertMaterial({ color: 0xa59c8e }),
 };
+
+function panelMaterial(p: PanelDef): THREE.MeshLambertMaterial {
+  switch (p.orient) {
+    case "flat":
+      return MAT.panelRoof;
+    case "bx":
+    case "bz":
+      return MAT.built;
+    case "trunk":
+      return MAT.trunk;
+    case "canopy":
+      return MAT.canopy;
+    default:
+      return MAT.panel;
+  }
+}
+
+// One shared BoxGeometry per orientation — a thousand panels, seven geometries.
+const panelGeos = new Map<string, THREE.BoxGeometry>();
+
+function panelGeometry(orient: PanelDef["orient"]): THREE.BoxGeometry {
+  let geo = panelGeos.get(orient);
+  if (!geo) {
+    const [w, h, d] = panelExtents(orient);
+    geo = new THREE.BoxGeometry(w, h, d);
+    panelGeos.set(orient, geo);
+  }
+  return geo;
+}
 
 let mapGroup = new THREE.Group();
 scene.add(mapGroup);
 const panelMeshes = new Map<number, THREE.Mesh>();
 
-function panelMesh(p: PanelDef, built: boolean): THREE.Mesh {
-  const [w, h, d] = panelExtents(p.orient);
-  const mesh = new THREE.Mesh(
-    new THREE.BoxGeometry(w, h, d),
-    built ? MAT.built : p.orient === "flat" ? MAT.panelRoof : MAT.panel,
-  );
+function panelMesh(p: PanelDef): THREE.Mesh {
+  const mesh = new THREE.Mesh(panelGeometry(p.orient), panelMaterial(p));
   mesh.position.set(p.x, p.y, p.z);
   mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  return mesh;
+}
+
+// Terrain rendered from the same heightfield the physics mesh uses, with a
+// subtle two-tone grass blend by elevation.
+function makeTerrainMesh(): THREE.Mesh {
+  const data = terrainMesh();
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(data.vertices, 3));
+  geo.setIndex(data.indices);
+  geo.computeVertexNormals();
+  const colors: number[] = [];
+  const low = new THREE.Color(0x86996a);
+  const high = new THREE.Color(0x9aa66f);
+  for (let i = 0; i < data.vertices.length; i += 3) {
+    const t = Math.min(1, data.vertices[i + 1] / 1.1);
+    const c = low.clone().lerp(high, t);
+    colors.push(c.r, c.g, c.b);
+  }
+  geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+  const mesh = new THREE.Mesh(geo, new THREE.MeshLambertMaterial({ vertexColors: true }));
   mesh.receiveShadow = true;
   return mesh;
 }
@@ -125,23 +173,24 @@ function buildMapVisuals(): void {
   scene.add(mapGroup);
   panelMeshes.clear();
 
+  mapGroup.add(makeTerrainMesh());
   for (const s of MAP.statics) {
-    const mat = s.kind === "ground" ? MAT.ground : s.kind === "crate" ? MAT.crate : MAT.wall;
+    const mat = s.kind === "crate" ? MAT.crate : MAT.wall;
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.w, s.h, s.d), mat);
     mesh.position.set(s.x, s.y, s.z);
-    mesh.castShadow = s.kind !== "ground";
+    mesh.castShadow = true;
     mesh.receiveShadow = true;
     mapGroup.add(mesh);
   }
   for (const p of MAP.panels) {
-    const mesh = panelMesh(p, false);
+    const mesh = panelMesh(p);
     mapGroup.add(mesh);
     panelMeshes.set(p.id, mesh);
   }
 }
 
 function addBuiltPanelVisual(p: PanelDef): void {
-  const mesh = panelMesh(p, true);
+  const mesh = panelMesh(p);
   mapGroup.add(mesh);
   panelMeshes.set(p.id, mesh);
 }
@@ -214,10 +263,9 @@ function collapseFx(buildingId: number): void {
 function removePanelVisual(id: number, withDebris: boolean): void {
   const mesh = panelMeshes.get(id);
   if (!mesh) return;
-  if (withDebris) spawnDebris(mesh.position, 6);
+  if (withDebris) spawnDebris(mesh.position, 4);
   mapGroup.remove(mesh);
-  mesh.geometry.dispose();
-  panelMeshes.delete(id);
+  panelMeshes.delete(id); // geometry is shared per-orient — never disposed
 }
 
 // ---------------------------------------------------------------------------

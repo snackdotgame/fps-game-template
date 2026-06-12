@@ -26,7 +26,14 @@ import {
   RIFLE_MAG,
   TICK_RATE,
 } from "./constants.js";
-import { type BuildingDef, MAP, type PanelDef, type PanelOrient, panelExtents } from "./map.js";
+import {
+  type BuildingDef,
+  MAP,
+  type PanelDef,
+  type PanelOrient,
+  panelExtents,
+  terrainMesh,
+} from "./map.js";
 
 export type { Body } from "jolt-ts";
 
@@ -103,7 +110,7 @@ const AIR_ACCEL = 14;
 const GROUND_FRICTION = 50;
 const JUMP_VEL = 6.8;
 const COYOTE_TICKS = 4;
-const GROUND_PROBE = 0.09;
+const GROUND_PROBE = 0.16; // generous: uneven terrain underfoot
 
 export function makeChar(spawn: readonly number[]): CharState {
   return {
@@ -163,6 +170,26 @@ export async function createGameWorld(): Promise<GameWorld> {
     deterministic: "cross-platform",
   });
   const gw: GameWorld = { world, panels: new Map(), players: new Map(), grenades: new Map() };
+
+  // Terrain: a triangle mesh from the shared heightfield, plus a safety slab
+  // underneath so nothing ever falls out of the world.
+  const terrain = terrainMesh();
+  world.createBody({
+    type: "static",
+    shape: { kind: "mesh", vertices: terrain.vertices, indices: terrain.indices },
+    position: [0, 0, 0],
+    layer: "static",
+    friction: 0.7,
+    userData: { static: true } satisfies BodyTag,
+  });
+  world.createBody({
+    type: "static",
+    shape: Shape.box({ halfExtents: [MAP.size / 2 + 2, 0.5, MAP.size / 2 + 2] }),
+    position: [0, -0.55, 0],
+    layer: "static",
+    friction: 0.7,
+    userData: { static: true } satisfies BodyTag,
+  });
 
   for (const s of MAP.statics) {
     world.createBody({
@@ -318,7 +345,7 @@ export function buildPlacement(s: CharState, yaw: number): PanelDef {
   const px = s.x + dx * BUILD_RANGE;
   const pz = s.z + dz * BUILD_RANGE;
   // Face the player: wall axis perpendicular to view.
-  const orient: PanelOrient = Math.abs(dx) > Math.abs(dz) ? "z" : "x";
+  const orient: PanelOrient = Math.abs(dx) > Math.abs(dz) ? "bz" : "bx";
   return {
     id: 0, // assigned by the server
     x: Math.round(px * 2) / 2,

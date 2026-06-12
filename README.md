@@ -11,12 +11,14 @@ grenades blow buildings open — and you can deploy fresh cover of your own.
 
 - **Team deathmatch**, two teams, auto-balanced. First to 40 kills or best score after
   5 minutes; short results screen, then the map fully restores and a new round starts.
-- **Buildings collapse** (BattleBit's critical-health 'levolution'): every building
-  tracks structural integrity, and once 40% of its wall panels are gone the whole
-  structure crumbles — remaining walls and roof fall, dust and debris fly, the ground
-  shakes, and a low rubble mound is left as cover. Panels also show damage (darkening
-  as they're chipped), and explosions delete panels up close while cracking them in an
-  outer falloff ring.
+- **Buildings collapse** (BattleBit's critical-health 'levolution'): every structure
+  tracks integrity — buildings fall at 40% wall loss, trees fall when the trunk
+  breaks — and a collapse drops everything left standing with dust, debris, ground
+  shake, and a rubble mound that becomes new cover. Panels darken as they're chipped,
+  and explosions delete panels up close while cracking them in an outer falloff ring.
+- **Uneven terrain**: rolling noise-generated ground (one shared height function drives
+  both Jolt collision and the rendered mesh), with ridgelines as natural cover and
+  buildings on flat pads.
 - **Rifle** — full-auto hitscan, 30-round mag, server-side spread that worsens while
   moving or airborne. R reloads (auto on empty).
 - **Grenades (G)** — real physics projectiles (they bounce); the blast damages players
@@ -45,9 +47,13 @@ body is removed on the server _and_ in every client's mirror world, so you can w
 shoot through the hole your grenade just made, and prediction collides with the same
 breached geometry the server does.
 
-- `src/shared/map.ts` — the battlefield as data: indestructible statics plus ~230
-  destructible panels (buildings with door/window gaps, freestanding cover, roofs),
-  authored by tiny helpers. Deployed cover becomes a panel at runtime.
+- `src/shared/map.ts` — a **procedurally generated battlefield** from a fixed seed
+  (change `MAP_SEED` for a new layout): value-noise terrain with real relief
+  (flattened under buildings and spawns, identical Jolt mesh collision and rendered
+  geometry from one height function), five buildings made of ~950 fine-grained panels
+  (1m x 0.625m — holes where you actually shoot), procedurally placed cover walls and
+  crates, and **destructible trees** — two sledge swings or any blast to the trunk
+  fells the whole tree. Deployed cover becomes a panel at runtime.
 - `src/shared/physics.ts` — world construction and the deterministic FPS controller:
   walk/sprint/jump movement, plus the **deterministic weapon state machine** (ammo,
   cooldowns, reload, grenade/supply counts) that runs identically in prediction and on
