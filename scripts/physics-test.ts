@@ -4,7 +4,14 @@
 //     --platform=browser --external:module --outfile=/tmp/bp-physics-test.mjs \
 //     && node /tmp/bp-physics-test.mjs
 import { GRENADE_FUSE_TICKS, RIFLE_COOLDOWN_TICKS, RIFLE_MAG } from "../src/shared/constants.js";
-import { addCrater, heightAt, MAP, resetCraters, spawnPoint } from "../src/shared/map.js";
+import {
+  addCrater,
+  buildSupportIndex,
+  heightAt,
+  MAP,
+  resetCraters,
+  spawnPoint,
+} from "../src/shared/map.js";
 import { quantizeAngle, quantizeMove } from "../src/shared/netCodec.js";
 import {
   applyCraterBodies,
@@ -381,6 +388,41 @@ async function main(): Promise<void> {
     const houses = MAP.buildings.filter((b) => b.kind === "building");
     const twoStory = houses.filter((b) => b.wallPanelIds.length > 1300);
     check("multi-story buildings exist", twoStory.length >= 2, `tall=${twoStory.length}`);
+  }
+
+  // --- Structural support graph: walls stand on their bottom courses. ---
+  {
+    const sup = buildSupportIndex();
+    const bricks = MAP.panels.filter((p) => p.material === "brick" && p.buildingId === 1);
+    const grounded = bricks.filter((b) => sup.grounded.has(b.id));
+    const resting = bricks.filter(
+      (b) => !sup.grounded.has(b.id) && (sup.below.get(b.id) ?? []).length > 0,
+    );
+    check("bottom brick course is grounded", grounded.length > 20, `g=${grounded.length}`);
+    check(
+      "upper bricks rest on lower bricks",
+      resting.length > bricks.length * 0.7,
+      `resting=${resting.length}/${bricks.length}`,
+    );
+    const doubled = bricks.filter((b) => (sup.below.get(b.id) ?? []).length >= 2);
+    check("running bond gives most bricks two supports", doubled.length > bricks.length * 0.5, "");
+    const planks = MAP.panels.filter((p) => p.material === "plank" && p.buildingId === 1);
+    check(
+      "roof planks rest on the wall tops",
+      planks.some((pl) => (sup.below.get(pl.id) ?? []).length > 0),
+      "",
+    );
+    // Floating stair treads must NOT be in any support chain (they'd
+    // insta-fall): nothing rests on them and they rest on nothing.
+    const center = MAP.buildings[0];
+    const treads = MAP.panels.filter(
+      (p) => p.buildingId === center.id && p.material === "plank" && p.ey === 0.12,
+    );
+    check(
+      "stair treads float outside the support graph",
+      treads.length >= 10 && treads.every((t) => (sup.below.get(t.id) ?? []).length === 0),
+      `treads=${treads.length}`,
+    );
   }
 
   // --- Terrain destruction: a crater lowers both heightAt and the rebuilt

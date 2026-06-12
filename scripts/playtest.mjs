@@ -286,7 +286,10 @@ for (let attempt = 0; attempt < 4 && !okA; attempt++) {
 }
 await goTo(b, 24, 30, 25000);
 const okB = await goTo(b, 24, 14, 20000);
-check("A reached the duel lane", okA, `A=${okA}`);
+// Best-effort staging, not an assertion: the 3-story tower overlooks the
+// lane, so bots sometimes deny the approach entirely. The duel below tracks
+// B wherever both ended up; the kill check is the real coverage.
+if (!okA) console.log("(A never settled in the lane — dueling from wherever A is)");
 if (!okB) console.log("(B got stuck en route — fine, A tracks B wherever they are)");
 const scores0 = await a.fps("scores");
 // B's idx as seen from A: the human idx with a remote view (you aren't your

@@ -755,6 +755,80 @@ function buildMap(): MapDef {
 
 export const MAP = buildMap();
 
+// ---------------------------------------------------------------------------
+// Structural support: which pieces rest on which. The server consults this
+// when a piece dies — anything that just lost its LAST support falls too
+// (and sheds rubble), so shooting out the bottom of a wall drops the column
+// above it. Pure map data, computed once over the static piece list.
+//
+// A piece is "supported" by terrain (grounded) or by any alive piece whose
+// top face its bottom face rests on with real xz overlap. Pieces that never
+// had support (floating stair treads, canopy clumps) are left alone — they
+// only fall with their structure's collapse.
+
+export interface SupportIndex {
+  above: Map<number, number[]>; // id -> pieces resting on it
+  below: Map<number, number[]>; // id -> pieces it rests on
+  grounded: Set<number>; // pieces standing on the terrain itself
+}
+
+export function buildSupportIndex(): SupportIndex {
+  const above = new Map<number, number[]>();
+  const below = new Map<number, number[]>();
+  const grounded = new Set<number>();
+
+  // Spatial hash over xz so each piece only tests its neighborhood.
+  const CELL = 2;
+  const grid = new Map<number, PanelDef[]>();
+  const key = (cx: number, cz: number) => (cx + 128) * 4096 + (cz + 128);
+  const cellRange = (p: PanelDef): [number, number, number, number] => [
+    Math.floor((p.x - p.ex / 2) / CELL),
+    Math.floor((p.x + p.ex / 2) / CELL),
+    Math.floor((p.z - p.ez / 2) / CELL),
+    Math.floor((p.z + p.ez / 2) / CELL),
+  ];
+
+  for (const p of MAP.panels) {
+    if (p.y - p.ey / 2 <= baseHeightAt(p.x, p.z) + 0.15) grounded.add(p.id);
+    const [x0, x1, z0, z1] = cellRange(p);
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cz = z0; cz <= z1; cz++) {
+        const k = key(cx, cz);
+        const list = grid.get(k);
+        if (list) list.push(p);
+        else grid.set(k, [p]);
+      }
+    }
+  }
+
+  for (const p of MAP.panels) {
+    const pTop = p.y + p.ey / 2;
+    const seen = new Set<number>();
+    const [x0, x1, z0, z1] = cellRange(p);
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cz = z0; cz <= z1; cz++) {
+        for (const q of grid.get(key(cx, cz)) ?? []) {
+          if (q.id === p.id || seen.has(q.id)) continue;
+          seen.add(q.id);
+          // q rests on p: q's bottom at p's top, with real overlap.
+          if (Math.abs(q.y - q.ey / 2 - pTop) > 0.09) continue;
+          const ox = (p.ex + q.ex) / 2 - Math.abs(p.x - q.x);
+          const oz = (p.ez + q.ez) / 2 - Math.abs(p.z - q.z);
+          if (ox < 0.03 || oz < 0.03) continue;
+          let a = above.get(p.id);
+          if (!a) above.set(p.id, (a = []));
+          a.push(q.id);
+          let b = below.get(q.id);
+          if (!b) below.set(q.id, (b = []));
+          b.push(p.id);
+        }
+      }
+    }
+  }
+
+  return { above, below, grounded };
+}
+
 // Deployed cover panels get ids above this; map panel ids stay below it.
 export const BUILT_PANEL_ID_BASE = 10000;
 
