@@ -227,6 +227,14 @@ const panelSlots = new Map<number, PieceSlot>();
 const builtMeshes = new Map<number, THREE.Mesh>();
 const panelDefs = new Map<number, PanelDef>(); // map + built, for tint/debris
 
+// Rubble chunks arrive at runtime in unbounded numbers, so they get their
+// own pre-sized instanced pool with a freelist (matches the server's
+// RUBBLE_CAP) — a thousand persistent chunks cost one draw call, not one
+// mesh each.
+const RUBBLE_POOL_CAP = 1200;
+let rubblePool: THREE.InstancedMesh | null = null;
+const rubbleFree: number[] = [];
+
 const _m4 = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
 const _pos = new THREE.Vector3();
@@ -498,7 +506,7 @@ function surfaceNormalAt(body: Body | null, point: THREE.Vector3): THREE.Vector3
   return _decalN.set(-dhdx, 1, -dhdz).normalize();
 }
 
-function spawnBulletDecal(point: THREE.Vector3, normal: THREE.Vector3): void {
+function spawnBulletDecal(point: THREE.Vector3, normal: THREE.Vector3, panelId?: number): void {
   if (decals.length >= 240) {
     const old = decals.shift()!;
     old.parent?.remove(old);
@@ -509,8 +517,34 @@ function spawnBulletDecal(point: THREE.Vector3, normal: THREE.Vector3): void {
   m.position.copy(point).addScaledVector(normal, 0.012);
   m.quaternion.setFromUnitVectors(FORWARD_Z, normal);
   m.rotateZ(Math.random() * Math.PI * 2);
+  m.userData.panelId = panelId; // undefined = terrain
   mapGroup.add(m); // dies with the map on round reset
   decals.push(m);
+}
+
+// Marks die with the surface they're on: piece decals when the piece is
+// destroyed, ground decals when a crater swallows the ground.
+function removeDecalsForPanels(ids: ReadonlySet<number>): void {
+  for (let i = decals.length - 1; i >= 0; i--) {
+    const pid = decals[i].userData.panelId as number | undefined;
+    if (pid !== undefined && ids.has(pid)) {
+      decals[i].parent?.remove(decals[i]);
+      decals.splice(i, 1);
+    }
+  }
+}
+
+function removeDecalsInCrater(c: { x: number; z: number; r: number }): void {
+  for (let i = decals.length - 1; i >= 0; i--) {
+    const d = decals[i];
+    if (
+      d.userData.panelId === undefined &&
+      Math.hypot(d.position.x - c.x, d.position.z - c.z) < c.r + 0.3
+    ) {
+      d.parent?.remove(d);
+      decals.splice(i, 1);
+    }
+  }
 }
 
 function buildMapVisuals(): void {
@@ -565,10 +599,33 @@ function buildMapVisuals(): void {
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mapGroup.add(mesh);
   }
+
+  rubblePool = new THREE.InstancedMesh(GEO.bevel, voxelMat, RUBBLE_POOL_CAP);
+  rubblePool.castShadow = true;
+  rubblePool.receiveShadow = true;
+  rubbleFree.length = 0;
+  for (let i = RUBBLE_POOL_CAP - 1; i >= 0; i--) {
+    rubblePool.setMatrixAt(i, ZERO_SCALE);
+    rubbleFree.push(i);
+  }
+  rubblePool.instanceMatrix.needsUpdate = true;
+  mapGroup.add(rubblePool);
 }
 
-// Deployed cover and rubble chunks arrive one at a time as individual meshes.
+// Deployed cover arrives as individual meshes; rubble chunks claim slots in
+// the instanced pool (falling back to a mesh only if the pool is full).
 function addBuiltPanelVisual(p: PanelDef): void {
+  panelDefs.set(p.id, p);
+  if (p.material === "rubble" && rubblePool && rubbleFree.length > 0) {
+    const index = rubbleFree.pop()!;
+    pieceColor(p, _col);
+    rubblePool.setMatrixAt(index, pieceMatrix(p));
+    rubblePool.setColorAt(index, _col);
+    rubblePool.instanceMatrix.needsUpdate = true;
+    if (rubblePool.instanceColor) rubblePool.instanceColor.needsUpdate = true;
+    panelSlots.set(p.id, { mesh: rubblePool, index, base: _col.getHex() });
+    return;
+  }
   const style = PIECE_STYLE[p.material];
   const mesh = new THREE.Mesh(style.geo, (style.mat as THREE.MeshStandardMaterial).clone());
   (mesh.material as THREE.MeshStandardMaterial).color.copy(pieceColor(p, _col));
@@ -579,7 +636,6 @@ function addBuiltPanelVisual(p: PanelDef): void {
   mesh.receiveShadow = true;
   mapGroup.add(mesh);
   builtMeshes.set(p.id, mesh);
-  panelDefs.set(p.id, p);
 }
 
 const RUBBLE_MAT = MAT.rubble;
@@ -660,6 +716,7 @@ function removePanelVisual(id: number, withDebris: boolean): void {
     slot.mesh.setMatrixAt(slot.index, ZERO_SCALE);
     slot.mesh.instanceMatrix.needsUpdate = true;
     panelSlots.delete(id);
+    if (slot.mesh === rubblePool) rubbleFree.push(slot.index);
   } else {
     const mesh = builtMeshes.get(id);
     if (!mesh) return;
@@ -1147,6 +1204,7 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
         if (gw) removePanelBody(gw, id);
         removePanelVisual(id, debrisLeft-- > 0);
       }
+      removeDecalsForPanels(new Set(msg.panelIds));
       break;
     }
     case "crater": {
@@ -1156,6 +1214,7 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
         rebuildTerrainChunk(ci, cj);
         rebuildGrassChunk(ci, cj);
       }
+      removeDecalsInCrater(msg.crater);
       break;
     }
     case "build": {
@@ -1507,9 +1566,13 @@ function predictionTick(): void {
           ? new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])
           : new THREE.Vector3(eye[0] + dir[0] * 90, eye[1] + dir[1] * 90, eye[2] + dir[2] * 90);
         spawnTracer(from, end);
-        const tag = (hit?.body.userData ?? {}) as { playerIdx?: number; grenadeId?: number };
+        const tag = (hit?.body.userData ?? {}) as {
+          playerIdx?: number;
+          grenadeId?: number;
+          panelId?: number;
+        };
         if (hit && tag.playerIdx === undefined && tag.grenadeId === undefined) {
-          spawnBulletDecal(end, surfaceNormalAt(hit.body, end));
+          spawnBulletDecal(end, surfaceNormalAt(hit.body, end), tag.panelId);
         }
       }
     },
@@ -2010,14 +2073,14 @@ function processEvents(list: GameEvent[]): void {
             if (len > 0.5 && len < 89) {
               d.divideScalar(len);
               const hit = castLocal([from.x, from.y, from.z], [d.x, d.y, d.z], len + 0.4);
-              const tag = (hit?.body.userData ?? {}) as { playerIdx?: number };
+              const tag = (hit?.body.userData ?? {}) as { playerIdx?: number; panelId?: number };
               if (
                 hit &&
                 tag.playerIdx === undefined &&
                 at.distanceToSquared(new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])) <
                   0.36
               ) {
-                spawnBulletDecal(at, surfaceNormalAt(hit.body, at));
+                spawnBulletDecal(at, surfaceNormalAt(hit.body, at), tag.panelId);
               }
             }
           }

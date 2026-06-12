@@ -36,6 +36,7 @@ import {
 import {
   addCrater,
   BUILT_PANEL_ID_BASE,
+  buildSupportIndex,
   type Crater,
   craterList,
   heightAt,
@@ -934,6 +935,22 @@ function damagePlayer(
 
 const panelById = new Map(MAP.panels.map((p) => [p.id, p]));
 
+// Static structural support graph (who rests on whom) — computed once; the
+// map regenerates identically every round.
+const SUPPORT = buildSupportIndex();
+
+// A destroyed piece drops whatever was resting on it (unless something else
+// still holds it up). Recursion is bounded by destroyedPanels idempotency
+// and wall height; fallen pieces shed rubble like any other destruction.
+function cascadeUnsupported(panelId: number): void {
+  for (const aboveId of SUPPORT.above.get(panelId) ?? []) {
+    if (destroyedPanels.has(aboveId) || SUPPORT.grounded.has(aboveId)) continue;
+    const supports = SUPPORT.below.get(aboveId);
+    if (supports && supports.some((id) => !destroyedPanels.has(id))) continue;
+    destroyPanel(aboveId, true);
+  }
+}
+
 function panelMaxHp(panelId: number): number {
   const def = panelById.get(panelId) ?? builtPanels.get(panelId);
   return def ? PANEL_HP[def.material] : PANEL_HP.metal;
@@ -958,6 +975,7 @@ function destroyPanel(panelId: number, leaveRubble = true): void {
   removePanelBody(gw, panelId);
   pendingDestroys.push(panelId);
   if (leaveRubble && src) maybeLeaveRubble(src);
+  if (leaveRubble && panelId < BUILT_PANEL_ID_BASE) cascadeUnsupported(panelId);
   // BattleBit-style critical health: enough wall damage fells the building.
   const buildingId = src?.buildingId;
   if (buildingId !== undefined && !collapsedBuildings.has(buildingId)) {
@@ -975,17 +993,17 @@ function destroyPanel(panelId: number, leaveRubble = true): void {
 // (they're just runtime panels), so clients get body + visual for free, and
 // they're destructible in turn (material "rubble", no re-rubble).
 const RUBBLE_CHANCE: Partial<Record<PanelMaterial, number>> = {
-  brick: 0.16,
-  log: 0.45,
-  plank: 0.12,
-  post: 0.7,
-  trunk: 0.55,
-  crate: 0.5,
-  sandbag: 0.3,
-  rock: 0.5,
-  metal: 0.35,
+  brick: 0.38,
+  log: 0.6,
+  plank: 0.32,
+  post: 0.8,
+  trunk: 0.65,
+  crate: 0.7,
+  sandbag: 0.45,
+  rock: 0.6,
+  metal: 0.5,
 };
-const RUBBLE_CAP = 900;
+const RUBBLE_CAP = 1200; // mirrors the client's instanced rubble pool
 
 function maybeLeaveRubble(src: PanelDef): void {
   if (builtPanels.size >= RUBBLE_CAP) return;
