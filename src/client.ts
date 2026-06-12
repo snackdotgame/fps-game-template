@@ -175,6 +175,30 @@ const PIECE_STYLE: Record<
   metal: { geo: GEO.bevel, mat: voxelMat, debris: 0x8a949e },
 };
 
+// Pre-fractured unit boxes: one half survives, the break face is a jagged
+// surface displaced by a position-hashed offset (coincident vertices get the
+// same offset, so the surface stays sealed). Three deterministic variants;
+// fragments pick one by palette seed.
+function makeFractureGeo(variant: number): THREE.BufferGeometry {
+  const geo = new THREE.BoxGeometry(1, 1, 1, 2, 2, 2);
+  const pos = geo.getAttribute("position") as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    if (x < 0.1) continue; // keep the intact half pristine
+    const y = pos.getY(i);
+    const z = pos.getZ(i);
+    const h = hash01(Math.round((y + 2 * z) * 97) + variant * 7919, 41);
+    const h2 = hash01(Math.round((y - z) * 131) + variant * 104729, 42);
+    pos.setX(i, x - 0.12 - h * 0.3);
+    if (Math.abs(y) < 0.49) pos.setY(i, y + (h2 - 0.5) * 0.12);
+  }
+  const out = geo.toNonIndexed();
+  out.computeVertexNormals();
+  return out;
+}
+
+const FRACTURE_GEOS = [makeFractureGeo(0), makeFractureGeo(1), makeFractureGeo(2)];
+
 const CANOPY_GREENS = [0x4e8a3c, 0x5f9c46, 0x3f7a34, 0x6fae52, 0x35703a];
 
 // The palette: deterministic per-piece color so a wall is a thousand subtly
@@ -276,6 +300,7 @@ class LoosePool {
 
 const looseBoxes = new LoosePool(1500);
 const looseCyls = new LoosePool(300);
+const fracturePools = [new LoosePool(450), new LoosePool(450), new LoosePool(450)];
 
 const _m4 = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
@@ -663,13 +688,22 @@ function buildMapVisuals(): void {
 
   looseBoxes.rebuild(GEO.bevel, mapGroup);
   looseCyls.rebuild(GEO.cyl, mapGroup);
+  for (let i = 0; i < fracturePools.length; i++) {
+    fracturePools[i].rebuild(FRACTURE_GEOS[i], mapGroup);
+  }
 }
 
 // Runtime pieces (rubble, settled fallen pieces, deployed cover) claim
 // instanced pool slots, falling back to a mesh only if the pool is full.
 function addBuiltPanelVisual(p: PanelDef): void {
   panelDefs.set(p.id, p);
-  const pool = p.material === "log" || p.material === "trunk" ? looseCyls : looseBoxes;
+  const cyl = p.material === "log" || p.material === "trunk";
+  const pool =
+    p.broken && !cyl
+      ? fracturePools[(p.seed ?? p.id) % fracturePools.length]
+      : cyl
+        ? looseCyls
+        : looseBoxes;
   const slot = pool.claim(p);
   if (slot) {
     panelSlots.set(p.id, slot);
@@ -765,7 +799,11 @@ function removePanelVisual(id: number, withDebris: boolean): void {
     slot.mesh.setMatrixAt(slot.index, ZERO_SCALE);
     slot.mesh.instanceMatrix.needsUpdate = true;
     panelSlots.delete(id);
-    if (!looseBoxes.release(slot)) looseCyls.release(slot);
+    if (!looseBoxes.release(slot) && !looseCyls.release(slot)) {
+      for (const fp of fracturePools) {
+        if (fp.release(slot)) break;
+      }
+    }
   } else {
     const mesh = builtMeshes.get(id);
     if (!mesh) return;
@@ -774,7 +812,7 @@ function removePanelVisual(id: number, withDebris: boolean): void {
   }
   panelDefs.delete(id);
   if (withDebris && def) {
-    spawnDebris(_pos.set(def.x, def.y, def.z), 3, PIECE_STYLE[def.material].debris);
+    spawnDebris(_pos.set(def.x, def.y, def.z), 3, pieceColor(def, _col).getHex());
   }
 }
 
@@ -2148,8 +2186,12 @@ function debrisMat(color: number): THREE.MeshLambertMaterial {
 function spawnDebris(at: THREE.Vector3, count: number, color = 0xa59c8e): void {
   for (let i = 0; i < count; i++) {
     const s = 0.1 + Math.random() * 0.2;
-    const mesh = new THREE.Mesh(GEO.box, debrisMat(color));
-    mesh.scale.setScalar(s);
+    const mesh = new THREE.Mesh(
+      FRACTURE_GEOS[(Math.random() * FRACTURE_GEOS.length) | 0],
+      debrisMat(color),
+    );
+    mesh.scale.set(s * 1.3, s * 0.6, s * 0.9); // shard, not cube
+    mesh.rotation.y = Math.random() * Math.PI;
     mesh.userData.sharedMat = true;
     mesh.userData.sharedGeo = true;
     mesh.position.set(
@@ -2698,9 +2740,8 @@ window.__fps = {
   craterCount: () => craterList().length,
   roundTicksLeft: () => Math.max(0, phaseEndTick - estServerTick()),
   groundHeightAt: (x: number, z: number) => heightAt(x, z),
-  rubbleCount: () => builtList.filter((p) => p.material === "rubble").length,
-  fallenCount: () =>
-    builtList.filter((p) => p.material !== "rubble" && p.material !== "metal").length,
+  rubbleCount: () => builtList.filter((p) => p.broken).length,
+  fallenCount: () => builtList.filter((p) => !p.broken && p.material !== "metal").length,
   corpseCount: () => corpses.length,
   perf: () => ({
     fps: perf.fps,
