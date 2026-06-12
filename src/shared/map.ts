@@ -1,8 +1,12 @@
-// The battlefield as data: indestructible statics (ground, perimeter, crates)
-// plus destructible PANELS — the unit of BattleBit-style destruction. Wall and
-// roof panels have ids and HP; gunfire chips them, sledgehammers breach them,
-// explosions delete them in a radius. Deployed cover becomes a panel too.
-// Client and server build identical physics worlds from this module.
+// The battlefield, procedurally generated from a fixed seed so client and
+// server build identical worlds. Terrain is a value-noise heightfield
+// (flattened under buildings and spawns); buildings are fine-grained grids of
+// destructible PANELS (1m x 0.625m pieces — gunfire chips them, explosions
+// blow holes, enough wall loss collapses the whole structure); trees are
+// destructible too — break the trunk and the tree comes down. Deployed cover
+// becomes a panel at runtime.
+
+export const MAP_SEED = 0xb17b17;
 
 export interface StaticBox {
   x: number; // center
@@ -11,10 +15,12 @@ export interface StaticBox {
   w: number; // full extents
   h: number;
   d: number;
-  kind: "ground" | "wall" | "crate";
+  kind: "wall" | "crate";
 }
 
-export type PanelOrient = "x" | "z" | "flat"; // wall along x, along z, or roof
+// "x"/"z": wall pieces along an axis. "flat": roof slab. "bx"/"bz": deployed
+// cover (wider). "trunk": tree trunk segment. "canopy": tree foliage block.
+export type PanelOrient = "x" | "z" | "flat" | "bx" | "bz" | "trunk" | "canopy";
 
 export interface PanelDef {
   id: number;
@@ -22,30 +28,46 @@ export interface PanelDef {
   y: number;
   z: number;
   orient: PanelOrient;
-  // Panels belonging to a building share its id; enough wall damage brings
-  // the whole structure down (BattleBit-style critical health).
+  // Panels belonging to a structure share its id; enough structural damage
+  // brings the whole thing down (BattleBit-style critical health).
   buildingId?: number;
 }
 
 export interface BuildingDef {
   id: number;
+  kind: "building" | "tree";
   cx: number;
   cz: number;
   w: number;
   d: number;
-  wallPanelIds: number[];
-  roofPanelIds: number[];
+  wallPanelIds: number[]; // the structural panels that count toward collapse
+  roofPanelIds: number[]; // fall with the structure but don't count
+  collapseFraction: number; // fraction of structural panels lost -> collapse
 }
 
 // Panel dimensions by orientation (full extents).
-export const PANEL_W = 2;
-export const PANEL_H = 1.25;
+export const PANEL_W = 1;
+export const PANEL_H = 0.625;
 export const PANEL_T = 0.22;
+export const WALL_ROWS = 4; // 2.5m walls
 
 export function panelExtents(orient: PanelOrient): [number, number, number] {
-  if (orient === "x") return [PANEL_W, PANEL_H, PANEL_T];
-  if (orient === "z") return [PANEL_T, PANEL_H, PANEL_W];
-  return [PANEL_W, PANEL_T, PANEL_W]; // flat roof slab 2x2
+  switch (orient) {
+    case "x":
+      return [PANEL_W, PANEL_H, PANEL_T];
+    case "z":
+      return [PANEL_T, PANEL_H, PANEL_W];
+    case "flat":
+      return [PANEL_W, PANEL_T, PANEL_W];
+    case "bx":
+      return [2, 1.25, PANEL_T];
+    case "bz":
+      return [PANEL_T, 1.25, 2];
+    case "trunk":
+      return [0.5, 1.0, 0.5];
+    case "canopy":
+      return [2.0, 1.6, 2.0];
+  }
 }
 
 export interface MapDef {
@@ -53,111 +75,246 @@ export interface MapDef {
   statics: StaticBox[];
   panels: PanelDef[];
   buildings: BuildingDef[];
-  // Spawn zone centers per team (players fan out around them).
   spawns: [[number, number, number], [number, number, number]];
 }
 
 // ---------------------------------------------------------------------------
-// Authoring helpers.
+// Deterministic noise terrain.
+
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function hash2(ix: number, iz: number): number {
+  let h = (ix * 374761393 + iz * 668265263 + MAP_SEED * 69069) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return (((h ^ (h >>> 16)) >>> 0) % 10000) / 10000;
+}
+
+function smooth(t: number): number {
+  return t * t * (3 - 2 * t);
+}
+
+function valueNoise(x: number, z: number, cell: number): number {
+  const gx = Math.floor(x / cell);
+  const gz = Math.floor(z / cell);
+  const fx = smooth(x / cell - gx);
+  const fz = smooth(z / cell - gz);
+  const a = hash2(gx, gz);
+  const b = hash2(gx + 1, gz);
+  const c = hash2(gx, gz + 1);
+  const d = hash2(gx + 1, gz + 1);
+  return a + (b - a) * fx + (c - a) * fz + (a - b - c + d) * fx * fz;
+}
+
+const SIZE = 56;
+const TERRAIN_AMPLITUDE = 1.1;
+
+// Footprints that must stay flat: building pads and spawn zones.
+const FLAT_PADS: Array<[number, number, number, number]> = [
+  // [cx, cz, halfW, halfD]
+  [0, 0, 7.5, 6.5],
+  [-15, -12, 6.5, 6.5],
+  [15, 12, 6.5, 6.5],
+  [16, -14, 6.5, 5.5],
+  [-16, 14, 6.5, 5.5],
+  [0, -23, 8, 5], // team 0 spawn
+  [0, 23, 8, 5], // team 1 spawn
+];
+
+export function heightAt(x: number, z: number): number {
+  const raw = valueNoise(x + 1000, z + 1000, 13) * 0.7 + valueNoise(x + 2000, z + 2000, 5.5) * 0.3;
+  let h = raw * TERRAIN_AMPLITUDE;
+  // Fade to zero inside flat pads (with a 2.5m blend skirt).
+  for (const [cx, cz, hw, hd] of FLAT_PADS) {
+    const dx = Math.max(0, Math.abs(x - cx) - hw);
+    const dz = Math.max(0, Math.abs(z - cz) - hd);
+    const dist = Math.hypot(dx, dz);
+    if (dist < 2.5) h *= smooth(dist / 2.5);
+  }
+  // Settle to zero at the perimeter so the boundary walls seat cleanly.
+  const edge = SIZE / 2 - Math.max(Math.abs(x), Math.abs(z));
+  if (edge < 3) h *= smooth(Math.max(0, edge) / 3);
+  return h;
+}
+
+// Triangle grid for the physics mesh. The client renders its own geometry
+// from the same heightAt, so collision matches visuals exactly.
+export const TERRAIN_CELL = 2;
+
+export function terrainMesh(): { vertices: number[]; indices: number[] } {
+  const half = SIZE / 2;
+  const n = Math.floor(SIZE / TERRAIN_CELL);
+  const vertices: number[] = [];
+  const indices: number[] = [];
+  for (let iz = 0; iz <= n; iz++) {
+    for (let ix = 0; ix <= n; ix++) {
+      const x = -half + ix * TERRAIN_CELL;
+      const z = -half + iz * TERRAIN_CELL;
+      vertices.push(x, heightAt(x, z), z);
+    }
+  }
+  const stride = n + 1;
+  for (let iz = 0; iz < n; iz++) {
+    for (let ix = 0; ix < n; ix++) {
+      const a = iz * stride + ix;
+      const b = a + 1;
+      const c = a + stride;
+      const d = c + 1;
+      indices.push(a, c, b, b, c, d);
+    }
+  }
+  return { vertices, indices };
+}
+
+// ---------------------------------------------------------------------------
+// Structure generation.
 
 let nextPanelId = 1;
-let currentBuildingId: number | undefined;
+let nextBuildingId = 0;
 
-function wallX(
-  panels: PanelDef[],
-  x0: number,
-  x1: number,
-  y: number,
-  z: number,
-  skip: Set<number> = new Set(),
-): void {
-  let i = 0;
-  for (let x = x0 + PANEL_W / 2; x <= x1 - PANEL_W / 2 + 0.01; x += PANEL_W, i++) {
-    if (skip.has(i)) continue;
-    panels.push({ id: nextPanelId++, x, y, z, orient: "x", buildingId: currentBuildingId });
-  }
+interface Gen {
+  statics: StaticBox[];
+  panels: PanelDef[];
+  buildings: BuildingDef[];
 }
 
-function wallZ(
-  panels: PanelDef[],
-  z0: number,
-  z1: number,
-  y: number,
-  x: number,
-  skip: Set<number> = new Set(),
+function wallRun(
+  g: Gen,
+  orient: "x" | "z",
+  a0: number,
+  a1: number,
+  fixed: number,
+  buildingId: number | undefined,
+  gaps: (col: number, row: number) => boolean = () => false,
 ): void {
-  let i = 0;
-  for (let z = z0 + PANEL_W / 2; z <= z1 - PANEL_W / 2 + 0.01; z += PANEL_W, i++) {
-    if (skip.has(i)) continue;
-    panels.push({ id: nextPanelId++, x, y, z, orient: "z", buildingId: currentBuildingId });
-  }
-}
-
-function roof(panels: PanelDef[], x0: number, x1: number, z0: number, z1: number, y: number): void {
-  for (let x = x0 + PANEL_W / 2; x <= x1 - PANEL_W / 2 + 0.01; x += PANEL_W) {
-    for (let z = z0 + PANEL_W / 2; z <= z1 - PANEL_W / 2 + 0.01; z += PANEL_W) {
-      panels.push({ id: nextPanelId++, x, y, z, orient: "flat", buildingId: currentBuildingId });
+  const cols = Math.round((a1 - a0) / PANEL_W);
+  for (let col = 0; col < cols; col++) {
+    for (let row = 0; row < WALL_ROWS; row++) {
+      if (gaps(col, row)) continue;
+      const along = a0 + (col + 0.5) * PANEL_W;
+      const y = (row + 0.5) * PANEL_H;
+      g.panels.push({
+        id: nextPanelId++,
+        x: orient === "x" ? along : fixed,
+        y,
+        z: orient === "x" ? fixed : along,
+        orient,
+        buildingId,
+      });
     }
   }
 }
 
-// A simple rectangular building: two panel rows per wall, a door gap in the
-// front, a window gap (top row only) on a side, and a flat destructible roof.
-let nextBuildingId = 0;
-
 function building(
-  statics: StaticBox[],
-  panels: PanelDef[],
-  buildings: BuildingDef[],
+  g: Gen,
   cx: number,
   cz: number,
   w: number,
   d: number,
-  doorSide: 0 | 1 | 2 | 3, // 0 +z, 1 -z, 2 +x, 3 -x
+  doorSide: 0 | 1 | 2 | 3,
 ): void {
+  const id = nextBuildingId++;
   const firstPanel = nextPanelId;
-  currentBuildingId = nextBuildingId++;
   const x0 = cx - w / 2;
   const x1 = cx + w / 2;
   const z0 = cz - d / 2;
   const z1 = cz + d / 2;
-  const rows = [PANEL_H / 2, PANEL_H * 1.5];
-  const doorPanel = Math.floor(w / PANEL_W / 2);
-  for (const [row, y] of rows.entries()) {
-    const doorSkip = (side: number) =>
-      doorSide === side && row === 0 ? new Set([doorPanel]) : new Set<number>();
-    const windowSkip = (side: number) =>
-      doorSide !== side && row === 1 ? new Set([0]) : new Set<number>();
-    wallX(panels, x0, x1, y, z1, new Set([...doorSkip(0), ...windowSkip(0)]));
-    wallX(panels, x0, x1, y, z0, new Set([...doorSkip(1), ...windowSkip(1)]));
-    wallZ(panels, z0, z1, y, x1, new Set([...doorSkip(2), ...windowSkip(2)]));
-    wallZ(panels, z0, z1, y, x0, new Set([...doorSkip(3), ...windowSkip(3)]));
+
+  // Door: a 1-col x 3-row opening centered on its wall. Windows: a 2-col x
+  // 1-row opening (row 2) centered on every other wall.
+  const doorGap = (cols: number) => {
+    const c = Math.floor(cols / 2);
+    return (col: number, row: number) => col === c && row < 3;
+  };
+  const windowGap = (cols: number) => {
+    const c = Math.floor(cols / 2);
+    return (col: number, row: number) => (col === c || col === c - 1) && row === 2;
+  };
+  const pick = (side: number, cols: number) =>
+    doorSide === side ? doorGap(cols) : windowGap(cols);
+
+  wallRun(g, "x", x0, x1, z1, id, pick(0, Math.round(w)));
+  wallRun(g, "x", x0, x1, z0, id, pick(1, Math.round(w)));
+  wallRun(g, "z", z0, z1, x1, id, pick(2, Math.round(d)));
+  wallRun(g, "z", z0, z1, x0, id, pick(3, Math.round(d)));
+
+  const roofY = WALL_ROWS * PANEL_H + PANEL_T / 2;
+  const roofIds: number[] = [];
+  for (let x = x0 + PANEL_W / 2; x <= x1 - PANEL_W / 2 + 0.01; x += PANEL_W) {
+    for (let z = z0 + PANEL_W / 2; z <= z1 - PANEL_W / 2 + 0.01; z += PANEL_W) {
+      roofIds.push(nextPanelId);
+      g.panels.push({ id: nextPanelId++, x, y: roofY, z, orient: "flat", buildingId: id });
+    }
   }
-  roof(panels, x0, x1, z0, z1, PANEL_H * 2 + PANEL_T / 2);
-  // Corner posts (indestructible) so a building keeps its silhouette.
+
+  // Indestructible corner posts keep the silhouette until collapse.
   for (const [px, pz] of [
     [x0, z0],
     [x1, z0],
     [x0, z1],
     [x1, z1],
   ]) {
-    statics.push({ x: px, y: PANEL_H, z: pz, w: 0.3, h: PANEL_H * 2, d: 0.3, kind: "wall" });
+    g.statics.push({
+      x: px,
+      y: (WALL_ROWS * PANEL_H) / 2,
+      z: pz,
+      w: 0.3,
+      h: WALL_ROWS * PANEL_H,
+      d: 0.3,
+      kind: "wall",
+    });
   }
-  const mine = panels.filter((p) => p.id >= firstPanel);
-  buildings.push({
-    id: currentBuildingId!,
+
+  const mine = g.panels.filter((p) => p.id >= firstPanel);
+  g.buildings.push({
+    id,
+    kind: "building",
     cx,
     cz,
     w,
     d,
     wallPanelIds: mine.filter((p) => p.orient !== "flat").map((p) => p.id),
-    roofPanelIds: mine.filter((p) => p.orient === "flat").map((p) => p.id),
+    roofPanelIds: roofIds,
+    collapseFraction: 0.4,
   });
-  currentBuildingId = undefined;
 }
 
-function crate(statics: StaticBox[], x: number, z: number, s = 1.4): void {
-  statics.push({ x, y: s / 2, z, w: s, h: s, d: s, kind: "crate" });
+function tree(g: Gen, x: number, z: number): void {
+  const id = nextBuildingId++;
+  const base = heightAt(x, z);
+  const trunkIds: number[] = [];
+  for (let seg = 0; seg < 2; seg++) {
+    trunkIds.push(nextPanelId);
+    g.panels.push({
+      id: nextPanelId++,
+      x,
+      y: base + 0.5 + seg,
+      z,
+      orient: "trunk",
+      buildingId: id,
+    });
+  }
+  const canopyIds = [nextPanelId];
+  g.panels.push({ id: nextPanelId++, x, y: base + 2.8, z, orient: "canopy", buildingId: id });
+  g.buildings.push({
+    id,
+    kind: "tree",
+    cx: x,
+    cz: z,
+    w: 0.9,
+    d: 0.9,
+    wallPanelIds: trunkIds,
+    roofPanelIds: canopyIds,
+    collapseFraction: 0.5, // one trunk segment fells it
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -165,47 +322,92 @@ function crate(statics: StaticBox[], x: number, z: number, s = 1.4): void {
 function buildMap(): MapDef {
   nextPanelId = 1;
   nextBuildingId = 0;
-  const size = 56;
-  const statics: StaticBox[] = [];
-  const panels: PanelDef[] = [];
-  const buildings: BuildingDef[] = [];
+  const rng = mulberry32(MAP_SEED);
+  const g: Gen = { statics: [], panels: [], buildings: [] };
+  const half = SIZE / 2;
 
-  // Ground and perimeter (indestructible).
-  statics.push({ x: 0, y: -0.5, z: 0, w: size, h: 1, d: size, kind: "ground" });
-  const half = size / 2;
-  statics.push({ x: 0, y: 1.5, z: -half, w: size, h: 3, d: 1, kind: "wall" });
-  statics.push({ x: 0, y: 1.5, z: half, w: size, h: 3, d: 1, kind: "wall" });
-  statics.push({ x: -half, y: 1.5, z: 0, w: 1, h: 3, d: size, kind: "wall" });
-  statics.push({ x: half, y: 1.5, z: 0, w: 1, h: 3, d: size, kind: "wall" });
+  // Perimeter walls (terrain fades to 0 at the edge so these seat flush).
+  g.statics.push({ x: 0, y: 1.5, z: -half, w: SIZE, h: 3, d: 1, kind: "wall" });
+  g.statics.push({ x: 0, y: 1.5, z: half, w: SIZE, h: 3, d: 1, kind: "wall" });
+  g.statics.push({ x: -half, y: 1.5, z: 0, w: 1, h: 3, d: SIZE, kind: "wall" });
+  g.statics.push({ x: half, y: 1.5, z: 0, w: 1, h: 3, d: SIZE, kind: "wall" });
 
-  // Buildings: a contested center block and four flanking houses.
-  building(statics, panels, buildings, 0, 0, 10, 8, 0);
-  building(statics, panels, buildings, -15, -12, 8, 8, 2);
-  building(statics, panels, buildings, 15, 12, 8, 8, 3);
-  building(statics, panels, buildings, 16, -14, 8, 6, 0);
-  building(statics, panels, buildings, -16, 14, 8, 6, 1);
+  // Buildings on their flat pads (positions match FLAT_PADS).
+  building(g, 0, 0, 10, 8, 0);
+  building(g, -15, -12, 8, 8, 2);
+  building(g, 15, 12, 8, 8, 3);
+  building(g, 16, -14, 8, 6, 0);
+  building(g, -16, 14, 8, 6, 1);
 
-  // Freestanding cover walls (destructible) along the midline flanks.
-  wallX(panels, -10, -2, PANEL_H / 2, 10);
-  wallX(panels, 2, 10, PANEL_H / 2, -10);
-  wallZ(panels, -6, 2, PANEL_H / 2, -22);
-  wallZ(panels, -2, 6, PANEL_H / 2, 22);
+  // Procedural placement for everything else, rejected against keep-outs.
+  const placed: Array<[number, number, number]> = []; // x, z, radius
+  const clearOf = (x: number, z: number, r: number): boolean => {
+    if (Math.abs(x) > half - 3 || Math.abs(z) > half - 3) return false;
+    for (const [cx, cz, hw, hd] of FLAT_PADS) {
+      if (Math.abs(x - cx) < hw + r && Math.abs(z - cz) < hd + r) return false;
+    }
+    if (x > 20.5) return false; // keep the east duel lane open
+    for (const [px, pz, pr] of placed) {
+      if (Math.hypot(x - px, z - pz) < r + pr) return false;
+    }
+    return true;
+  };
 
-  // Crates for hard cover.
-  crate(statics, -8, 4);
-  crate(statics, 8, -4);
-  crate(statics, -20, 2);
-  crate(statics, 20, -2);
-  crate(statics, 4, 18);
-  crate(statics, -4, -18);
-  crate(statics, 11, 6, 1.0);
-  crate(statics, -11, -6, 1.0);
+  // Freestanding cover walls (2 cols x 2 rows of panels).
+  for (let i = 0; i < 8; i++) {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 6);
+      const z = (rng() * 2 - 1) * (half - 6);
+      if (!clearOf(x, z, 2.2)) continue;
+      const along: "x" | "z" = rng() < 0.5 ? "x" : "z";
+      const base = heightAt(x, z);
+      for (let col = 0; col < 2; col++) {
+        for (let row = 0; row < 2; row++) {
+          const a = (col - 0.5) * PANEL_W;
+          g.panels.push({
+            id: nextPanelId++,
+            x: along === "x" ? x + a : x,
+            y: base + (row + 0.5) * PANEL_H,
+            z: along === "x" ? z : z + a,
+            orient: along,
+          });
+        }
+      }
+      placed.push([x, z, 2.2]);
+      break;
+    }
+  }
+
+  // Trees.
+  for (let i = 0; i < 14; i++) {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 5);
+      const z = (rng() * 2 - 1) * (half - 5);
+      if (!clearOf(x, z, 2.4)) continue;
+      tree(g, x, z);
+      placed.push([x, z, 2.4]);
+      break;
+    }
+  }
+
+  // Crates.
+  for (let i = 0; i < 10; i++) {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 5);
+      const z = (rng() * 2 - 1) * (half - 5);
+      if (!clearOf(x, z, 1.6)) continue;
+      const s = 1.0 + rng() * 0.7;
+      g.statics.push({ x, y: heightAt(x, z) + s / 2, z, w: s, h: s, d: s, kind: "crate" });
+      placed.push([x, z, 1.6]);
+      break;
+    }
+  }
 
   return {
-    size,
-    statics,
-    panels,
-    buildings,
+    size: SIZE,
+    statics: g.statics,
+    panels: g.panels,
+    buildings: g.buildings,
     spawns: [
       [0, 0.1, -23],
       [0, 0.1, 23],
@@ -221,5 +423,7 @@ export const BUILT_PANEL_ID_BASE = 10000;
 export function spawnPoint(team: number, idx: number): [number, number, number] {
   const c = MAP.spawns[team === 0 ? 0 : 1];
   const angle = (idx / 8) * Math.PI * 2;
-  return [c[0] + Math.sin(angle) * 3.5, c[1], c[2] + Math.cos(angle) * 2.5];
+  const x = c[0] + Math.sin(angle) * 3.5;
+  const z = c[2] + Math.cos(angle) * 2.5;
+  return [x, heightAt(x, z) + 0.1, z];
 }

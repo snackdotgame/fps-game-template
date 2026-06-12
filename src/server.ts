@@ -36,7 +36,6 @@ import {
 } from "./shared/constants.js";
 import { BUILT_PANEL_ID_BASE, MAP, type PanelDef, spawnPoint } from "./shared/map.js";
 import {
-  COLLAPSE_WALL_FRACTION,
   EXPLOSION_PANEL_OUTER_DAMAGE,
   EXPLOSION_PANEL_OUTER_RADIUS,
   RUBBLE_HEIGHT,
@@ -905,7 +904,7 @@ function destroyPanel(panelId: number): void {
   if (buildingId !== undefined && !collapsedBuildings.has(buildingId)) {
     const b = MAP.buildings[buildingId];
     const gone = b.wallPanelIds.filter((id) => destroyedPanels.has(id)).length;
-    if (gone >= Math.ceil(b.wallPanelIds.length * COLLAPSE_WALL_FRACTION)) {
+    if (gone >= Math.ceil(b.wallPanelIds.length * b.collapseFraction)) {
       collapseBuilding(buildingId);
     }
   }
