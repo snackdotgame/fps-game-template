@@ -37,7 +37,7 @@ import {
 import {
   addCrater,
   BUILT_PANEL_ID_BASE,
-  buildSupportIndex,
+  buildContactIndex,
   type Crater,
   craterList,
   heightAt,
@@ -982,79 +982,75 @@ function damagePlayer(
 
 const panelById = new Map(MAP.panels.map((p) => [p.id, p]));
 
-// Static structural support graph (who rests on whom) — computed once; the
+// Static structural contact graph (who touches whom) — computed once; the
 // map regenerates identically every round.
-const SUPPORT = buildSupportIndex();
+const CONTACTS = buildContactIndex();
 
-// A destroyed piece RELEASES whatever was resting on it (unless something
-// else still holds it up): the intact piece becomes a dynamic body, tumbles,
-// and settles back into the world wherever it lands. Recursion is bounded by
-// destroyedPanels idempotency and wall height.
+// Masonry is bonded: a piece stands while its connected region (through
+// touching alive pieces) still reaches the ground. When a piece dies, flood
+// from each alive neighbor — regions that no longer reach ground are
+// released whole, as one island, and fall as one rigid chunk. Breaking a
+// window drops nothing; carving a seam drops the slab you cut loose.
+const _floodSeen = new Set<number>();
+
 function cascadeUnsupported(panelId: number): void {
-  for (const aboveId of SUPPORT.above.get(panelId) ?? []) {
-    if (destroyedPanels.has(aboveId) || isSupported(aboveId)) continue;
-    queueRelease(aboveId);
-  }
-  // A dying plank can strand the rest of its sheet: re-check neighbors.
-  for (const adjId of SUPPORT.plankAdj.get(panelId) ?? []) {
-    if (destroyedPanels.has(adjId) || isSupported(adjId)) continue;
-    queueRelease(adjId);
+  const neighbors = CONTACTS.adj.get(panelId);
+  if (!neighbors) return;
+  const safe = new Set<number>(); // verified ground-connected, this event
+  for (const n of neighbors) {
+    if (destroyedPanels.has(n) || safe.has(n)) continue;
+    const island = floodToGround(n, safe);
+    if (island) queueRelease(island);
   }
 }
 
-// Releases are budgeted per tick: a grenade that unsupports a hundred pieces
-// crumbles them over a few ticks instead of spiking one (and it reads better
-// — structures progressively shear away rather than popping at once).
-const releaseQueue: number[] = [];
-const RELEASES_PER_TICK = 40;
+// BFS through alive contacts. Reaching a grounded (or known-safe) piece
+// marks everything visited as safe and returns null; exhausting the region
+// returns the disconnected island.
+function floodToGround(start: number, safe: Set<number>): number[] | null {
+  _floodSeen.clear();
+  _floodSeen.add(start);
+  const stack = [start];
+  let i = 0;
+  while (i < stack.length) {
+    const id = stack[i++];
+    if (CONTACTS.grounded.has(id) || safe.has(id)) {
+      for (const v of _floodSeen) safe.add(v);
+      return null;
+    }
+    for (const next of CONTACTS.adj.get(id) ?? []) {
+      if (_floodSeen.has(next) || destroyedPanels.has(next)) continue;
+      _floodSeen.add(next);
+      stack.push(next);
+    }
+  }
+  return stack;
+}
 
-function queueRelease(id: number): void {
-  releaseQueue.push(id);
+// Releases are budgeted per tick, but an island is atomic — it falls as one
+// chunk however big it is.
+const releaseQueue: number[][] = [];
+const RELEASE_PIECES_PER_TICK = 80;
+
+function queueRelease(island: number[]): void {
+  releaseQueue.push(island);
 }
 
 function drainReleases(): void {
   let n = 0;
-  while (releaseQueue.length > 0 && n < RELEASES_PER_TICK) {
-    const id = releaseQueue.shift()!;
-    if (destroyedPanels.has(id)) continue;
-    releasePiece(id);
-    n++;
-  }
-}
-
-function isSupported(id: number): boolean {
-  if (SUPPORT.grounded.has(id)) return true;
-  const belows = SUPPORT.below.get(id);
-  if (belows && belows.some((b) => !destroyedPanels.has(b))) return true;
-  // Planks hang off their sheet as long as it still reaches an anchor.
-  if (SUPPORT.plankAdj.has(id)) return plankSheetAnchored(id);
-  return false;
-}
-
-// BFS across the alive plank sheet looking for any plank that still has a
-// live direct support. Bounded by one roof (~100 planks).
-const _sheetSeen = new Set<number>();
-
-function plankSheetAnchored(startId: number): boolean {
-  _sheetSeen.clear();
-  _sheetSeen.add(startId);
-  const queue = [startId];
-  while (queue.length > 0) {
-    const id = queue.pop()!;
-    const belows = SUPPORT.below.get(id);
-    if (belows && belows.some((b) => !destroyedPanels.has(b))) return true;
-    for (const n of SUPPORT.plankAdj.get(id) ?? []) {
-      if (_sheetSeen.has(n) || destroyedPanels.has(n)) continue;
-      _sheetSeen.add(n);
-      queue.push(n);
+  while (releaseQueue.length > 0 && n < RELEASE_PIECES_PER_TICK) {
+    const island = releaseQueue.shift()!;
+    for (const id of island) {
+      if (destroyedPanels.has(id)) continue;
+      releasePiece(id);
+      n++;
     }
   }
-  return false;
 }
 
-// Settled pieces aren't in the static support graph — when something is
+// Settled pieces aren't in the static contact graph — when something is
 // destroyed near them, probe whether their perch is gone and re-release the
-// ones left hanging.
+// ones left hanging (each as its own one-piece island).
 function recheckSettledNear(x: number, y: number, z: number): void {
   // Snapshot: releasing mutates builtPanels mid-iteration.
   const candidates = [...builtPanels];
@@ -1063,7 +1059,7 @@ function recheckSettledNear(x: number, y: number, z: number): void {
     const halfH = (def.rot ? Math.max(def.ex, def.ey, def.ez) : def.ey) / 2;
     if (def.y - halfH < heightAt(def.x, def.z) + 0.2) continue; // on the ground
     const hit = gw.world.castRay([def.x, def.y - halfH - 0.03, def.z], [0, -0.35, 0]);
-    if (!hit) queueRelease(id);
+    if (!hit) queueRelease([id]);
   }
 }
 
@@ -1097,8 +1093,8 @@ function releasePiece(panelId: number): void {
     rot: src.rot,
     seed: src.seed ?? src.id,
   });
-  // The piece left its slot — whatever rested on IT falls next.
-  if (panelId < BUILT_PANEL_ID_BASE) cascadeUnsupported(panelId);
+  // No re-cascade: islands are computed in full before release, and pieces
+  // at the boundary are ground-connected by construction.
 }
 
 // Group this tick's released pieces into connected clusters (touching
@@ -1285,20 +1281,26 @@ const RUBBLE_CAP = 1200; // mirrors the client's instanced rubble pool
 function maybeLeaveRubble(src: PanelDef): void {
   if (builtPanels.size >= RUBBLE_CAP) return;
   if (rng() >= (RUBBLE_CHANCE[src.material] ?? 0)) return;
+  // The fragment IS a broken chunk of the destroyed piece: same material and
+  // palette, a bite taken out of the original proportions, dropped at the
+  // foot of where it died with a random resting yaw.
   const span = Math.max(src.ex, src.ez);
-  const s = Math.min(0.6, Math.max(0.24, Math.min(src.ex, src.ey, src.ez) * (0.8 + rng() * 0.6)));
-  const x = src.x + (rng() - 0.5) * Math.min(1.2, span);
-  const z = src.z + (rng() - 0.5) * Math.min(1.2, span);
+  const x = src.x + (rng() - 0.5) * Math.min(1.0, span);
+  const z = src.z + (rng() - 0.5) * Math.min(1.0, span);
+  const ey = src.ey * (0.8 + rng() * 0.2);
+  const yaw = rng() * Math.PI;
   const def: PanelDef = {
     id: nextBuiltPanelId++,
     x,
-    y: heightAt(x, z) + s * 0.4,
+    y: heightAt(x, z) + ey * 0.45,
     z,
-    ex: s * (1 + rng() * 0.6),
-    ey: s,
-    ez: s * (1 + rng() * 0.4),
-    material: "rubble",
+    ex: src.ex * (0.4 + rng() * 0.3),
+    ey,
+    ez: src.ez * (0.75 + rng() * 0.25),
+    material: src.material,
+    rot: [0, Math.sin(yaw / 2), 0, Math.cos(yaw / 2)],
     seed: src.seed ?? src.id,
+    broken: true,
   };
   addPanelBody(gw, def);
   builtPanels.set(def.id, def);

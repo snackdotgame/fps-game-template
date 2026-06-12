@@ -52,6 +52,9 @@ export interface PanelDef {
   // Palette seed for runtime pieces: a fallen brick keeps the color it had
   // on the wall (its original id), whatever runtime id it ends up with.
   seed?: number;
+  // A broken-off fragment of a destroyed piece — renders with fractured
+  // geometry (jagged break face) instead of the pristine shape.
+  broken?: boolean;
 }
 
 // Max HP per material. Rifle hits chip 10, sledge swings 50.
@@ -462,27 +465,30 @@ function building(
   }
   endSlab(g, postsFirst);
 
-  // The stairwell hole (multi-story only): a column along the west wall that
-  // every upper floor leaves open, with switchback flights of floating
-  // treads inside it. Step-up assist walks them like real stairs.
+  // The stairwell (multi-story only): a TWO-LANE column along the west wall
+  // — flights alternate lanes side by side instead of stacking, so there's
+  // always full story headroom while climbing (stacked switchbacks wedge
+  // the capsule under the flight above). The final flight exits through a
+  // hole in the roof: every multi-story building has rooftop access.
   const roofIds: number[] = [];
   const stairHole: GapRect | null =
-    stories > 1 ? { lo: x0 + 0.55, hi: x0 + 1.8, y0: z0 + 1.0, y1: z0 + 5.35 } : null;
+    stories > 1 ? { lo: x0 + 0.55, hi: x0 + 2.85, y0: z0 + 1.0, y1: z0 + 5.35 } : null;
   const STAIR_RISE = WALL_HEIGHT / 10;
   const STAIR_RUN = 0.42;
-  for (let flight = 0; flight < stories - 1; flight++) {
+  for (let flight = 0; flight < (stories > 1 ? stories : 0); flight++) {
     const flightFirst = nextPanelId;
     const baseY = flight * WALL_HEIGHT;
-    const up = flight % 2 === 0; // switchback: alternate +z / -z
+    const up = flight % 2 === 0; // alternate direction AND lane per flight
+    const laneX = x0 + (up ? 1.12 : 2.27);
     for (let k = 0; k < 10; k++) {
       const z = up ? z0 + 1.3 + k * STAIR_RUN : z0 + 5.05 - k * STAIR_RUN;
       roofIds.push(nextPanelId);
       g.panels.push({
         id: nextPanelId++,
-        x: x0 + 1.17,
+        x: laneX,
         y: baseY + (k + 1) * STAIR_RISE - 0.06,
         z,
-        ex: 1.15,
+        ex: 1.05,
         ey: 0.12,
         ez: 0.5,
         material: "plank",
@@ -499,10 +505,10 @@ function building(
   for (let level = 1; level <= stories; level++) {
     const levelFirst = nextPanelId;
     const y = level * WALL_HEIGHT + PLANK.h / 2;
-    const isRoof = level === stories;
     for (let s = 0; s < strips; s++) {
       const z = z0 + (s + 0.5) * PLANK.w;
-      const inHoleZ = !isRoof && stairHole !== null && z > stairHole.y0 && z < stairHole.y1;
+      // The roof keeps the stairwell open too — that's the rooftop exit.
+      const inHoleZ = stairHole !== null && z > stairHole.y0 && z < stairHole.y1;
       const segs: Array<[number, number]> = [];
       if (s % 2 === 0) {
         for (let i = 0; i < npl; i++) segs.push([x0 + (i + 0.5) * PLANK.l, PLANK.l]);
@@ -814,6 +820,82 @@ export function slabOfPiece(pieceId: number): number {
     else return mid;
   }
   return -1;
+}
+
+// ---------------------------------------------------------------------------
+// Structural contact graph: masonry is BONDED — support flows through the
+// wall fabric in every direction, not just straight down. A piece stands as
+// long as its connected region (through touching alive pieces) still reaches
+// the ground; carve a region loose and the whole island falls as one chunk.
+// Pure map data, computed once over the static piece list.
+
+export interface ContactIndex {
+  adj: Map<number, number[]>; // id -> ids in face contact (undirected)
+  grounded: Set<number>; // pieces standing on the terrain itself
+}
+
+export function buildContactIndex(): ContactIndex {
+  const adj = new Map<number, number[]>();
+  const grounded = new Set<number>();
+
+  // Spatial hash over xz so each piece only tests its neighborhood.
+  const CELL = 2;
+  const grid = new Map<number, PanelDef[]>();
+  const key = (cx: number, cz: number) => (cx + 128) * 4096 + (cz + 128);
+  const cellRange = (p: PanelDef): [number, number, number, number] => [
+    Math.floor((p.x - p.ex / 2) / CELL),
+    Math.floor((p.x + p.ex / 2) / CELL),
+    Math.floor((p.z - p.ez / 2) / CELL),
+    Math.floor((p.z + p.ez / 2) / CELL),
+  ];
+
+  for (const p of MAP.panels) {
+    if (p.y - p.ey / 2 <= baseHeightAt(p.x, p.z) + 0.15) grounded.add(p.id);
+    const [x0, x1, z0, z1] = cellRange(p);
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cz = z0; cz <= z1; cz++) {
+        const k = key(cx, cz);
+        const list = grid.get(k);
+        if (list) list.push(p);
+        else grid.set(k, [p]);
+      }
+    }
+  }
+
+  // Two pieces are in contact when their boxes touch (or overlap) along some
+  // axis with real overlap in the other two — mortar, in effect.
+  const GAP = 0.02;
+  const MIN_OVERLAP = 0.02;
+  for (const p of MAP.panels) {
+    const seen = new Set<number>();
+    const [x0, x1, z0, z1] = cellRange(p);
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cz = z0; cz <= z1; cz++) {
+        for (const q of grid.get(key(cx, cz)) ?? []) {
+          if (q.id <= p.id || seen.has(q.id)) continue;
+          seen.add(q.id);
+          const gx = Math.abs(p.x - q.x) - (p.ex + q.ex) / 2;
+          const gy = Math.abs(p.y - q.y) - (p.ey + q.ey) / 2;
+          const gz = Math.abs(p.z - q.z) - (p.ez + q.ez) / 2;
+          if (gx > GAP || gy > GAP || gz > GAP) continue;
+          // Touching along one axis needs overlap in the others.
+          const overlaps =
+            (gx <= GAP && gy < -MIN_OVERLAP && gz < -MIN_OVERLAP) ||
+            (gy <= GAP && gx < -MIN_OVERLAP && gz < -MIN_OVERLAP) ||
+            (gz <= GAP && gx < -MIN_OVERLAP && gy < -MIN_OVERLAP);
+          if (!overlaps) continue;
+          let a = adj.get(p.id);
+          if (!a) adj.set(p.id, (a = []));
+          a.push(q.id);
+          let b = adj.get(q.id);
+          if (!b) adj.set(q.id, (b = []));
+          b.push(p.id);
+        }
+      }
+    }
+  }
+
+  return { adj, grounded };
 }
 
 // ---------------------------------------------------------------------------
