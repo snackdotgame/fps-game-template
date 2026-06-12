@@ -73,4 +73,4 @@ export const TEAM_NAMES = ["Orange", "Blue"];
 // Bots fill the server up to this many participants so there's always
 // something to fight; each joining human replaces one bot (and bots return
 // as humans leave).
-export const BOT_FILL = 6;
+export const BOT_FILL = 8;

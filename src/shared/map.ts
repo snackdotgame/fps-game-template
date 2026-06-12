@@ -28,6 +28,9 @@ export type PanelMaterial =
   | "canopy" // foliage clump
   | "crate" // supply crate
   | "sandbag" // freestanding bag cover
+  | "rock" // boulder / stone
+  | "glass" // windowpane — one hit shatters it
+  | "rubble" // chunk left behind by a destroyed piece (spawned at runtime)
   | "metal"; // deployed cover sheet (built at runtime)
 
 export interface PanelDef {
@@ -54,6 +57,9 @@ export const PANEL_HP: Record<PanelMaterial, number> = {
   canopy: 30,
   crate: 90,
   sandbag: 60,
+  rock: 180,
+  glass: 10, // any hit shatters it
+  rubble: 40,
   metal: 120,
 };
 
@@ -120,8 +126,8 @@ function valueNoise(x: number, z: number, cell: number): number {
   return a + (b - a) * fx + (c - a) * fz + (a - b - c + d) * fx * fz;
 }
 
-const SIZE = 56;
-const TERRAIN_AMPLITUDE = 1.1;
+const SIZE = 84;
+const TERRAIN_AMPLITUDE = 1.35;
 
 // Footprints that must stay flat: building pads and spawn zones.
 const FLAT_PADS: Array<[number, number, number, number]> = [
@@ -131,39 +137,96 @@ const FLAT_PADS: Array<[number, number, number, number]> = [
   [15, 12, 6.5, 6.5],
   [16, -14, 6.5, 5.5],
   [-16, 14, 6.5, 5.5],
-  [0, -23, 8, 5], // team 0 spawn
-  [0, 23, 8, 5], // team 1 spawn
+  [32, 4, 6.5, 6.5],
+  [-32, -25, 6.5, 5.5],
+  [-31, 27, 6.5, 5.5],
+  [14, -30, 6.5, 5.5],
+  [0, -35, 8, 5], // team 0 spawn
+  [0, 35, 8, 5], // team 1 spawn
 ];
 
-export function heightAt(x: number, z: number): number {
-  const raw = valueNoise(x + 1000, z + 1000, 13) * 0.7 + valueNoise(x + 2000, z + 2000, 5.5) * 0.3;
-  let h = raw * TERRAIN_AMPLITUDE;
-  // Fade to zero inside flat pads (with a 2.5m blend skirt).
+// How exposed (x,z) is to terrain shaping: 1 in the open field, fading to 0
+// inside flat pads and at the perimeter. Both the noise relief and crater
+// digging are scaled by this, so buildings never get undermined.
+function shapeFade(x: number, z: number): number {
+  let f = 1;
   for (const [cx, cz, hw, hd] of FLAT_PADS) {
     const dx = Math.max(0, Math.abs(x - cx) - hw);
     const dz = Math.max(0, Math.abs(z - cz) - hd);
     const dist = Math.hypot(dx, dz);
-    if (dist < 2.5) h *= smooth(dist / 2.5);
+    if (dist < 2.5) f *= smooth(dist / 2.5);
   }
-  // Settle to zero at the perimeter so the boundary walls seat cleanly.
   const edge = SIZE / 2 - Math.max(Math.abs(x), Math.abs(z));
-  if (edge < 3) h *= smooth(Math.max(0, edge) / 3);
-  return h;
+  if (edge < 3) f *= smooth(Math.max(0, edge) / 3);
+  return f;
 }
 
-// Triangle grid for the physics mesh. The client renders its own geometry
-// from the same heightAt, so collision matches visuals exactly.
-export const TERRAIN_CELL = 1;
+// The pristine pre-battle terrain. Structure generation seats pieces on this,
+// so later craters never move existing geometry.
+export function baseHeightAt(x: number, z: number): number {
+  const raw = valueNoise(x + 1000, z + 1000, 14) * 0.7 + valueNoise(x + 2000, z + 2000, 5.5) * 0.3;
+  return raw * TERRAIN_AMPLITUDE * shapeFade(x, z);
+}
 
-export function terrainMesh(): { vertices: number[]; indices: number[] } {
-  const half = SIZE / 2;
-  const n = Math.floor(SIZE / TERRAIN_CELL);
+// ---------------------------------------------------------------------------
+// Terrain destruction: explosions dig craters. The crater list is shared
+// state that client and server keep in sync over reliable messages (the
+// server is authoritative; clients apply craters as they arrive and receive
+// the full list in the welcome). heightAt = base terrain minus crater bowls.
+
+export interface Crater {
+  x: number;
+  z: number;
+  r: number;
+  d: number;
+}
+
+let craters: Crater[] = [];
+
+export function resetCraters(): void {
+  craters = [];
+}
+
+export function addCrater(c: Crater): void {
+  craters.push(c);
+}
+
+export function craterList(): readonly Crater[] {
+  return craters;
+}
+
+export function heightAt(x: number, z: number): number {
+  let h = baseHeightAt(x, z);
+  let dug = 0;
+  for (const c of craters) {
+    const dist = Math.hypot(x - c.x, z - c.z);
+    if (dist < c.r) dug += c.d * smooth(1 - dist / c.r);
+  }
+  // Craters respect pads/perimeter and can't dig to bedrock no matter how
+  // many grenades stack.
+  return h - Math.min(2.0, dug * shapeFade(x, z));
+}
+
+// Triangle grids for the physics mesh, in chunks so a crater only rebuilds
+// the tiles it touches. The client renders its own geometry from the same
+// heightAt, so collision matches visuals exactly.
+export const TERRAIN_CELL = 1;
+export const TERRAIN_CHUNK = 14; // 6x6 chunks
+export const TERRAIN_CHUNKS = SIZE / TERRAIN_CHUNK;
+
+export function terrainChunkMesh(
+  ci: number,
+  cj: number,
+): { vertices: number[]; indices: number[] } {
+  const x0 = -SIZE / 2 + ci * TERRAIN_CHUNK;
+  const z0 = -SIZE / 2 + cj * TERRAIN_CHUNK;
+  const n = TERRAIN_CHUNK / TERRAIN_CELL;
   const vertices: number[] = [];
   const indices: number[] = [];
   for (let iz = 0; iz <= n; iz++) {
     for (let ix = 0; ix <= n; ix++) {
-      const x = -half + ix * TERRAIN_CELL;
-      const z = -half + iz * TERRAIN_CELL;
+      const x = x0 + ix * TERRAIN_CELL;
+      const z = z0 + iz * TERRAIN_CELL;
       vertices.push(x, heightAt(x, z), z);
     }
   }
@@ -178,6 +241,18 @@ export function terrainMesh(): { vertices: number[]; indices: number[] } {
     }
   }
   return { vertices, indices };
+}
+
+// Chunk indices whose tile intersects the crater's footprint.
+export function chunksTouching(c: Crater): Array<[number, number]> {
+  const half = SIZE / 2;
+  const lo = (v: number) => Math.max(0, Math.floor((v + half) / TERRAIN_CHUNK));
+  const hi = (v: number) => Math.min(TERRAIN_CHUNKS - 1, Math.floor((v + half) / TERRAIN_CHUNK));
+  const out: Array<[number, number]> = [];
+  for (let ci = lo(c.x - c.r); ci <= hi(c.x + c.r); ci++) {
+    for (let cj = lo(c.z - c.r); cj <= hi(c.z + c.r); cj++) out.push([ci, cj]);
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +376,32 @@ function building(
   masonryRun(g, "z", z0, z1, x1, 0, rows, unit, style, id, pick(2, cz));
   masonryRun(g, "z", z0, z1, x0, 0, rows, unit, style, id, pick(3, cz));
 
+  // Windowpanes fill the window openings: one hit shatters them. They fall
+  // with the building but don't count toward its integrity.
+  const glassIds: number[] = [];
+  const walls: Array<[axis: "x" | "z", mid: number, fixed: number]> = [
+    ["x", cx, z1],
+    ["x", cx, z0],
+    ["z", cz, x1],
+    ["z", cz, x0],
+  ];
+  for (let side = 0; side < 4; side++) {
+    if (side === doorSide) continue;
+    const [axis, mid, fixed] = walls[side];
+    glassIds.push(nextPanelId);
+    g.panels.push({
+      id: nextPanelId++,
+      x: axis === "x" ? mid : fixed,
+      y: (1.3 + 2.05) / 2,
+      z: axis === "x" ? fixed : mid,
+      ex: axis === "x" ? 2.1 : 0.06,
+      ey: 2.05 - 1.3,
+      ez: axis === "x" ? 0.06 : 2.1,
+      material: "glass",
+      buildingId: id,
+    });
+  }
+
   // Structural corner posts — destructible like everything else, just tough.
   for (const [px, pz] of [
     [x0, z0],
@@ -362,52 +463,74 @@ function building(
     cz,
     w,
     d,
-    wallPanelIds: mine.filter((p) => p.material !== "plank").map((p) => p.id),
-    roofPanelIds: roofIds,
+    wallPanelIds: mine
+      .filter((p) => p.material !== "plank" && p.material !== "glass")
+      .map((p) => p.id),
+    roofPanelIds: [...roofIds, ...glassIds],
     collapseFraction: 0.35,
   });
 }
 
+// Procedural trees, two species. Oaks: a stout trunk with a clustered cube
+// crown. Pines: a tall thin trunk with stacked, shrinking foliage tiers.
+// Either way the trunk is the structure — break two segments and it falls.
 function tree(g: Gen, x: number, z: number, rng: () => number): void {
   const id = nextBuildingId++;
-  const base = heightAt(x, z);
+  const base = baseHeightAt(x, z);
+  const pine = rng() < 0.4;
   const SEG = 0.8;
+  const segs = pine ? 4 + Math.floor(rng() * 3) : 3 + Math.floor(rng() * 3); // 4-6 / 3-5
+  const girth = pine ? 0.3 + rng() * 0.1 : 0.42 + rng() * 0.14;
   const trunkIds: number[] = [];
-  for (let seg = 0; seg < 4; seg++) {
+  for (let seg = 0; seg < segs; seg++) {
     trunkIds.push(nextPanelId);
     g.panels.push({
       id: nextPanelId++,
       x,
       y: base + (seg + 0.5) * SEG,
       z,
-      ex: 0.45,
+      ex: girth,
       ey: SEG,
-      ez: 0.45,
+      ez: girth,
       material: "trunk",
       buildingId: id,
     });
   }
-  // Canopy: a crown clump on top, smaller clumps ringed around it.
+  const top = base + segs * SEG;
   const canopyIds: number[] = [];
-  const clumps: Array<[number, number, number, number]> = [[0, 3.55, 0, 1.7]];
-  for (let i = 0; i < 3; i++) {
-    const ang = rng() * Math.PI * 2;
-    const r = 0.55 + rng() * 0.4;
-    clumps.push([Math.sin(ang) * r, 2.75 + rng() * 0.5, Math.cos(ang) * r, 1.25 + rng() * 0.5]);
-  }
-  for (const [ox, oy, oz, s] of clumps) {
+  const clump = (cx: number, cy: number, cz: number, ex: number, ey: number, ez: number) => {
     canopyIds.push(nextPanelId);
     g.panels.push({
       id: nextPanelId++,
-      x: x + ox,
-      y: base + oy,
-      z: z + oz,
-      ex: s,
-      ey: s * 0.85,
-      ez: s,
+      x: cx,
+      y: cy,
+      z: cz,
+      ex,
+      ey,
+      ez,
       material: "canopy",
       buildingId: id,
     });
+  };
+  if (pine) {
+    // Stacked shrinking tiers starting partway up the trunk.
+    const tiers = 3 + Math.floor(rng() * 2);
+    for (let t = 0; t < tiers; t++) {
+      const f = 1 - t / tiers;
+      const s = 0.9 + 1.5 * f;
+      clump(x, top - (tiers - 1 - t) * 0.85 - 0.2, z, s, 0.7, s);
+    }
+    clump(x, top + 0.55, z, 0.7, 0.8, 0.7); // tip
+  } else {
+    // A crown cube plus 4-6 satellite cubes packed around it.
+    clump(x, top + 0.55, z, 1.6 + rng() * 0.5, 1.4, 1.6 + rng() * 0.5);
+    const n = 4 + Math.floor(rng() * 3);
+    for (let i = 0; i < n; i++) {
+      const ang = rng() * Math.PI * 2;
+      const r = 0.7 + rng() * 0.5;
+      const s = 0.9 + rng() * 0.7;
+      clump(x + Math.sin(ang) * r, top - 0.3 + rng() * 0.8, z + Math.cos(ang) * r, s, s * 0.85, s);
+    }
   }
   g.buildings.push({
     id,
@@ -418,8 +541,30 @@ function tree(g: Gen, x: number, z: number, rng: () => number): void {
     d: 0.9,
     wallPanelIds: trunkIds,
     roofPanelIds: canopyIds,
-    collapseFraction: 0.5, // two trunk segments fell it
+    // ceil(segs * 1.5/segs) = 2 exactly: two trunk segments fell it.
+    collapseFraction: 1.5 / segs,
   });
+}
+
+// Boulder clusters: 1-3 destructible rocks, partially sunk into the ground.
+function rocks(g: Gen, x: number, z: number, rng: () => number): void {
+  const n = 1 + Math.floor(rng() * 3);
+  for (let i = 0; i < n; i++) {
+    const ox = i === 0 ? 0 : (rng() - 0.5) * 2.4;
+    const oz = i === 0 ? 0 : (rng() - 0.5) * 2.4;
+    const s = i === 0 ? 0.9 + rng() * 0.8 : 0.4 + rng() * 0.5;
+    const ey = s * (0.7 + rng() * 0.3);
+    g.panels.push({
+      id: nextPanelId++,
+      x: x + ox,
+      y: baseHeightAt(x + ox, z + oz) + ey * 0.32,
+      z: z + oz,
+      ex: s,
+      ey,
+      ez: s * (0.8 + rng() * 0.4),
+      material: "rock",
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -437,13 +582,17 @@ function buildMap(): MapDef {
   g.statics.push({ x: -half, y: 1.5, z: 0, w: 1, h: 3, d: SIZE, kind: "wall" });
   g.statics.push({ x: half, y: 1.5, z: 0, w: 1, h: 3, d: SIZE, kind: "wall" });
 
-  // Buildings on their flat pads (positions match FLAT_PADS): three brick,
-  // two log cabins.
+  // Buildings on their flat pads (positions match FLAT_PADS): six brick,
+  // three log cabins.
   building(g, 0, 0, 10, 8, 0, "brick");
   building(g, -15, -12, 8, 8, 2, "brick");
   building(g, 15, 12, 8, 8, 3, "log");
   building(g, 16, -14, 8, 6, 0, "log");
   building(g, -16, 14, 8, 6, 1, "brick");
+  building(g, 32, 4, 8, 8, 3, "brick");
+  building(g, -32, -25, 8, 6, 0, "log");
+  building(g, -31, 27, 8, 6, 1, "brick");
+  building(g, 14, -30, 8, 6, 0, "brick");
 
   // Procedural placement for everything else, rejected against keep-outs.
   const placed: Array<[number, number, number]> = []; // x, z, radius
@@ -452,7 +601,7 @@ function buildMap(): MapDef {
     for (const [cx, cz, hw, hd] of FLAT_PADS) {
       if (Math.abs(x - cx) < hw + r && Math.abs(z - cz) < hd + r) return false;
     }
-    if (x > 20.5) return false; // keep the east duel lane open
+    if (x > 20.5 && x < 27.5) return false; // keep the east duel lane open
     for (const [px, pz, pr] of placed) {
       if (Math.hypot(x - px, z - pz) < r + pr) return false;
     }
@@ -460,13 +609,13 @@ function buildMap(): MapDef {
   };
 
   // Sandbag emplacements (three staggered courses of bags).
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 12; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const x = (rng() * 2 - 1) * (half - 6);
       const z = (rng() * 2 - 1) * (half - 6);
       if (!clearOf(x, z, 2.2)) continue;
       const axis: "x" | "z" = rng() < 0.5 ? "x" : "z";
-      const base = heightAt(x, z);
+      const base = baseHeightAt(x, z);
       const len = 4 * SANDBAG.l;
       const a0 = (axis === "x" ? x : z) - len / 2;
       masonryRun(
@@ -487,7 +636,7 @@ function buildMap(): MapDef {
   }
 
   // Trees.
-  for (let i = 0; i < 14; i++) {
+  for (let i = 0; i < 26; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const x = (rng() * 2 - 1) * (half - 5);
       const z = (rng() * 2 - 1) * (half - 5);
@@ -498,14 +647,26 @@ function buildMap(): MapDef {
     }
   }
 
+  // Boulder clusters.
+  for (let i = 0; i < 12; i++) {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 5);
+      const z = (rng() * 2 - 1) * (half - 5);
+      if (!clearOf(x, z, 2.0)) continue;
+      rocks(g, x, z, rng);
+      placed.push([x, z, 2.0]);
+      break;
+    }
+  }
+
   // Crates, some with a smaller crate stacked on top.
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 16; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const x = (rng() * 2 - 1) * (half - 5);
       const z = (rng() * 2 - 1) * (half - 5);
       if (!clearOf(x, z, 1.6)) continue;
       const s = 0.9 + rng() * 0.5;
-      const base = heightAt(x, z);
+      const base = baseHeightAt(x, z);
       g.panels.push({
         id: nextPanelId++,
         x,
@@ -540,8 +701,8 @@ function buildMap(): MapDef {
     panels: g.panels,
     buildings: g.buildings,
     spawns: [
-      [0, 0.1, -23],
-      [0, 0.1, 23],
+      [0, 0.1, -35],
+      [0, 0.1, 35],
     ],
   };
 }

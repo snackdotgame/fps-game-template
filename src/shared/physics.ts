@@ -26,7 +26,15 @@ import {
   RIFLE_MAG,
   TICK_RATE,
 } from "./constants.js";
-import { type BuildingDef, MAP, type PanelDef, terrainMesh } from "./map.js";
+import {
+  type BuildingDef,
+  type Crater,
+  chunksTouching,
+  MAP,
+  type PanelDef,
+  TERRAIN_CHUNKS,
+  terrainChunkMesh,
+} from "./map.js";
 
 export type { Body } from "jolt-ts";
 
@@ -153,6 +161,7 @@ export interface GameWorld {
   panels: Map<number, Body>; // destructible, by panel id (map + built)
   players: Map<number, Body>; // by player idx
   grenades: Map<number, Body>; // by grenade id
+  terrain: Map<number, Body>; // by chunk key ci * TERRAIN_CHUNKS + cj
 }
 
 export async function createGameWorld(): Promise<GameWorld> {
@@ -162,19 +171,20 @@ export async function createGameWorld(): Promise<GameWorld> {
     gravity: [0, -GRAVITY, 0],
     deterministic: "cross-platform",
   });
-  const gw: GameWorld = { world, panels: new Map(), players: new Map(), grenades: new Map() };
+  const gw: GameWorld = {
+    world,
+    panels: new Map(),
+    players: new Map(),
+    grenades: new Map(),
+    terrain: new Map(),
+  };
 
-  // Terrain: a triangle mesh from the shared heightfield, plus a safety slab
+  // Terrain: chunked triangle meshes from the shared heightfield (chunked so
+  // crater digs only rebuild the touched tiles), plus a safety slab
   // underneath so nothing ever falls out of the world.
-  const terrain = terrainMesh();
-  world.createBody({
-    type: "static",
-    shape: { kind: "mesh", vertices: terrain.vertices, indices: terrain.indices },
-    position: [0, 0, 0],
-    layer: "static",
-    friction: 0.7,
-    userData: { static: true } satisfies BodyTag,
-  });
+  for (let ci = 0; ci < TERRAIN_CHUNKS; ci++) {
+    for (let cj = 0; cj < TERRAIN_CHUNKS; cj++) addTerrainChunkBody(gw, ci, cj);
+  }
   world.createBody({
     type: "static",
     shape: Shape.box({ halfExtents: [MAP.size / 2 + 2, 0.5, MAP.size / 2 + 2] }),
@@ -203,6 +213,32 @@ export function destroyGameWorld(gw: GameWorld): void {
   gw.panels.clear();
   gw.players.clear();
   gw.grenades.clear();
+  gw.terrain.clear();
+}
+
+function addTerrainChunkBody(gw: GameWorld, ci: number, cj: number): void {
+  const mesh = terrainChunkMesh(ci, cj);
+  const body = gw.world.createBody({
+    type: "static",
+    shape: { kind: "mesh", vertices: mesh.vertices, indices: mesh.indices },
+    position: [0, 0, 0],
+    layer: "static",
+    friction: 0.7,
+    userData: { static: true } satisfies BodyTag,
+  });
+  gw.terrain.set(ci * TERRAIN_CHUNKS + cj, body);
+}
+
+// Rebuild the terrain tiles a fresh crater touches. Call AFTER addCrater()
+// so the chunk meshes bake the new heightAt. Deterministic given the same
+// crater list, so server and client mirror stay in lockstep.
+export function applyCraterBodies(gw: GameWorld, c: Crater): void {
+  for (const [ci, cj] of chunksTouching(c)) {
+    const key = ci * TERRAIN_CHUNKS + cj;
+    const old = gw.terrain.get(key);
+    if (old) gw.world.removeBody(old);
+    addTerrainChunkBody(gw, ci, cj);
+  }
 }
 
 export function addPanelBody(gw: GameWorld, p: PanelDef): Body {
