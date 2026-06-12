@@ -33,6 +33,13 @@ export type ServerMsg =
   | { type: "destroy"; panelIds: number[] }
   | { type: "panelhp"; updates: Array<[number, number]> } // [panelId, hp]
   | { type: "collapse"; buildingId: number }
+  // A piece lost its support and is now tumbling (cosmetic on clients; the
+  // server simulates it). fromId is the static piece that was removed.
+  | { type: "fall"; piece: PanelDef; fromId: number }
+  // A fallen piece came to rest: it re-enters the world as a static,
+  // destructible piece at this pose. Carries the full def so even clients
+  // that missed the fall can materialize it.
+  | { type: "settle"; piece: PanelDef }
   | { type: "crater"; crater: Crater }
   | { type: "build"; panel: PanelDef; byIdx: number }
   | { type: "score"; scores: [number, number] }

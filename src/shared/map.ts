@@ -45,6 +45,10 @@ export interface PanelDef {
   // Pieces belonging to a structure share its id; enough structural damage
   // brings the whole thing down (BattleBit-style critical health).
   buildingId?: number;
+  // Resting orientation for pieces that fell and settled (released by the
+  // support cascade and re-frozen where physics left them). Absent = axis
+  // aligned, as generated.
+  rot?: [number, number, number, number];
 }
 
 // Max HP per material. Rifle hits chip 10, sledge swings 50.
@@ -512,7 +516,9 @@ function building(
       .filter((p) => p.material !== "plank" && p.material !== "glass")
       .map((p) => p.id),
     roofPanelIds: [...roofIds, ...glassIds],
-    collapseFraction: 0.35,
+    // Higher than before the release cascade existed: walls now genuinely
+    // shed their unsupported pieces, so integrity loss accrues much faster.
+    collapseFraction: 0.5,
   });
 }
 
@@ -770,12 +776,18 @@ export interface SupportIndex {
   above: Map<number, number[]>; // id -> pieces resting on it
   below: Map<number, number[]>; // id -> pieces it rests on
   grounded: Set<number>; // pieces standing on the terrain itself
+  // Coplanar side-touching plank neighbors (roofs/floors): a plank with no
+  // direct support hangs off the roof sheet as long as the sheet still
+  // reaches an anchored plank somewhere — and the whole sheet drops when the
+  // last anchor goes.
+  plankAdj: Map<number, number[]>;
 }
 
 export function buildSupportIndex(): SupportIndex {
   const above = new Map<number, number[]>();
   const below = new Map<number, number[]>();
   const grounded = new Set<number>();
+  const plankAdj = new Map<number, number[]>();
 
   // Spatial hash over xz so each piece only tests its neighborhood.
   const CELL = 2;
@@ -826,7 +838,32 @@ export function buildSupportIndex(): SupportIndex {
     }
   }
 
-  return { above, below, grounded };
+  // Plank sheets: link coplanar, side-touching planks (same level of one
+  // roof/floor) so support can flow across the sheet from its anchored edge.
+  for (const p of MAP.panels) {
+    if (p.material !== "plank") continue;
+    const seen = new Set<number>();
+    const [x0, x1, z0, z1] = cellRange(p);
+    for (let cx = x0; cx <= x1; cx++) {
+      for (let cz = z0; cz <= z1; cz++) {
+        for (const q of grid.get(key(cx, cz)) ?? []) {
+          if (q.id === p.id || q.material !== "plank" || seen.has(q.id)) continue;
+          seen.add(q.id);
+          if (Math.abs(q.y - p.y) > 0.02) continue;
+          const gapX = Math.abs(p.x - q.x) - (p.ex + q.ex) / 2;
+          const gapZ = Math.abs(p.z - q.z) - (p.ez + q.ez) / 2;
+          const touching =
+            (Math.abs(gapX) < 0.05 && gapZ < -0.1) || (Math.abs(gapZ) < 0.05 && gapX < -0.1);
+          if (!touching) continue;
+          let a = plankAdj.get(p.id);
+          if (!a) plankAdj.set(p.id, (a = []));
+          a.push(q.id);
+        }
+      }
+    }
+  }
+
+  return { above, below, grounded, plankAdj };
 }
 
 // Deployed cover panels get ids above this; map panel ids stay below it.

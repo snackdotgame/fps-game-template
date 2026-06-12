@@ -227,13 +227,48 @@ const panelSlots = new Map<number, PieceSlot>();
 const builtMeshes = new Map<number, THREE.Mesh>();
 const panelDefs = new Map<number, PanelDef>(); // map + built, for tint/debris
 
-// Rubble chunks arrive at runtime in unbounded numbers, so they get their
-// own pre-sized instanced pool with a freelist (matches the server's
-// RUBBLE_CAP) — a thousand persistent chunks cost one draw call, not one
-// mesh each.
-const RUBBLE_POOL_CAP = 1200;
-let rubblePool: THREE.InstancedMesh | null = null;
-const rubbleFree: number[] = [];
+// Runtime pieces (rubble chunks, settled fallen pieces) arrive in unbounded
+// numbers, so they live in pre-sized instanced pools with freelists — a
+// thousand persistent loose pieces cost two draw calls, not one mesh each.
+// Boxes cover everything except logs/trunks, which keep their cylinders.
+class LoosePool {
+  mesh: THREE.InstancedMesh | null = null;
+  private readonly free: number[] = [];
+  constructor(private readonly cap: number) {}
+
+  rebuild(geo: THREE.BufferGeometry, parent: THREE.Group): void {
+    this.mesh = new THREE.InstancedMesh(geo, voxelMat, this.cap);
+    this.mesh.castShadow = true;
+    this.mesh.receiveShadow = true;
+    this.free.length = 0;
+    for (let i = this.cap - 1; i >= 0; i--) {
+      this.mesh.setMatrixAt(i, ZERO_SCALE);
+      this.free.push(i);
+    }
+    this.mesh.instanceMatrix.needsUpdate = true;
+    parent.add(this.mesh);
+  }
+
+  claim(def: PanelDef): PieceSlot | null {
+    if (!this.mesh || this.free.length === 0) return null;
+    const index = this.free.pop()!;
+    pieceColor(def, _col);
+    this.mesh.setMatrixAt(index, pieceMatrix(def));
+    this.mesh.setColorAt(index, _col);
+    this.mesh.instanceMatrix.needsUpdate = true;
+    if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+    return { mesh: this.mesh, index, base: _col.getHex() };
+  }
+
+  release(slot: PieceSlot): boolean {
+    if (slot.mesh !== this.mesh || !this.mesh) return false;
+    this.free.push(slot.index);
+    return true;
+  }
+}
+
+const looseBoxes = new LoosePool(1500);
+const looseCyls = new LoosePool(300);
 
 const _m4 = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
@@ -247,8 +282,26 @@ const ZERO_SCALE = new THREE.Matrix4().makeScale(0, 0, 0);
 
 // Logs lie on their side (cylinder axis along the wall), trunks stand up,
 // canopy cubes and rocks get a per-piece twist so they don't read as tiled.
+const _qDef = new THREE.Quaternion();
+
 function pieceMatrix(def: PanelDef): THREE.Matrix4 {
   _pos.set(def.x, def.y, def.z);
+  if (def.rot) {
+    // A settled piece: physics box was axis-aligned, so the resting rotation
+    // composes onto whatever visual orientation the material uses.
+    _qDef.set(def.rot[0], def.rot[1], def.rot[2], def.rot[3]);
+    if (def.material === "log" && def.ex >= def.ez) {
+      _q.setFromAxisAngle(Z_AXIS, Math.PI / 2).premultiply(_qDef);
+      _scl.set(def.ey, def.ex, def.ez);
+    } else if (def.material === "log") {
+      _q.setFromAxisAngle(X_AXIS, Math.PI / 2).premultiply(_qDef);
+      _scl.set(def.ex, def.ez, def.ey);
+    } else {
+      _q.copy(_qDef);
+      _scl.set(def.ex, def.ey, def.ez);
+    }
+    return _m4.compose(_pos, _q, _scl);
+  }
   if (def.material === "log" && def.ex >= def.ez) {
     _q.setFromAxisAngle(Z_AXIS, Math.PI / 2);
     _scl.set(def.ey, def.ex, def.ez);
@@ -562,6 +615,7 @@ function buildMapVisuals(): void {
   decals.length = 0;
   ragdolls.length = 0;
   corpses.length = 0; // their groups died with the old mapGroup
+  fallingFx.clear(); // ditto
 
   for (let ci = 0; ci < TERRAIN_CHUNKS; ci++) {
     for (let cj = 0; cj < TERRAIN_CHUNKS; cj++) {
@@ -600,30 +654,18 @@ function buildMapVisuals(): void {
     mapGroup.add(mesh);
   }
 
-  rubblePool = new THREE.InstancedMesh(GEO.bevel, voxelMat, RUBBLE_POOL_CAP);
-  rubblePool.castShadow = true;
-  rubblePool.receiveShadow = true;
-  rubbleFree.length = 0;
-  for (let i = RUBBLE_POOL_CAP - 1; i >= 0; i--) {
-    rubblePool.setMatrixAt(i, ZERO_SCALE);
-    rubbleFree.push(i);
-  }
-  rubblePool.instanceMatrix.needsUpdate = true;
-  mapGroup.add(rubblePool);
+  looseBoxes.rebuild(GEO.bevel, mapGroup);
+  looseCyls.rebuild(GEO.cyl, mapGroup);
 }
 
-// Deployed cover arrives as individual meshes; rubble chunks claim slots in
-// the instanced pool (falling back to a mesh only if the pool is full).
+// Runtime pieces (rubble, settled fallen pieces, deployed cover) claim
+// instanced pool slots, falling back to a mesh only if the pool is full.
 function addBuiltPanelVisual(p: PanelDef): void {
   panelDefs.set(p.id, p);
-  if (p.material === "rubble" && rubblePool && rubbleFree.length > 0) {
-    const index = rubbleFree.pop()!;
-    pieceColor(p, _col);
-    rubblePool.setMatrixAt(index, pieceMatrix(p));
-    rubblePool.setColorAt(index, _col);
-    rubblePool.instanceMatrix.needsUpdate = true;
-    if (rubblePool.instanceColor) rubblePool.instanceColor.needsUpdate = true;
-    panelSlots.set(p.id, { mesh: rubblePool, index, base: _col.getHex() });
+  const pool = p.material === "log" || p.material === "trunk" ? looseCyls : looseBoxes;
+  const slot = pool.claim(p);
+  if (slot) {
+    panelSlots.set(p.id, slot);
     return;
   }
   const style = PIECE_STYLE[p.material];
@@ -716,7 +758,7 @@ function removePanelVisual(id: number, withDebris: boolean): void {
     slot.mesh.setMatrixAt(slot.index, ZERO_SCALE);
     slot.mesh.instanceMatrix.needsUpdate = true;
     panelSlots.delete(id);
-    if (slot.mesh === rubblePool) rubbleFree.push(slot.index);
+    if (!looseBoxes.release(slot)) looseCyls.release(slot);
   } else {
     const mesh = builtMeshes.get(id);
     if (!mesh) return;
@@ -1109,6 +1151,7 @@ async function buildWorlds(): Promise<void> {
     removePanelVisual(id, false);
   }
   for (const buildingId of collapsedList) {
+    if (MAP.buildings[buildingId]?.kind === "tree") continue;
     addRubbleVisual(buildingId);
     addRubbleBody(gw, MAP.buildings[buildingId], RUBBLE_HEIGHT);
   }
@@ -1190,8 +1233,12 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
     case "collapse": {
       collapsedCount++;
       collapseFx(msg.buildingId);
-      addRubbleVisual(msg.buildingId);
-      if (gw) addRubbleBody(gw, MAP.buildings[msg.buildingId], RUBBLE_HEIGHT);
+      // Trees topple piece by piece (fall/settle) — no mound; buildings
+      // implode onto one.
+      if (MAP.buildings[msg.buildingId]?.kind !== "tree") {
+        addRubbleVisual(msg.buildingId);
+        if (gw) addRubbleBody(gw, MAP.buildings[msg.buildingId], RUBBLE_HEIGHT);
+      }
       collapsedList.push(msg.buildingId);
       break;
     }
@@ -1205,6 +1252,17 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
         removePanelVisual(id, debrisLeft-- > 0);
       }
       removeDecalsForPanels(new Set(msg.panelIds));
+      break;
+    }
+    case "fall": {
+      startFallFx(msg.piece);
+      break;
+    }
+    case "settle": {
+      endFallFx(msg.piece.id);
+      builtList.push(msg.piece);
+      if (gw) addPanelBody(gw, msg.piece);
+      addBuiltPanelVisual(msg.piece);
       break;
     }
     case "crater": {
@@ -1698,6 +1756,73 @@ function makeSoldier(team: number, name: string): THREE.Group {
 
   scene.add(g);
   return g;
+}
+
+// ---------------------------------------------------------------------------
+// Falling pieces: the server simulates released pieces; clients play a
+// cosmetic tumble (gravity + ground bounce + spin) and snap-ease to the
+// authoritative pose when the settle message lands.
+
+interface FallingFx {
+  mesh: THREE.Mesh;
+  def: PanelDef;
+  vel: THREE.Vector3;
+  spin: THREE.Vector3;
+  bornAt: number;
+}
+
+const fallingFx = new Map<number, FallingFx>();
+
+function startFallFx(piece: PanelDef): void {
+  const style = PIECE_STYLE[piece.material];
+  const mesh = new THREE.Mesh(style.geo, voxelMat);
+  mesh.userData.sharedGeo = true;
+  mesh.userData.sharedMat = true;
+  pieceMatrix(piece).decompose(mesh.position, mesh.quaternion, mesh.scale);
+  mesh.castShadow = true;
+  mapGroup.add(mesh);
+  fallingFx.set(piece.id, {
+    mesh,
+    def: piece,
+    vel: new THREE.Vector3((Math.random() - 0.5) * 0.6, 0, (Math.random() - 0.5) * 0.6),
+    spin: new THREE.Vector3(
+      (Math.random() - 0.5) * 4,
+      (Math.random() - 0.5) * 2,
+      (Math.random() - 0.5) * 4,
+    ),
+    bornAt: performance.now(),
+  });
+}
+
+function endFallFx(id: number): void {
+  const fx = fallingFx.get(id);
+  if (!fx) return;
+  fx.mesh.parent?.remove(fx.mesh);
+  fallingFx.delete(id);
+}
+
+function stepFallingFx(dt: number): void {
+  const now = performance.now();
+  for (const [id, fx] of fallingFx) {
+    if (now - fx.bornAt > 8000) {
+      endFallFx(id); // settle never arrived (lost stream?) — give up quietly
+      continue;
+    }
+    fx.vel.y -= 16 * dt;
+    fx.mesh.position.addScaledVector(fx.vel, dt);
+    const r = Math.min(fx.def.ex, fx.def.ey, fx.def.ez) / 2;
+    const ground = heightAt(fx.mesh.position.x, fx.mesh.position.z) + r;
+    if (fx.mesh.position.y < ground) {
+      fx.mesh.position.y = ground;
+      fx.vel.y *= -0.25;
+      fx.vel.x *= 0.7;
+      fx.vel.z *= 0.7;
+      fx.spin.multiplyScalar(0.7);
+    }
+    fx.mesh.rotation.x += fx.spin.x * dt;
+    fx.mesh.rotation.y += fx.spin.y * dt;
+    fx.mesh.rotation.z += fx.spin.z * dt;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -2205,6 +2330,7 @@ function frame(): void {
   if (meleeSwing > 0) meleeSwing = Math.max(0, meleeSwing - dt * 4);
   stepClouds(dt);
   stepRagdolls(dt);
+  stepFallingFx(dt);
   (grassMat.uniforms.uTime as { value: number }).value = now / 1000;
 
   // Camera at the predicted eye, interpolated between the last two ticks so
@@ -2478,6 +2604,7 @@ declare global {
       roundTicksLeft(): number;
       groundHeightAt(x: number, z: number): number;
       rubbleCount(): number;
+      fallenCount(): number;
       corpseCount(): number;
       perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
@@ -2523,6 +2650,8 @@ window.__fps = {
   roundTicksLeft: () => Math.max(0, phaseEndTick - estServerTick()),
   groundHeightAt: (x: number, z: number) => heightAt(x, z),
   rubbleCount: () => builtList.filter((p) => p.material === "rubble").length,
+  fallenCount: () =>
+    builtList.filter((p) => p.material !== "rubble" && p.material !== "metal").length,
   corpseCount: () => corpses.length,
   perf: () => ({
     fps: perf.fps,
