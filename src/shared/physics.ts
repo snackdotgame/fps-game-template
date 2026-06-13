@@ -159,10 +159,23 @@ export function makeChar(spawn: readonly number[]): CharState {
 // Jolt module bootstrap.
 
 let rawModulePromise: Promise<unknown> | null = null;
+let rawModule: unknown = null;
 
 export function joltModule(): Promise<unknown> {
-  rawModulePromise ??= (initJolt as unknown as () => Promise<unknown>)();
+  rawModulePromise ??= (initJolt as unknown as () => Promise<unknown>)().then((m) => {
+    rawModule = m;
+    return m;
+  });
   return rawModulePromise;
+}
+
+// Free bytes left in the fixed 128MB Jolt WASM heap (the module aborts with
+// OOM when an allocation no longer fits). Diagnostic gauge for leak hunts.
+export function joltFreeMemory(): number {
+  const m = rawModule as {
+    _emscripten_bind_JoltInterface_sGetFreeMemory_0?: () => number;
+  } | null;
+  return m?._emscripten_bind_JoltInterface_sGetFreeMemory_0?.() ?? -1;
 }
 
 // ---------------------------------------------------------------------------

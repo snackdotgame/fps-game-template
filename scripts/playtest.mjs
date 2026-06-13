@@ -43,7 +43,55 @@ async function openClient(label) {
     null,
     { timeout: 40000, polling: 100 },
   );
-  const fps = (fn, ...args) => frame.evaluate(([f, a]) => window.__fps[f](...a), [fn, args]);
+  // The minion dev transport sometimes drops a connection under load (known
+  // platform flake); the host shell then reloads the game iframe. Reattach
+  // and retry instead of crashing a six-minute run on one reconnect.
+  const state = { frame };
+  const reattach = async () => {
+    for (let i = 0; i < 240; i++) {
+      const f = page.frames().find((fr) => fr.url().includes(`:${CLIENT_PORT}`));
+      if (f && f !== state.frame) {
+        try {
+          await f.waitForFunction(
+            () => window.__fps && window.__fps.connectionState() === "connected",
+            null,
+            { timeout: 40000, polling: 100 },
+          );
+          state.frame = f;
+          return;
+        } catch {
+          /* keep looking */
+        }
+      }
+      await page.waitForTimeout(250);
+    }
+    throw new Error(`${label}: client frame never reappeared after reload`);
+  };
+  const fps = async (fn, ...args) => {
+    try {
+      return await state.frame.evaluate(([f, a]) => window.__fps[f](...a), [fn, args]);
+    } catch (e) {
+      const s = String(e);
+      if (!s.includes("context was destroyed") && !s.includes("detached")) throw e;
+      console.log(`[${label}] client frame reloaded — reattaching`);
+      await reattach();
+      return await state.frame.evaluate(([f, a]) => window.__fps[f](...a), [fn, args]);
+    }
+  };
+  // TEMP (OOM hunt): sample the fixed Jolt heap so an abort points at its trigger.
+  setInterval(async () => {
+    try {
+      const free = await fps("joltFree");
+      const d = await fps("destroyedCount");
+      const c = await fps("craterCount");
+      const p = await fps("panelCount");
+      console.log(
+        `[${label} heap] free=${(free / 1048576).toFixed(1)}MB destroyed=${d} craters=${c} panels=${p}`,
+      );
+    } catch {
+      /* page busy or closing */
+    }
+  }, 10000).unref();
   return { page, frame, fps, label };
 }
 
@@ -89,15 +137,18 @@ async function goTo(c, tx, tz, timeoutMs = 25000) {
 }
 
 // Wait until the round is in a calm window: playing, alive, and with enough
-// round time left that the next sequence won't be chopped by a results
-// screen + map rebuild.
+// round time AND tickets left that the next sequence won't be chopped by a
+// results screen + map rebuild (conquest rounds usually end on ticket
+// exhaustion, well before the clock).
 async function awaitCalm(c, needSecs = 45, timeoutMs = 90000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
     const playing = (await c.fps("phase")) === "playing";
     const alive = ((await c.fps("selfStatus")) & 1) === 0;
     const left = (await c.fps("roundTicksLeft")) / 30;
-    if (playing && alive && left > needSecs) return true;
+    const tk = await c.fps("tickets");
+    const ticketsOk = Math.min(tk[0], tk[1]) > 45;
+    if (playing && alive && left > needSecs && ticketsOk) return true;
     await c.page.waitForTimeout(800);
   }
   return false;
@@ -223,16 +274,25 @@ check("built cover appears for B", panelsClose, `B=${panelsB} A=${panelsA1}`);
 
 // Shoot our own panel to death (deployed steel: 120 HP / 10 per rifle hit).
 {
-  const d0 = await a.fps("destroyedCount");
-  const [x, y, z] = await a.fps("playerPosition");
-  const dist = Math.hypot(target1.px - x, target1.pz - z);
-  await a.fps(
-    "look",
-    Math.atan2(target1.px - x, target1.pz - z),
-    Math.atan2(target1.py - (y + 1.45), dist),
-  );
+  let target = target1;
+  let d0 = await a.fps("destroyedCount");
   let destroyed = false;
-  for (let i = 0; i < 16 && !destroyed; i++) {
+  for (let i = 0; i < 20 && !destroyed; i++) {
+    const dn = await a.fps("destroyedCount");
+    if (dn < d0) {
+      // The round reset mid-check (counters re-zeroed, target wiped):
+      // wait out the rebuild, place a fresh target, rebase the delta.
+      await awaitCalm(a, 60);
+      target = await buildTargetPanel();
+      d0 = await a.fps("destroyedCount");
+    }
+    const [x, y, z] = await a.fps("playerPosition");
+    const dist = Math.hypot(target.px - x, target.pz - z);
+    await a.fps(
+      "look",
+      Math.atan2(target.px - x, target.pz - z),
+      Math.atan2(target.py - (y + 1.45), dist),
+    );
     await a.fps("drive", { fire: true }, 10);
     await a.page.waitForTimeout(400);
     destroyed = (await a.fps("destroyedCount")) > d0;
@@ -252,13 +312,17 @@ check("built cover appears for B", panelsClose, `B=${panelsB} A=${panelsA1}`);
   check("destruction propagates to B", synced, "");
 }
 
-// Grenade demolition: build another target and chuck grenades steeply at the
-// ground by its base so the bounce stays inside the blast radius.
+// Grenade demolition: build a target and chuck grenades steeply at the
+// ground by its base so the bounce stays inside the blast radius. Each
+// attempt stages from scratch — a mid-check round reset wipes the target
+// and re-zeroes the counters, so per-attempt baselines are the only safe ones.
 {
-  const target2 = await buildTargetPanel();
-  const d0 = await a.fps("destroyedCount");
   let demolished = false;
-  for (let attempt = 0; attempt < 3 && !demolished; attempt++) {
+  for (let attempt = 0; attempt < 4 && !demolished; attempt++) {
+    await awaitCalm(a, 60);
+    const target2 = await buildTargetPanel();
+    if (!target2.ok) continue;
+    const d0 = await a.fps("destroyedCount");
     const [x, y, z] = await a.fps("playerPosition");
     const dist = Math.hypot(target2.px - x, target2.pz - z);
     await a.fps(
@@ -269,7 +333,9 @@ check("built cover appears for B", panelsClose, `B=${panelsB} A=${panelsA1}`);
     await a.fps("drive", { grenade: true }, 3);
     for (let i = 0; i < 10 && !demolished; i++) {
       await a.page.waitForTimeout(400);
-      demolished = (await a.fps("destroyedCount")) > d0;
+      const dn = await a.fps("destroyedCount");
+      demolished = dn > d0;
+      if (dn < d0) break; // round reset mid-throw: restage
     }
   }
   check("grenade demolishes panels", demolished, `destroyed=${await a.fps("destroyedCount")}`);
@@ -347,6 +413,7 @@ await b.page.screenshot({ path: "/tmp/bp-play-b.png" });
 
 // --- Conquest state reaches clients: five zones, live ticket pools. ---
 {
+  await awaitCalm(a, 10); // during results one pool reads 0 — wait out the flip
   const zs = await a.fps("zones");
   const tk = await a.fps("tickets");
   check("five conquest zones", Array.isArray(zs) && zs.length === 5, JSON.stringify(zs));
