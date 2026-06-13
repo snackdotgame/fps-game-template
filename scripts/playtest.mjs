@@ -114,7 +114,7 @@ for (let i = 0; i < 40 && (await a.fps("phase")) !== "playing"; i++) {
 }
 
 // --- Roster, teams, and bot fill (bots leave one-for-one as humans join). ---
-const BOT_FILL = 8; // mirrors shared/constants.ts
+const BOT_FILL = 12; // mirrors shared/constants.ts
 // The bot swap happens within a tick or two of the welcome — poll briefly
 // instead of asserting against a join race.
 let rosterA = await a.fps("roster");
@@ -171,7 +171,8 @@ check("A's movement syncs to B", moveSynced, `gap=${lastGap.toFixed(2)}`);
 // --- Destruction: build our own targets, then shoot and bomb them — works
 // regardless of how war-torn the map already is, and proves the full
 // build -> destroy -> propagate loop. ---
-await goTo(a, 6, -16);
+await goTo(a, 6, -45, 60000); // long trek in from the spawn edge
+await goTo(a, 6, -16, 30000);
 // Deployed cover lands ~3m ahead, snapped to the half-meter grid (mirrors
 // shared/physics.ts buildPlacement).
 async function buildTargetPanel() {
@@ -281,10 +282,9 @@ console.log("staging a duel on the east lane…");
 let okA = false;
 for (let attempt = 0; attempt < 4 && !okA; attempt++) {
   await awaitCalm(a, 50);
-  // Hug the south edge first: the direct line from spawn runs straight into
-  // the (14,-30) house.
-  await goTo(a, 25, -35.5, 20000);
-  await goTo(a, 24, -22, 12000);
+  // Approach the lane from the south, skirting the village.
+  await goTo(a, 24, -45, 45000);
+  await goTo(a, 24, -22, 15000);
   okA = await goTo(a, 24, -14, 12000);
   // Close enough counts — the duel only needs A in the lane with LoS.
   if (!okA) {
@@ -292,7 +292,7 @@ for (let attempt = 0; attempt < 4 && !okA; attempt++) {
     okA = Math.hypot(x - 24, z + 14) < 6;
   }
 }
-await goTo(b, 24, 30, 25000);
+await goTo(b, 24, 40, 45000);
 const okB = await goTo(b, 24, 14, 20000);
 // Best-effort staging, not an assertion: the 3-story tower overlooks the
 // lane, so bots sometimes deny the approach entirely. The duel below tracks
@@ -344,6 +344,14 @@ check("B respawned", respawned, `hp=${await b.fps("hp")}`);
 
 await a.page.screenshot({ path: "/tmp/bp-play-a.png" });
 await b.page.screenshot({ path: "/tmp/bp-play-b.png" });
+
+// --- Conquest state reaches clients: five zones, live ticket pools. ---
+{
+  const zs = await a.fps("zones");
+  const tk = await a.fps("tickets");
+  check("five conquest zones", Array.isArray(zs) && zs.length === 5, JSON.stringify(zs));
+  check("tickets are live", Array.isArray(tk) && tk[0] > 0 && tk[1] > 0, JSON.stringify(tk));
+}
 
 // --- Leave: B goes, and a bot backfills the slot. ---
 const botsBefore = botCount(await a.fps("roster"));

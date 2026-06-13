@@ -177,10 +177,19 @@ export interface ChunkSnap {
   qw: number;
 }
 
+// Conquest zone state: owner (-1 neutral / 0 / 1) and the capture meter
+// (-100 fully team0 ... +100 fully team1).
+export interface ZoneSnap {
+  owner: number;
+  v: number;
+}
+
 export interface Snapshot {
   serverTick: number;
   phase: number; // 0 playing, 1 results
   phaseEndTick: number;
+  tickets: [number, number];
+  zones: ZoneSnap[];
   self: SelfSnap;
   remotes: RemoteSnap[];
   entities: EntitySnap[];
@@ -193,6 +202,7 @@ const SELF_STATE = 6 * 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1; // pos/vel f64, flags+coun
 const REMOTE_BYTES = 1 + 1 + 3 * 4 + 4 + 2;
 const ENTITY_BYTES = 1 + 6 * 4 + 1;
 const CHUNK_BYTES = 2 + 7 * 4;
+const ZONE_BYTES = 2;
 const EVENT_BYTES = 2 + 1 + 1 + 3 * 4;
 
 export function encodeSnapshot(snap: Snapshot): Uint8Array {
@@ -209,6 +219,9 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
     snap.entities.length * ENTITY_BYTES +
     1 +
     snap.chunks.length * CHUNK_BYTES +
+    4 +
+    1 +
+    snap.zones.length * ZONE_BYTES +
     1 +
     snap.events.length * EVENT_BYTES;
   const buf = new ArrayBuffer(size);
@@ -286,6 +299,16 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
     dv.setFloat32(o + 22, c.qz);
     dv.setFloat32(o + 26, c.qw);
     o += CHUNK_BYTES;
+  }
+
+  dv.setUint16(o, Math.max(0, snap.tickets[0]));
+  dv.setUint16(o + 2, Math.max(0, snap.tickets[1]));
+  o += 4;
+  dv.setUint8(o++, snap.zones.length);
+  for (const zn of snap.zones) {
+    dv.setUint8(o, zn.owner + 1);
+    dv.setInt8(o + 1, Math.round(zn.v / 1));
+    o += ZONE_BYTES;
   }
 
   dv.setUint8(o++, snap.events.length);
@@ -394,6 +417,17 @@ export function decodeSnapshot(bytes: Uint8Array): Snapshot | null {
     o += CHUNK_BYTES;
   }
 
+  if (bytes.length < o + 5) return null;
+  const tickets: [number, number] = [dv.getUint16(o), dv.getUint16(o + 2)];
+  o += 4;
+  const zones: ZoneSnap[] = [];
+  const zoneCount = dv.getUint8(o++);
+  if (bytes.length < o + zoneCount * ZONE_BYTES + 1) return null;
+  for (let i = 0; i < zoneCount; i++) {
+    zones.push({ owner: dv.getUint8(o) - 1, v: dv.getInt8(o + 1) });
+    o += ZONE_BYTES;
+  }
+
   const events: GameEvent[] = [];
   const eventCount = dv.getUint8(o++);
   if (bytes.length < o + eventCount * EVENT_BYTES) return null;
@@ -413,6 +447,8 @@ export function decodeSnapshot(bytes: Uint8Array): Snapshot | null {
     serverTick,
     phase,
     phaseEndTick,
+    tickets,
+    zones,
     self: { ackSeq, ackTick, status, bufferDepth, hp, respawnTicks, state },
     remotes,
     entities,

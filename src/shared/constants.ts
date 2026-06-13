@@ -12,10 +12,14 @@ export const REMOTE_DELAY_MS = 120;
 
 export const MAX_PLAYERS = 16;
 
-// Round flow.
-export const ROUND_TICKS = 5 * 60 * TICK_RATE; // 5 minute rounds
+// Round flow: CONQUEST. Each team has a ticket pool; holding the zone
+// majority bleeds the other team's tickets, every death costs one, and the
+// round ends when a pool empties (or on the clock, higher pool wins).
+export const ROUND_TICKS = 8 * 60 * TICK_RATE; // 8 minute rounds
 export const RESULTS_TICKS = 10 * TICK_RATE;
-export const SCORE_LIMIT = 40; // team kills to win early
+export const TICKETS_START = 250;
+export const ZONE_CAP_RATE = 0.55; // capture meter per tick per net attacker
+export const BLEED_INTERVAL_TICKS = 60; // majority bleed cadence (2s)
 
 // Player.
 export const MAX_HP = 100;
@@ -73,7 +77,7 @@ export const TEAM_NAMES = ["Orange", "Blue"];
 // Bots fill the server up to this many participants so there's always
 // something to fight; each joining human replaces one bot (and bots return
 // as humans leave).
-export const BOT_FILL = 8;
+export const BOT_FILL = 12;
 
 // Destruction/procgen test environment: no bots, no damage, bottomless
 // ammo/grenades/supply. Flip on locally to iterate on the world without
