@@ -57,6 +57,7 @@ import {
   createPlayerBody,
   destroyGameWorld,
   EYE_HEIGHT,
+  joltFreeMemory,
   type GameWorld,
   type InputCmd,
   makeChar,
@@ -2837,6 +2838,7 @@ declare global {
       rubbleCount(): number;
       fallenCount(): number;
       corpseCount(): number;
+      joltFree(): number;
       perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
       drive(over: Partial<Omit<InputCmd, "seq">> & { trackIdx?: number }, ticks: number): void;
@@ -2884,6 +2886,7 @@ window.__fps = {
   rubbleCount: () => builtList.filter((p) => p.broken).length,
   fallenCount: () => builtList.filter((p) => !p.broken && p.material !== "metal").length,
   corpseCount: () => corpses.length,
+  joltFree: () => joltFreeMemory(),
   perf: () => ({
     fps: perf.fps,
     avgFrameMs: perf.avgFrameMs,
