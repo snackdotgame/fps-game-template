@@ -30,7 +30,9 @@ import {
   RIFLE_PANEL_DAMAGE,
   RIFLE_RANGE,
   ROUND_TICKS,
-  SCORE_LIMIT,
+  TICKETS_START,
+  ZONE_CAP_RATE,
+  BLEED_INTERVAL_TICKS,
   TICK_MS,
   TICK_RATE,
 } from "./shared/constants.js";
@@ -48,6 +50,7 @@ import {
   resetCraters,
   slabOfPiece,
   spawnPoint,
+  ZONES,
 } from "./shared/map.js";
 import {
   EXPLOSION_PANEL_OUTER_DAMAGE,
@@ -68,6 +71,7 @@ import {
   EV_TRACER,
   type GameEvent,
   type RemoteSnap,
+  type ZoneSnap,
   RF_DEAD,
   RF_GROUND,
   RF_PROTECTED,
@@ -189,7 +193,82 @@ const players = new Map<string, Player>(); // by connection id, or "bot:<n>"
 const parked = new Map<string, Parked>();
 let nextBotSerial = 0;
 const BOT_NAMES = ["Ash", "Brick", "Castle", "Dune", "Echo", "Flint", "Gravel", "Hatch"];
-const scores: [number, number] = [0, 0];
+const scores: [number, number] = [TICKETS_START, TICKETS_START]; // = tickets
+
+// Conquest zone state, parallel to map.ZONES. v in [-100, 100]: negative is
+// team 0's side, positive team 1's; owner flips at the poles and neutralizes
+// when the meter is pushed back through zero.
+interface ZoneState {
+  owner: number; // -1 neutral, 0, 1
+  v: number;
+}
+
+const zones: ZoneState[] = ZONES.map(() => ({ owner: -1, v: 0 }));
+let nextBleedTick = 0;
+
+function stepZones(): void {
+  if (phase !== "playing") return;
+  for (let i = 0; i < ZONES.length; i++) {
+    const def = ZONES[i];
+    const zn = zones[i];
+    let c0 = 0;
+    let c1 = 0;
+    for (const p of players.values()) {
+      if (p.dead) continue;
+      if (Math.hypot(p.state.x - def.x, p.state.z - def.z) > def.r) continue;
+      if (p.team === 0) c0++;
+      else c1++;
+    }
+    const net = Math.max(-3, Math.min(3, c1 - c0));
+    if (net !== 0) {
+      zn.v = Math.max(-100, Math.min(100, zn.v + net * ZONE_CAP_RATE));
+    } else if (c0 === 0 && c1 === 0 && zn.owner === -1 && zn.v !== 0) {
+      // Abandoned half-captures drift back to neutral.
+      zn.v += zn.v > 0 ? -0.1 : 0.1;
+      if (Math.abs(zn.v) < 0.15) zn.v = 0;
+    }
+    if (zn.owner === 0 && zn.v >= 0) zn.owner = -1;
+    if (zn.owner === 1 && zn.v <= 0) zn.owner = -1;
+    if (zn.v <= -100) zn.owner = 0;
+    if (zn.v >= 100) zn.owner = 1;
+  }
+
+  // Majority bleed: holding more flags drains the other side's tickets.
+  if (tick >= nextBleedTick) {
+    nextBleedTick = tick + BLEED_INTERVAL_TICKS;
+    const owned0 = zones.filter((z) => z.owner === 0).length;
+    const owned1 = zones.filter((z) => z.owner === 1).length;
+    if (owned0 > owned1) scores[1] = Math.max(0, scores[1] - (owned0 - owned1));
+    else if (owned1 > owned0) scores[0] = Math.max(0, scores[0] - (owned1 - owned0));
+  }
+}
+
+// Conquest spawning: at the base or any safely-held zone.
+function chooseSpawn(team: number, idx: number): [number, number, number] {
+  const safe: Array<[number, number]> = [];
+  for (let i = 0; i < ZONES.length; i++) {
+    if (zones[i].owner !== team) continue;
+    const def = ZONES[i];
+    let hot = false;
+    for (const q of players.values()) {
+      if (
+        q.team !== team &&
+        !q.dead &&
+        Math.hypot(q.state.x - def.x, q.state.z - def.z) < def.r + 8
+      ) {
+        hot = true;
+        break;
+      }
+    }
+    if (!hot) safe.push([def.x, def.z]);
+  }
+  if (safe.length === 0 || rng() < 0.35) return spawnPoint(team, idx);
+  const [zx, zz] = safe[Math.floor(rng() * safe.length)];
+  const ang = rng() * Math.PI * 2;
+  const x = zx + Math.sin(ang) * 7;
+  const z = zz + Math.cos(ang) * 7;
+  return [x, heightAt(x, z) + 0.1, z];
+}
 
 const panelHp = new Map<number, number>(); // damaged panels only
 const pieceAlive = (id: number): boolean => !destroyedPanels.has(id);
@@ -294,6 +373,7 @@ async function stepServer(): Promise<void> {
   const t2 = server.elapsedMs();
 
   stepLifecycles();
+  stepZones();
   flushDestroys();
   await stepPhase();
   broadcastSnapshots();
@@ -521,13 +601,21 @@ function botThink(p: Player, b: BotBrain): InputCmd {
     const toX = b.wanderX - s.x;
     const toZ = b.wanderZ - s.z;
     if (tick >= b.repathAtTick || Math.hypot(toX, toZ) < 2) {
-      const half = MAP.size / 2 - 6;
-      b.wanderX = (rng() * 2 - 1) * half;
-      b.wanderZ = (rng() * 2 - 1) * half;
-      // Don't camp the enemy spawn zone — keep the fight in the field.
-      const enemySpawnZ = p.team === 0 ? 35 : -35;
-      if (Math.abs(b.wanderZ - enemySpawnZ) < 13 && Math.abs(b.wanderX) < 13) {
-        b.wanderZ = enemySpawnZ - Math.sign(enemySpawnZ) * (14 + rng() * 10);
+      // Play the objective: usually head for a flag we don't hold.
+      const targets = ZONES.filter((_, i) => zones[i].owner !== p.team);
+      if (targets.length > 0 && rng() < 0.7) {
+        const t = targets[Math.floor(rng() * targets.length)];
+        b.wanderX = t.x + (rng() * 2 - 1) * 7;
+        b.wanderZ = t.z + (rng() * 2 - 1) * 7;
+      } else {
+        const half = MAP.size / 2 - 6;
+        b.wanderX = (rng() * 2 - 1) * half;
+        b.wanderZ = (rng() * 2 - 1) * half;
+        // Don't camp the enemy spawn zone — keep the fight in the field.
+        const enemySpawnZ = p.team === 0 ? 100 : -100;
+        if (Math.abs(b.wanderZ - enemySpawnZ) < 15 && Math.abs(b.wanderX) < 15) {
+          b.wanderZ = enemySpawnZ - Math.sign(enemySpawnZ) * (16 + rng() * 12);
+        }
       }
       b.repathAtTick = tick + 240 + Math.floor(rng() * 240);
     }
@@ -967,11 +1055,9 @@ function damagePlayer(
     victim.dead = true;
     victim.deaths++;
     victim.respawnAtTick = tick + RESPAWN_TICKS;
-    if (attacker !== victim) {
-      attacker.kills++;
-      scores[attacker.team]++;
-      broadcast({ type: "score", scores: [scores[0], scores[1]] });
-    }
+    if (attacker !== victim) attacker.kills++;
+    // Conquest: every death burns a ticket.
+    scores[victim.team] = Math.max(0, scores[victim.team] - 1);
     broadcast({ type: "kill", killer: attacker.idx, victim: victim.idx, weapon });
     // Park the body at the spawn until respawn; clients hide it via RF_DEAD.
     const spawn = spawnPoint(victim.team, victim.idx);
@@ -1440,7 +1526,7 @@ function stepLifecycles(): void {
     if (p.dead) p.history.clear(); // don't rewind into a corpse
 
     if (p.dead && tick >= p.respawnAtTick && phase === "playing") {
-      const spawn = spawnPoint(p.team, p.idx);
+      const spawn = chooseSpawn(p.team, p.idx);
       p.state = makeChar(spawn);
       writeChar(p.body, p.state);
       p.hp = MAX_HP;
@@ -1460,10 +1546,7 @@ async function stepPhase(): Promise<void> {
     return;
   }
   if (phase === "playing") {
-    if (
-      players.size > 0 &&
-      (tick >= phaseEndTick || scores[0] >= SCORE_LIMIT || scores[1] >= SCORE_LIMIT)
-    ) {
+    if (players.size > 0 && (tick >= phaseEndTick || scores[0] <= 0 || scores[1] <= 0)) {
       phase = "results";
       phaseEndTick = tick + RESULTS_TICKS;
       broadcast({ type: "phase", phase, phaseEndTick, scores: [scores[0], scores[1]], mapEpoch });
@@ -1490,8 +1573,13 @@ async function resetRound(): Promise<void> {
   pendingHpUpdates = new Map();
   pendingDestroys = [];
   grenades = [];
-  scores[0] = 0;
-  scores[1] = 0;
+  scores[0] = TICKETS_START;
+  scores[1] = TICKETS_START;
+  for (const zn of zones) {
+    zn.owner = -1;
+    zn.v = 0;
+  }
+  nextBleedTick = 0;
   mapEpoch++;
   rng = mulberry32((tick * 2654435761) >>> 0 || 1);
   for (const p of players.values()) {
@@ -1542,6 +1630,7 @@ function broadcastSnapshots(): void {
   const all = [...players.values()];
   for (const p of all) readChar(p.body, p.state);
 
+  const zoneSnaps: ZoneSnap[] = zones.map((zn) => ({ owner: zn.owner, v: Math.round(zn.v) }));
   const chunkSnaps: ChunkSnap[] = [];
   for (const f of falling.values()) {
     if (chunkSnaps.length >= 32) break;
@@ -1603,6 +1692,8 @@ function broadcastSnapshots(): void {
       serverTick: tick,
       phase: phase === "playing" ? 0 : 1,
       phaseEndTick,
+      tickets: [scores[0], scores[1]],
+      zones: zoneSnaps,
       chunks: chunkSnaps,
       self: {
         ackSeq: p.lastSeq,

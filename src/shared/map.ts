@@ -163,10 +163,12 @@ function valueNoise(x: number, z: number, cell: number): number {
   return a + (b - a) * fx + (c - a) * fz + (a - b - c + d) * fx * fz;
 }
 
-const SIZE = 84;
-const TERRAIN_AMPLITUDE = 1.35;
+const SIZE = 224; // a small-battlefield-scale arena (16 terrain chunks)
+const TERRAIN_AMPLITUDE = 1.6;
 
-// Footprints that must stay flat: building pads and spawn zones.
+// Footprints that must stay flat: building pads and spawn zones. The first
+// nine sites are the original village around the center; the rest spread
+// the battlefield out toward the corners.
 const FLAT_PADS: Array<[number, number, number, number]> = [
   // [cx, cz, halfW, halfD]
   [0, 0, 7.5, 6.5],
@@ -178,8 +180,20 @@ const FLAT_PADS: Array<[number, number, number, number]> = [
   [-32, -25, 6.5, 5.5],
   [-31, 27, 6.5, 5.5],
   [14, -30, 6.5, 5.5],
-  [0, -35, 8, 5], // team 0 spawn
-  [0, 35, 8, 5], // team 1 spawn
+  [60, 0, 6.5, 6.5],
+  [-60, -5, 6.5, 6.5],
+  [0, 62, 6.5, 6.5],
+  [-3, -65, 6.5, 6.5],
+  [62, 62, 6.5, 5.5],
+  [-62, 58, 6.5, 5.5],
+  [-65, -62, 6.5, 5.5],
+  [60, -64, 6.5, 5.5],
+  [95, 28, 6.5, 5.5],
+  [-95, -30, 6.5, 5.5],
+  [30, 90, 6.5, 5.5],
+  [-35, -92, 6.5, 5.5],
+  [0, -100, 10, 6], // team 0 spawn
+  [0, 100, 10, 6], // team 1 spawn
 ];
 
 // How exposed (x,z) is to terrain shaping: 1 in the open field, fading to 0
@@ -198,11 +212,52 @@ function shapeFade(x: number, z: number): number {
   return f;
 }
 
+// --- Water: one meandering river plus a couple of lakes, carved into the
+// base terrain (scaled by shapeFade, so building pads become natural fords
+// and the water never undermines a structure). Wadeable: max ~1.1m deep.
+
+export const WATER_SURFACE_Y = -0.22;
+const WATER_DEPTH = 1.35;
+const RIVER_HALF_WIDTH = 7;
+
+// River centerline, precomputed as a coarse polyline.
+function riverZ(x: number): number {
+  return 38 + 18 * Math.sin(x / 37) + 10 * Math.sin(x / 13 + 2);
+}
+
+const RIVER_PTS: Array<[number, number]> = [];
+for (let x = -SIZE / 2; x <= SIZE / 2; x += 4) RIVER_PTS.push([x, riverZ(x)]);
+
+const LAKES: Array<[number, number, number, number]> = [
+  // [cx, cz, rx, rz]
+  [-70, -55, 17, 12],
+  [85, -30, 13, 10],
+];
+
+// How deep the water carve is at (x,z), before pad fading. 0 = dry land.
+export function waterCarveAt(x: number, z: number): number {
+  let dug = 0;
+  // River: distance to the centerline polyline (cheap x-window reject).
+  let best = Infinity;
+  for (const [px, pz] of RIVER_PTS) {
+    if (Math.abs(px - x) > 12) continue;
+    const d = Math.hypot(x - px, z - pz);
+    if (d < best) best = d;
+  }
+  if (best < RIVER_HALF_WIDTH) dug = Math.max(dug, smooth(1 - best / RIVER_HALF_WIDTH));
+  for (const [cx, cz, rx, rz] of LAKES) {
+    const e = Math.hypot((x - cx) / rx, (z - cz) / rz);
+    if (e < 1) dug = Math.max(dug, smooth(1 - e));
+  }
+  return dug * WATER_DEPTH;
+}
+
 // The pristine pre-battle terrain. Structure generation seats pieces on this,
 // so later craters never move existing geometry.
 export function baseHeightAt(x: number, z: number): number {
   const raw = valueNoise(x + 1000, z + 1000, 14) * 0.7 + valueNoise(x + 2000, z + 2000, 5.5) * 0.3;
-  return raw * TERRAIN_AMPLITUDE * shapeFade(x, z);
+  const fade = shapeFade(x, z);
+  return raw * TERRAIN_AMPLITUDE * fade - waterCarveAt(x, z) * fade;
 }
 
 // ---------------------------------------------------------------------------
@@ -900,6 +955,18 @@ function buildMap(): MapDef {
     "log",
     "brick",
     "concrete",
+    "brick",
+    "log",
+    "concrete",
+    "brick",
+    "log",
+    "concrete",
+    "brick",
+    "concrete",
+    "log",
+    "brick",
+    "concrete",
+    "brick",
   ];
   for (let i = styles.length - 1; i > 0; i--) {
     const j = Math.floor(rng() * (i + 1));
@@ -914,6 +981,18 @@ function buildMap(): MapDef {
     [-32, -25, 8, 6],
     [-31, 27, 8, 6],
     [14, -30, 8, 6],
+    [60, 0, 8, 8],
+    [-60, -5, 8, 8],
+    [0, 62, 8, 8],
+    [-3, -65, 8, 8],
+    [62, 62, 8, 6],
+    [-62, 58, 8, 6],
+    [-65, -62, 8, 6],
+    [60, -64, 8, 6],
+    [95, 28, 8, 6],
+    [-95, -30, 8, 6],
+    [30, 90, 8, 6],
+    [-35, -92, 8, 6],
   ];
   sites.forEach(([cx, cz, w, d], i) => {
     const stories = rng() < 0.45 ? 1 : rng() < 0.72 ? 2 : 3;
@@ -937,7 +1016,8 @@ function buildMap(): MapDef {
     for (const [cx, cz, hw, hd] of FLAT_PADS) {
       if (Math.abs(x - cx) < hw + r && Math.abs(z - cz) < hd + r) return false;
     }
-    if (x > 20.5 && x < 27.5) return false; // keep the east duel lane open
+    if (x > 20.5 && x < 27.5 && Math.abs(z) < 45) return false; // east duel lane
+    if (waterCarveAt(x, z) > 0.08) return false; // stay out of the water
     for (const [px, pz, pr] of placed) {
       if (Math.hypot(x - px, z - pz) < r + pr) return false;
     }
@@ -945,7 +1025,7 @@ function buildMap(): MapDef {
   };
 
   // Sandbag emplacements (three staggered courses of bags).
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 32; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const x = (rng() * 2 - 1) * (half - 6);
       const z = (rng() * 2 - 1) * (half - 6);
@@ -972,7 +1052,7 @@ function buildMap(): MapDef {
   }
 
   // Trees.
-  for (let i = 0; i < 26; i++) {
+  for (let i = 0; i < 85; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const x = (rng() * 2 - 1) * (half - 5);
       const z = (rng() * 2 - 1) * (half - 5);
@@ -984,7 +1064,7 @@ function buildMap(): MapDef {
   }
 
   // Boulder clusters.
-  for (let i = 0; i < 12; i++) {
+  for (let i = 0; i < 34; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const x = (rng() * 2 - 1) * (half - 5);
       const z = (rng() * 2 - 1) * (half - 5);
@@ -996,7 +1076,7 @@ function buildMap(): MapDef {
   }
 
   // Crates, some with a smaller crate stacked on top.
-  for (let i = 0; i < 16; i++) {
+  for (let i = 0; i < 44; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const x = (rng() * 2 - 1) * (half - 5);
       const z = (rng() * 2 - 1) * (half - 5);
@@ -1041,13 +1121,32 @@ function buildMap(): MapDef {
     slabs: g.slabs,
     ladders: g.ladders,
     spawns: [
-      [0, 0.1, -35],
-      [0, 0.1, 35],
+      [0, 0.1, -100],
+      [0, 0.1, 100],
     ],
   };
 }
 
 export const MAP = buildMap();
+
+// ---------------------------------------------------------------------------
+// Conquest zones: capturable flags at five of the building sites, spread in
+// a cross over the battlefield. Hold the majority to bleed enemy tickets.
+
+export interface ZoneDef {
+  letter: string;
+  x: number;
+  z: number;
+  r: number;
+}
+
+export const ZONES: ZoneDef[] = [
+  { letter: "A", x: -60, z: -5, r: 12 },
+  { letter: "B", x: 0, z: 0, r: 12 },
+  { letter: "C", x: 60, z: 0, r: 12 },
+  { letter: "D", x: 0, z: 62, r: 12 },
+  { letter: "E", x: -3, z: -65, r: 12 },
+];
 
 // Slab index for a map piece id (binary search over the sorted id ranges).
 export function slabOfPiece(pieceId: number): number {

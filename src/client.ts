@@ -20,6 +20,8 @@ import {
   TERRAIN_CHUNK,
   TERRAIN_CHUNKS,
   terrainChunkMesh,
+  WATER_SURFACE_Y,
+  ZONES,
 } from "./shared/map.js";
 import { RUBBLE_HEIGHT } from "./shared/constants.js";
 import { BUILT_PANEL_ID_BASE } from "./shared/map.js";
@@ -41,6 +43,7 @@ import {
   RF_TEAM,
   type Snapshot,
   SS_DEAD,
+  type ZoneSnap,
 } from "./shared/netCodec.js";
 import {
   addPanelBody,
@@ -86,9 +89,9 @@ document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0xb8cfe0);
-scene.fog = new THREE.Fog(0xb8cfe0, 70, 160);
+scene.fog = new THREE.Fog(0xb8cfe0, 90, 230);
 
-const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.08, 250);
+const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.08, 360);
 const hemi = new THREE.HemisphereLight(0xe8f1fa, 0x6e6a5e, 1.0);
 scene.add(hemi);
 const sun = new THREE.DirectionalLight(0xfff2dd, 2.0);
@@ -376,6 +379,42 @@ const terrainMat = new THREE.MeshStandardMaterial({
 const TERRAIN_LOW = new THREE.Color(0x5e8a4a);
 const TERRAIN_HIGH = new THREE.Color(0x8aa763);
 const TERRAIN_SCORCH = new THREE.Color(0x4f463b);
+const TERRAIN_BED = new THREE.Color(0x6a6f52); // silty riverbed
+
+const poleMat = new THREE.MeshStandardMaterial({ color: 0x3a3d42, roughness: 0.7 });
+const flagGeo = new THREE.PlaneGeometry(1.55, 0.95);
+const zoneFlags: Array<{
+  flag: THREE.Mesh;
+  mat: THREE.MeshStandardMaterial;
+  baseY: number;
+  x: number;
+  z: number;
+}> = [];
+const NEUTRAL_FLAG = 0xd0d0cc;
+
+function stepFlags(now: number): void {
+  for (let i = 0; i < zoneFlags.length && i < zoneState.length; i++) {
+    const zf = zoneFlags[i];
+    const zn = zoneState[i];
+    const owner = zn.owner;
+    const towards = zn.v < 0 ? 0 : 1;
+    const color =
+      owner >= 0 ? TEAM_COLORS[owner] : Math.abs(zn.v) > 5 ? TEAM_COLORS[towards] : NEUTRAL_FLAG;
+    zf.mat.color.setHex(color);
+    zf.mat.opacity = 1;
+    const h = 1.6 + (Math.abs(zn.v) / 100) * 4.4;
+    zf.flag.position.y = zf.baseY + h;
+    zf.flag.rotation.y = Math.sin(now / 900 + i) * 0.25;
+  }
+}
+
+const waterMat = new THREE.MeshStandardMaterial({
+  color: 0x3e6f9d,
+  roughness: 0.12,
+  metalness: 0,
+  transparent: true,
+  opacity: 0.72,
+});
 
 function makeTerrainChunkMesh(ci: number, cj: number): THREE.Mesh {
   const data = terrainChunkMesh(ci, cj);
@@ -393,9 +432,12 @@ function makeTerrainChunkMesh(ci: number, cj: number): THREE.Mesh {
     const cz = (pos.getZ(f) + pos.getZ(f + 1) + pos.getZ(f + 2)) / 3;
     const t = Math.max(0, Math.min(1, cy / 1.5));
     c.copy(TERRAIN_LOW).lerp(TERRAIN_HIGH, t);
-    // Crater bowls read as scorched earth.
+    // Crater bowls read as scorched earth; riverbeds as silt.
     const dug = baseHeightAt(cx, cz) - cy;
     if (dug > 0.08) c.lerp(TERRAIN_SCORCH, Math.min(1, dug / 0.6));
+    if (cy < WATER_SURFACE_Y + 0.05) {
+      c.lerp(TERRAIN_BED, Math.min(1, (WATER_SURFACE_Y + 0.05 - cy) / 0.5));
+    }
     const j = 0.93 + hash01(Math.round(cx * 7 + cz * 131), 5) * 0.14;
     colors.push(c.r * j, c.g * j, c.b * j, c.r * j, c.g * j, c.b * j, c.r * j, c.g * j, c.b * j);
   }
@@ -421,7 +463,7 @@ function rebuildTerrainChunk(ci: number, cj: number): void {
 // tinted to the terrain. Blades resample the heightfield on crater rebuilds
 // (and skip scorched bowls).
 
-const GRASS_PER_CHUNK = 330;
+const GRASS_PER_CHUNK = 110; // 256 chunks now — ~28k blades total
 const grassChunkVisuals = new Map<number, THREE.Mesh>();
 const grassMat = new THREE.ShaderMaterial({
   uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, { uTime: { value: 0 } }]),
@@ -470,7 +512,7 @@ function makeGrassChunkMesh(ci: number, cj: number): THREE.Mesh | null {
     const x = x0 + hash01(seedBase + i, 11) * TERRAIN_CHUNK;
     const z = z0 + hash01(seedBase + i, 12) * TERRAIN_CHUNK;
     const baseH = baseHeightAt(x, z);
-    if (baseH < 0.04) continue; // pads, spawns, perimeter skirt
+    if (baseH < 0.04) continue; // pads, spawns, perimeter skirt, water
     const y = heightAt(x, z);
     if (baseH - y > 0.12) continue; // scorched crater bowl
     const h = 0.22 + hash01(seedBase + i, 13) * 0.3;
@@ -664,6 +706,35 @@ function buildMapVisuals(): void {
       rebuildGrassChunk(ci, cj);
     }
   }
+
+  // Conquest flags: a pole at each zone center, cloth raising toward the
+  // capturing team's color.
+  zoneFlags.length = 0;
+  for (const def of ZONES) {
+    const baseY = heightAt(def.x, def.z);
+    const pole = new THREE.Mesh(GEO.box, poleMat);
+    pole.scale.set(0.14, 7.2, 0.14);
+    pole.position.set(def.x, baseY + 3.6, def.z);
+    pole.userData.sharedGeo = true;
+    pole.castShadow = true;
+    mapGroup.add(pole);
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xd0d0cc,
+      roughness: 0.85,
+      side: THREE.DoubleSide,
+    });
+    const flag = new THREE.Mesh(flagGeo, mat);
+    flag.position.set(def.x + 0.85, baseY + 2, def.z);
+    mapGroup.add(flag);
+    zoneFlags.push({ flag, mat, baseY, x: def.x, z: def.z });
+  }
+
+  // One translucent sheet at water level: it only shows where the terrain
+  // dips below it (the river and the lakes).
+  const water = new THREE.Mesh(new THREE.PlaneGeometry(MAP.size, MAP.size), waterMat);
+  water.rotation.x = -Math.PI / 2;
+  water.position.y = WATER_SURFACE_Y;
+  mapGroup.add(water);
   for (const s of MAP.statics) {
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.w, s.h, s.d), MAT.wall);
     mesh.position.set(s.x, s.y, s.z);
@@ -861,6 +932,10 @@ hud.innerHTML = `
   #hitmark { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%) rotate(45deg); font-size:26px; color:#ff5a4a; opacity:0; font-weight:900; }
   #scores { position:absolute; top:12px; left:50%; transform:translateX(-50%); font-size:22px; font-weight:900; background:rgba(10,14,22,.55); padding:6px 18px; border-radius:10px; }
   #timer { position:absolute; top:48px; left:50%; transform:translateX(-50%); font-size:14px; font-weight:700; opacity:.85; }
+  #zones { position:absolute; top:68px; left:50%; transform:translateX(-50%); display:flex; gap:6px; }
+  #zones .zp { width:26px; height:26px; border-radius:6px; display:flex; align-items:center; justify-content:center; font-weight:900; font-size:14px; background:rgba(20,24,32,.55); color:#cfd4da; position:relative; overflow:hidden; }
+  #zones .zp .fill { position:absolute; left:0; bottom:0; width:100%; z-index:0; }
+  #zones .zp span { position:relative; z-index:1; }
   #vitals { position:absolute; bottom:18px; left:18px; font-size:15px; font-weight:800; }
   #vitals .hpbar { width:200px; height:10px; background:rgba(0,0,0,.45); border-radius:5px; overflow:hidden; margin-top:4px; }
   #vitals .hpbar div { height:100%; background:#5ad05a; width:100%; }
@@ -889,6 +964,7 @@ hud.innerHTML = `
   <div id="hitmark">+</div>
   <div id="scores" class="sh"></div>
   <div id="timer" class="sh"></div>
+  <div id="zones"></div>
   <div id="vitals" class="sh">HP<div class="hpbar"><div id="hpfill"></div></div></div>
   <div id="ammo" class="sh"><div class="mag" id="ammotext">30</div><div class="sub" id="gear"></div></div>
   <div id="feed"></div>
@@ -904,6 +980,7 @@ const el = {
   hitmark: document.getElementById("hitmark")!,
   scores: document.getElementById("scores")!,
   timer: document.getElementById("timer")!,
+  zones: document.getElementById("zones")!,
   hpfill: document.getElementById("hpfill")!,
   ammotext: document.getElementById("ammotext")!,
   gear: document.getElementById("gear")!,
@@ -1098,6 +1175,21 @@ const remotes = new Map<number, RemotePlayer>();
 const kd = new Map<number, { k: number; d: number }>();
 let selfStatus = 0;
 let selfHp = MAX_HP;
+let zoneState: ZoneSnap[] = ZONES.map(() => ({ owner: -1, v: 0 }));
+const zonePips: HTMLElement[] = [];
+const zoneFills: HTMLElement[] = [];
+for (const def of ZONES) {
+  const pip = document.createElement("div");
+  pip.className = "zp";
+  const fill = document.createElement("div");
+  fill.className = "fill";
+  const label = document.createElement("span");
+  label.textContent = def.letter;
+  pip.append(fill, label);
+  el.zones.appendChild(pip);
+  zonePips.push(pip);
+  zoneFills.push(fill);
+}
 let respawnTicks = 0;
 
 let gw: GameWorld | null = null;
@@ -1429,6 +1521,8 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
 
   noteArrival(receivedAt, snap.serverTick);
   noteChunkPoses(snap, receivedAt);
+  zoneState = snap.zones;
+  scores = [snap.tickets[0], snap.tickets[1]];
   const prevSelfStatus = selfStatus;
   selfStatus = snap.self.status;
   if ((prevSelfStatus & SS_DEAD) === 0 && (selfStatus & SS_DEAD) !== 0 && predState) {
@@ -2454,6 +2548,7 @@ function frame(): void {
   if (meleeSwing > 0) meleeSwing = Math.max(0, meleeSwing - dt * 4);
   stepClouds(dt);
   stepRagdolls(dt);
+  stepFlags(now);
   (grassMat.uniforms.uTime as { value: number }).value = now / 1000;
 
   // Camera at the predicted eye, interpolated between the last two ticks so
@@ -2628,6 +2723,16 @@ function updateCrosshairTarget(): void {
 // --- HUD updates.
 
 function updateHud(): void {
+  for (let i = 0; i < zonePips.length && i < zoneState.length; i++) {
+    const zn = zoneState[i];
+    const c = zn.owner === 0 ? "#e8743a" : zn.owner === 1 ? "#3a7be8" : "#cfd4da";
+    zonePips[i].style.color = zn.owner >= 0 ? "#fff" : "#cfd4da";
+    zonePips[i].style.boxShadow = zn.owner >= 0 ? `0 0 0 2px ${c} inset` : "none";
+    const towards = zn.v < 0 ? "#e8743a" : "#3a7be8";
+    zoneFills[i].style.height = `${Math.abs(zn.v)}%`;
+    zoneFills[i].style.background = towards;
+    zoneFills[i].style.opacity = "0.55";
+  }
   el.scores.innerHTML = `<span style="color:${TEAM_COLORS_CSS[0]}">${scores[0]}</span> · <span style="color:${TEAM_COLORS_CSS[1]}">${scores[1]}</span>`;
   const ticksLeft = Math.max(0, phaseEndTick - estServerTick());
   const secs = Math.ceil(ticksLeft / TICK_RATE);
@@ -2725,6 +2830,8 @@ declare global {
       destroyedCount(): number;
       collapsedCount(): number;
       craterCount(): number;
+      zones(): Array<{ owner: number; v: number }>;
+      tickets(): [number, number];
       roundTicksLeft(): number;
       groundHeightAt(x: number, z: number): number;
       rubbleCount(): number;
@@ -2770,6 +2877,8 @@ window.__fps = {
   destroyedCount: () => destroyedSet.size,
   collapsedCount: () => collapsedCount,
   craterCount: () => craterList().length,
+  zones: () => zoneState.map((z) => ({ owner: z.owner, v: z.v })),
+  tickets: () => [scores[0], scores[1]],
   roundTicksLeft: () => Math.max(0, phaseEndTick - estServerTick()),
   groundHeightAt: (x: number, z: number) => heightAt(x, z),
   rubbleCount: () => builtList.filter((p) => p.broken).length,

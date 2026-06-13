@@ -208,7 +208,7 @@ async function main(): Promise<void> {
     const gw = await createGameWorld();
     check(
       "world is a few hundred slab bodies, not 9k pieces",
-      gw.slabs.size === MAP.slabs.length && MAP.slabs.length < 320,
+      gw.slabs.size === MAP.slabs.length && MAP.slabs.length < 700,
       `slabs=${gw.slabs.size}`,
     );
     // A pristine wall face (hundreds of bricks) merges into few boxes.
@@ -332,7 +332,7 @@ async function main(): Promise<void> {
   {
     const houses = MAP.buildings.filter((b) => b.kind === "building");
     const trees = MAP.buildings.filter((b) => b.kind === "tree");
-    let ok = houses.length === 9 && trees.length >= 16;
+    let ok = houses.length === 21 && trees.length >= 60;
     // Concrete buildings use far fewer (bigger) panels than brick ones.
     for (const b of houses) ok &&= b.wallPanelIds.length >= 90 && b.roofPanelIds.length >= 40;
     for (const b of trees) {
@@ -387,7 +387,7 @@ async function main(): Promise<void> {
     check("terrain has relief", maxH > 0.5, `maxH=${maxH.toFixed(2)}`);
     check(
       "spawns and pads are flat",
-      Math.abs(heightAt(0, -35)) < 0.05 && Math.abs(heightAt(0, 0)) < 0.05,
+      Math.abs(heightAt(0, -100)) < 0.05 && Math.abs(heightAt(0, 0)) < 0.05,
       "",
     );
   }
@@ -493,6 +493,29 @@ async function main(): Promise<void> {
     check("island flood is well-formed", island.size > 0, `size=${island.size}`);
   }
 
+  // --- Water: the river is carved, wadeable, and never under a building. ---
+  {
+    const { waterCarveAt, WATER_SURFACE_Y, ZONES } = await import("../src/shared/map.js");
+    let wet = 0;
+    let deepest = 0;
+    for (let x = -100; x <= 100; x += 3) {
+      for (let z = -100; z <= 100; z += 3) {
+        const h = heightAt(x, z);
+        if (h < WATER_SURFACE_Y) {
+          wet++;
+          deepest = Math.max(deepest, WATER_SURFACE_Y - h);
+        }
+      }
+    }
+    check("river/lakes exist but are uncommon", wet > 60 && wet < 900, `wet=${wet}`);
+    check("water is wadeable, not swimmable", deepest < 1.3, `deepest=${deepest.toFixed(2)}`);
+    check(
+      "zones sit on dry, flat ground",
+      ZONES.every((zn) => Math.abs(heightAt(zn.x, zn.z)) < 0.05 && waterCarveAt(zn.x, zn.z) < 0.05),
+      "",
+    );
+  }
+
   // --- Ladders: real climbing — push into the wall and rise to the top. ---
   {
     check("ladders generated", MAP.ladders.length >= 2, `n=${MAP.ladders.length}`);
@@ -500,10 +523,12 @@ async function main(): Promise<void> {
     const r = await rig([lad.x + lad.nx * 0.55, 0.1, lad.z + lad.nz * 0.55]);
     for (let t = 0; t < 20; t++) step(r, cmd(t + 1)); // settle
     const yaw = quantizeAngle(Math.atan2(-lad.nx, -lad.nz));
+    let peak = 0;
     for (let t = 20; t < 140; t++) {
       step(r, cmd(t + 1, { moveX: quantizeMove(-lad.nx), moveZ: quantizeMove(-lad.nz), yaw }));
+      peak = Math.max(peak, r.s.y); // it crests the roof and keeps walking
     }
-    check("climbing reaches the top", r.s.y > lad.y1 - 1.2, `y=${r.s.y.toFixed(2)} top=${lad.y1}`);
+    check("climbing reaches the top", peak > lad.y1 - 1.2, `peak=${peak.toFixed(2)} top=${lad.y1}`);
     destroyGameWorld(r.gw);
   }
 
