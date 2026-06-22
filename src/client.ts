@@ -2,9 +2,17 @@
 // world, remote interpolation, destruction/construction sync, and the HUD.
 // The server is authoritative for everything; this file is display + input.
 
-import { client } from "minion:client";
+import { client } from "snack:client";
 import * as THREE from "three";
-import { INPUT_REDUNDANCY, MAX_HP, TEAM_NAMES, TICK_MS, TICK_RATE } from "./shared/constants.js";
+import {
+  HEADSHOT_HEIGHT,
+  INPUT_REDUNDANCY,
+  MAX_HP,
+  RELOAD_TICKS,
+  TEAM_NAMES,
+  TICK_MS,
+  TICK_RATE,
+} from "./shared/constants.js";
 import {
   addCrater,
   baseHeightAt,
@@ -71,6 +79,10 @@ import {
   writeChar,
   ZERO_INPUT,
 } from "./shared/physics.js";
+import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
+import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
 
 const TEAM_COLORS = [0xe8743a, 0x3a7be8];
 const TEAM_COLORS_CSS = ["#e8743a", "#3a7be8"];
@@ -697,7 +709,6 @@ function buildMapVisuals(): void {
   terrainChunkVisuals.clear();
   grassChunkVisuals.clear();
   decals.length = 0;
-  ragdolls.length = 0;
   corpses.length = 0; // their groups died with the old mapGroup
   fallingChunks.clear(); // ditto
 
@@ -1003,14 +1014,163 @@ function feed(text: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Audio (synthesized).
+// Audio: sample-backed when assets are present, synthesized fallback otherwise.
+
+const kenneyVariants = (family: string): string[] =>
+  Array.from({ length: 5 }, (_, i) => `/assets/sounds/${family}_00${i}.ogg`);
+
+const BUILT_IN_SOUND_FILES: Record<string, string[]> = {
+  footstep_grass: kenneyVariants("footstep_grass"),
+  footstep_concrete: kenneyVariants("footstep_concrete"),
+  footstep_snow: kenneyVariants("footstep_snow"),
+  footstep_wood: kenneyVariants("footstep_wood"),
+  impactPunch_medium: kenneyVariants("impactPunch_medium"),
+  impactPunch_heavy: kenneyVariants("impactPunch_heavy"),
+  impactSoft_medium: kenneyVariants("impactSoft_medium"),
+  impactSoft_heavy: kenneyVariants("impactSoft_heavy"),
+  impactWood_medium: kenneyVariants("impactWood_medium"),
+  impactMetal_medium: kenneyVariants("impactMetal_medium"),
+};
+
+interface SoundManifest {
+  families?: Record<string, string[]>;
+}
 
 let audioCtx: AudioContext | null = null;
+let masterGain: GainNode | null = null;
+const soundBuffers = new Map<string, AudioBuffer[]>();
+// One decode per URL, shared across every family that lists it (e.g. melee
+// reuses the Kenney impacts) so the same file isn't fetched or decoded twice.
+const bufferPromises = new Map<string, Promise<AudioBuffer | null>>();
+const soundLog: string[] = [];
+let soundManifestRequested = false;
+
 function ensureAudio(): void {
-  if (!audioCtx) audioCtx = new AudioContext();
+  if (!audioCtx) {
+    audioCtx = new AudioContext();
+    masterGain = audioCtx.createGain();
+    masterGain.gain.value = 0.7;
+    masterGain.connect(audioCtx.destination);
+    for (const [family, urls] of Object.entries(BUILT_IN_SOUND_FILES)) {
+      loadSoundFamily(family, urls);
+    }
+    loadSoundManifest();
+  }
   if (audioCtx.state === "suspended") void audioCtx.resume();
 }
-function noiseBurst(dur: number, vol: number, low = false): void {
+
+function loadSoundManifest(): void {
+  if (soundManifestRequested) return;
+  soundManifestRequested = true;
+  void fetch("/assets/sounds/manifest.json", { cache: "no-cache" })
+    .then((response) => (response.ok ? response.json() : null))
+    .then((manifest: SoundManifest | null) => {
+      if (!manifest?.families) return;
+      for (const [family, urls] of Object.entries(manifest.families)) {
+        loadSoundFamily(family, urls);
+      }
+    })
+    .catch(() => {});
+}
+
+function loadSoundFamily(family: string, urls: readonly string[]): void {
+  const buffers = soundBuffers.get(family) ?? [];
+  soundBuffers.set(family, buffers);
+  for (const url of urls) {
+    let pending = bufferPromises.get(url);
+    if (!pending) {
+      pending = fetch(url)
+        .then((response) => (response.ok ? response.arrayBuffer() : Promise.reject()))
+        .then((bytes) => audioCtx!.decodeAudioData(bytes))
+        .catch(() => null);
+      bufferPromises.set(url, pending);
+    }
+    void pending.then((buffer) => {
+      if (buffer) buffers.push(buffer);
+    });
+  }
+}
+
+function makePanner(at: THREE.Vector3): PannerNode | null {
+  if (!audioCtx) return null;
+  const panner = audioCtx.createPanner();
+  // Equal-power (not HRTF) keeps other players' sounds crisp and clearly
+  // left/right instead of spectrally muffled; a gentle linear falloff keeps
+  // them audible across the battlefield.
+  panner.panningModel = "equalpower";
+  panner.distanceModel = "linear";
+  panner.refDistance = 6;
+  panner.maxDistance = 80;
+  panner.rolloffFactor = 0.9;
+  panner.positionX.value = at.x;
+  panner.positionY.value = at.y;
+  panner.positionZ.value = at.z;
+  return panner;
+}
+
+function connectAudioNode(source: AudioNode, volume: number, at?: THREE.Vector3): void {
+  if (!audioCtx || !masterGain) return;
+  const gain = audioCtx.createGain();
+  gain.gain.value = volume;
+  source.connect(gain);
+  if (at) {
+    const panner = makePanner(at);
+    if (panner) {
+      gain.connect(panner).connect(masterGain);
+      return;
+    }
+  }
+  gain.connect(masterGain);
+}
+
+function playSound(family: string, volume = 1, pitch = 1): boolean {
+  if (!audioCtx) return false;
+  const buffers = soundBuffers.get(family);
+  if (!buffers || buffers.length === 0) return false;
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffers[Math.floor(Math.random() * buffers.length)];
+  source.playbackRate.value = pitch * (0.94 + Math.random() * 0.12);
+  connectAudioNode(source, volume);
+  source.start();
+  logSound(family);
+  return true;
+}
+
+function playSoundAt(family: string, at: THREE.Vector3, volume = 1, pitch = 1): boolean {
+  if (!audioCtx) return false;
+  const buffers = soundBuffers.get(family);
+  if (!buffers || buffers.length === 0) return false;
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffers[Math.floor(Math.random() * buffers.length)];
+  source.playbackRate.value = pitch * (0.94 + Math.random() * 0.12);
+  connectAudioNode(source, volume, at);
+  source.start();
+  logSound(family);
+  return true;
+}
+
+// Play a one-shot stretched to ~`seconds` long so a sample (e.g. the reload)
+// matches a fixed gameplay duration. No random pitch jitter.
+function playSoundFit(family: string, seconds: number, volume = 1): boolean {
+  if (!audioCtx) return false;
+  const buffers = soundBuffers.get(family);
+  if (!buffers || buffers.length === 0) return false;
+  const buffer = buffers[Math.floor(Math.random() * buffers.length)];
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.playbackRate.value = Math.max(0.5, Math.min(2, buffer.duration / seconds));
+  connectAudioNode(source, volume);
+  source.start();
+  logSound(family);
+  return true;
+}
+
+function logSound(family: string): void {
+  soundLog.push(family);
+  if (soundLog.length > 40) soundLog.shift();
+}
+
+function noiseBurst(dur: number, vol: number, low = false, at?: THREE.Vector3): void {
   if (!audioCtx) return;
   const t = audioCtx.currentTime;
   const len = Math.floor(audioCtx.sampleRate * dur);
@@ -1021,38 +1181,160 @@ function noiseBurst(dur: number, vol: number, low = false): void {
   src.buffer = buf;
   const filter = audioCtx.createBiquadFilter();
   filter.type = "lowpass";
-  filter.frequency.value = low ? 220 : 2600;
-  const gain = audioCtx.createGain();
-  gain.gain.value = vol;
-  src.connect(filter).connect(gain).connect(audioCtx.destination);
+  filter.frequency.value = low ? 260 : 2600;
+  src.connect(filter);
+  connectAudioNode(filter, vol, at);
   src.start(t);
 }
-function blip(freq: number, dur = 0.07, vol = 0.1, type: OscillatorType = "square"): void {
+
+function blip(
+  freq: number,
+  dur = 0.07,
+  vol = 0.1,
+  type: OscillatorType = "square",
+  at?: THREE.Vector3,
+): void {
   if (!audioCtx) return;
   const t = audioCtx.currentTime;
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();
   osc.type = type;
   osc.frequency.value = freq;
-  gain.gain.setValueAtTime(vol, t);
+  gain.gain.setValueAtTime(1, t);
   gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
-  osc.connect(gain).connect(audioCtx.destination);
+  osc.connect(gain);
+  connectAudioNode(gain, vol, at);
   osc.start(t);
   osc.stop(t + dur);
 }
+
+function updateAudioListener(): void {
+  if (!audioCtx) return;
+  const listener = audioCtx.listener;
+  const dir = new THREE.Vector3();
+  camera.getWorldDirection(dir);
+  listener.positionX.value = camera.position.x;
+  listener.positionY.value = camera.position.y;
+  listener.positionZ.value = camera.position.z;
+  listener.forwardX.value = dir.x;
+  listener.forwardY.value = dir.y;
+  listener.forwardZ.value = dir.z;
+  listener.upX.value = camera.up.x;
+  listener.upY.value = camera.up.y;
+  listener.upZ.value = camera.up.z;
+}
+
+function footstepFamilyAt(x: number, y: number, z: number): string {
+  const material = panelMaterialUnderfoot(x, y, z);
+  if (
+    material === "plank" ||
+    material === "log" ||
+    material === "post" ||
+    material === "trunk" ||
+    material === "crate"
+  ) {
+    return "footstep_wood";
+  }
+  if (
+    material === "brick" ||
+    material === "concrete" ||
+    material === "metal" ||
+    material === "rock" ||
+    material === "rubble" ||
+    material === "sandbag"
+  ) {
+    return "footstep_concrete";
+  }
+  const base = baseHeightAt(x, z);
+  if (base < 0.05) return "footstep_concrete";
+  if (base > 2.4) return "footstep_snow";
+  return "footstep_grass";
+}
+
+function panelMaterialUnderfoot(x: number, y: number, z: number): PanelMaterial | null {
+  let best: { material: PanelMaterial; dy: number } | null = null;
+  for (const def of panelDefs.values()) {
+    const dx = Math.abs(x - def.x);
+    const dz = Math.abs(z - def.z);
+    if (dx > def.ex / 2 + 0.16 || dz > def.ez / 2 + 0.16) continue;
+    const top = def.y + def.ey / 2;
+    const dy = Math.abs(y - top);
+    if (dy > 0.62) continue;
+    if (!best || dy < best.dy) best = { material: def.material, dy };
+  }
+  return best?.material ?? null;
+}
+
 const sounds = {
-  shot: () => noiseBurst(0.09, 0.16),
+  shot: () => {
+    if (!playSound("rifle_shot", 0.9)) noiseBurst(0.09, 0.16);
+    void playSound("rifle_tail", 0.35);
+  },
+  shotAt: (at: THREE.Vector3) => {
+    if (!playSoundAt("rifle_shot", at, 0.9)) noiseBurst(0.1, 0.15, true, at);
+    void playSoundAt("rifle_tail", at, 0.35);
+  },
   shotFar: (d: number) => noiseBurst(0.12, Math.max(0.02, 0.14 - d * 0.002), true),
-  explosion: () => {
-    noiseBurst(0.5, 0.4, true);
-    blip(60, 0.45, 0.25, "sine");
+  explosionAt: (at: THREE.Vector3) => {
+    // A sharp full-spectrum crack for the attack, the heavy impact sample at
+    // near-natural pitch for body, and a short low thump underneath — punchy,
+    // not the old pitched-down, sub-bass-drone muffle.
+    noiseBurst(0.22, 0.6, false, at);
+    void playSoundAt("impactSoft_heavy", at, 0.85, 0.95);
+    blip(80, 0.32, 0.22, "sine", at);
   },
   hitmarker: () => blip(1450, 0.07, 0.2),
-  hurt: () => blip(170, 0.12, 0.16, "sawtooth"),
-  reload: () => blip(700, 0.06, 0.08),
-  build: () => blip(240, 0.1, 0.14, "square"),
-  melee: () => noiseBurst(0.08, 0.1, true),
-  death: () => blip(110, 0.5, 0.2, "sawtooth"),
+  // Landed a bullet on an enemy: a meaty flesh thwack plus the confirm tick.
+  bulletHit: () => {
+    if (!playSound("impactPunch_heavy", 0.8, 1.15)) noiseBurst(0.05, 0.12);
+    blip(1500, 0.06, 0.14);
+  },
+  // Headshot: heavier thwack + a brighter two-tone ding so it reads distinctly.
+  headshot: () => {
+    if (!playSound("impactPunch_heavy", 0.85, 1.35)) noiseBurst(0.04, 0.12);
+    blip(2000, 0.05, 0.2);
+    blip(2600, 0.07, 0.18);
+  },
+  // Grenade tapping the ground: a small metallic clink, scaled by impact speed.
+  grenadeBounceAt: (at: THREE.Vector3, volume = 0.5) => {
+    void playSoundAt("impactMetal_medium", at, Math.min(0.6, volume), 1.1);
+  },
+  hurt: () => {
+    if (!playSound("impactPunch_medium", 0.9, 0.85)) blip(170, 0.12, 0.16, "sawtooth");
+  },
+  hurtAt: (at: THREE.Vector3) => {
+    if (!playSoundAt("impactPunch_medium", at, 0.85, 0.85)) blip(170, 0.12, 0.13, "sawtooth", at);
+  },
+  reload: () => {
+    // Stretch the sample to the fixed reload time so audio and the dip line up.
+    if (!playSoundFit("reload", RELOAD_TICKS / TICK_RATE, 0.8)) blip(700, 0.06, 0.08);
+  },
+  buildAt: (at: THREE.Vector3) => {
+    if (!playSoundAt("impactWood_medium", at, 0.75, 0.9)) blip(240, 0.1, 0.14, "square", at);
+  },
+  melee: () => {
+    if (!playSound("melee", 0.65, 0.85)) noiseBurst(0.08, 0.1, true);
+  },
+  meleeAt: (at: THREE.Vector3) => {
+    if (!playSoundAt("melee", at, 0.65, 0.85)) noiseBurst(0.08, 0.1, true, at);
+  },
+  death: () => {
+    // A heavy body-drop thud (pitched-down impact); synth groan if unloaded.
+    if (!playSound("death", 0.8, 0.75) && !playSound("impactSoft_heavy", 0.7, 0.7)) {
+      blip(110, 0.5, 0.2, "sawtooth");
+    }
+  },
+  deathAt: (at: THREE.Vector3) => {
+    if (!playSoundAt("death", at, 0.8, 0.75) && !playSoundAt("impactSoft_heavy", at, 0.7, 0.7)) {
+      blip(110, 0.5, 0.16, "sawtooth", at);
+    }
+  },
+  footstep: (x: number, y: number, z: number, volume = 0.22) => {
+    void playSound(footstepFamilyAt(x, y, z), volume, 1);
+  },
+  footstepAt: (x: number, y: number, z: number, volume = 0.22) => {
+    void playSoundAt(footstepFamilyAt(x, y, z), new THREE.Vector3(x, y + 0.1, z), volume, 1);
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -1164,6 +1446,11 @@ interface RemotePlayer {
   }>;
   lastFlags: number;
   lastProt: boolean;
+  lastStepIndex: number;
+  stepPhase: number;
+  createdAt: number; // ms; used to grace-reveal the box rig if the model is slow
+  // Set once the Quaternius model + AnimationMixer replace the blocky fallback.
+  anim?: CharacterAnim;
 }
 
 let selfIdx = -1;
@@ -1397,6 +1684,10 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       bumpKd(msg.killer, "k");
       bumpKd(msg.victim, "d");
       if (msg.victim === selfIdx) sounds.death();
+      else {
+        const at = eyeOf(msg.victim);
+        if (at) sounds.deathAt(at);
+      }
       if (msg.killer === selfIdx && msg.victim !== selfIdx) sounds.hitmarker();
       break;
     }
@@ -1464,7 +1755,9 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       builtList.push(msg.panel);
       if (gw) addPanelBody(gw, msg.panel);
       addBuiltPanelVisual(msg.panel);
-      if (msg.panel.material !== "rubble") sounds.build();
+      if (msg.panel.material !== "rubble") {
+        sounds.buildAt(new THREE.Vector3(msg.panel.x, msg.panel.y, msg.panel.z));
+      }
       break;
     }
     case "score": {
@@ -1528,7 +1821,7 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
   selfStatus = snap.self.status;
   if ((prevSelfStatus & SS_DEAD) === 0 && (selfStatus & SS_DEAD) !== 0 && predState) {
     const myTeam = roster.get(selfIdx)?.team ?? 0;
-    spawnRagdoll(new THREE.Vector3(predState.x, predState.y, predState.z), yaw, myTeam);
+    spawnCorpse(new THREE.Vector3(predState.x, predState.y, predState.z), yaw, myTeam);
   }
   selfHp = snap.self.hp;
   respawnTicks = snap.self.respawnTicks;
@@ -1550,18 +1843,23 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
     seen.add(r.idx);
     let rp = remotes.get(r.idx);
     if (!rp) {
+      const team = (r.flags & RF_TEAM) !== 0 ? 1 : 0;
       rp = {
         info: roster.get(r.idx) ?? {
           idx: r.idx,
           name: `player ${r.idx}`,
-          team: (r.flags & RF_TEAM) !== 0 ? 1 : 0,
+          team,
         },
-        group: makeSoldier((r.flags & RF_TEAM) !== 0 ? 1 : 0, nameOf(r.idx)),
+        group: makeSoldier(team, nameOf(r.idx)),
         buffer: [],
         lastFlags: 0,
         lastProt: false,
+        lastStepIndex: -1,
+        stepPhase: 0,
+        createdAt: performance.now(),
       };
       remotes.set(r.idx, rp);
+      attachExternalSoldier(rp); // swaps in the animated model when ready
     }
     const prevFlags = rp.lastFlags;
     const wasNew = rp.buffer.length === 0;
@@ -1579,7 +1877,7 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
     // Death transition: drop a ragdoll where viewers last saw them standing
     // (the server has already parked the body at spawn).
     if (!wasNew && (prevFlags & RF_DEAD) === 0 && (r.flags & RF_DEAD) !== 0) {
-      spawnRagdoll(rp.group.position, rp.group.rotation.y - Math.PI, rp.info.team);
+      spawnCorpse(rp.group.position, rp.group.rotation.y, rp.info.team);
     }
   }
   for (const idx of remotes.keys()) {
@@ -1760,6 +2058,8 @@ let prevEyeX = 0;
 let prevEyeY = 0;
 let prevEyeZ = 0;
 let lastTickAt = 0;
+let selfWalkPhase = 0;
+let selfLastStepIndex = -1;
 
 // Runs on a steady timer, NOT inside requestAnimationFrame: when rendering
 // drops below the tick rate, inputs must still flow to the server at a smooth
@@ -1834,6 +2134,7 @@ function predictionTick(): void {
   });
   gw.world.step(1 / TICK_RATE);
   readChar(selfBody, predState);
+  stepSelfFootsteps(dead);
   if (reloadBefore === 0 && predState.reloadTicks > 0 && ammoBefore < 30) sounds.reload();
 
   history.push({ seq, cmd });
@@ -1843,6 +2144,372 @@ function predictionTick(): void {
   perf.predictMs += performance.now() - t0;
   perf.predictCalls++;
 }
+
+function stepSelfFootsteps(dead: boolean): void {
+  if (!predState || dead || !predState.onGround) {
+    selfLastStepIndex = -1;
+    return;
+  }
+  const speed = Math.hypot(predState.vx, predState.vz);
+  if (speed < 1.1) {
+    selfLastStepIndex = -1;
+    return;
+  }
+  selfWalkPhase += speed * (1 / TICK_RATE) * FOOTSTEP_CADENCE;
+  const stepIndex = Math.floor(selfWalkPhase / Math.PI);
+  if (stepIndex !== selfLastStepIndex) {
+    selfLastStepIndex = stepIndex;
+    sounds.footstep(predState.x, predState.y, predState.z, 0.4);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Optional Quaternius Toon Shooter models.
+
+interface ToonShooterManifest {
+  characters?: string[];
+  weapons?: string[];
+}
+
+interface CharacterTemplate {
+  scene: THREE.Group;
+  clips: THREE.AnimationClip[];
+}
+interface CharacterInstance {
+  root: THREE.Group;
+  mixer: THREE.AnimationMixer;
+  actions: Map<string, THREE.AnimationAction>;
+}
+// Per-instance animation state carried on each remote player / corpse.
+interface CharacterAnim {
+  mixer: THREE.AnimationMixer;
+  actions: Map<string, THREE.AnimationAction>;
+  base: string; // current looping locomotion clip
+  shootUntil: number; // ms timestamp; play the *_Shoot variant until then
+  jumpUntil: number; // ms timestamp; play the airborne clip until then
+  hitUntil: number; // ms timestamp; play the HitReact flinch until then
+}
+
+// Team 0 renders as the Soldier, team 1 as the Enemy — distinct silhouettes so
+// friend and foe read at a glance. Both share the kit's identical 17-clip rig.
+const characterTemplates: Array<CharacterTemplate | null> = [null, null];
+let externalWeaponTemplate: THREE.Group | null = null;
+let externalAssetsRequested = false;
+const EXTERNAL_CHARACTER_YAW = 0; // Quaternius characters face local +Z, like the blocky rig.
+const EXTERNAL_VIEW_WEAPON_YAW = -Math.PI / 2; // ak.gltf barrel runs down -X; turn it to the camera's -Z (forward).
+const CHARACTER_WEAPON_NODES = new Set([
+  "AK",
+  "GrenadeLauncher",
+  "Knife_1",
+  "Knife_2",
+  "Pistol",
+  "Revolver",
+  "Revolver_Small",
+  "RocketLauncher",
+  "ShortCannon",
+  "Shotgun",
+  "Shovel",
+  "SMG",
+  "Sniper",
+  "Sniper_2",
+]);
+
+function loadExternalVisualAssets(): void {
+  if (externalAssetsRequested) return;
+  externalAssetsRequested = true;
+  void fetch("/assets/vendor/quaternius-toon-shooter/manifest.json", { cache: "no-cache" })
+    .then((response) => (response.ok ? response.json() : null))
+    .then((manifest: ToonShooterManifest | null) => {
+      const urls = manifest?.characters ?? [];
+      const soldierUrl = urls.find((u) => /soldier/i.test(u)) ?? urls[0];
+      const enemyUrl = urls.find((u) => /enemy/i.test(u)) ?? soldierUrl;
+      // Load both characters + the weapon in parallel so the models are ready
+      // as soon as possible (the frame loop swaps each team in on arrival).
+      if (soldierUrl) {
+        void loadCharacterTemplate(soldierUrl)
+          .then((t) => {
+            characterTemplates[0] = t;
+            if (!enemyUrl || enemyUrl === soldierUrl) characterTemplates[1] ??= t;
+          })
+          .catch(() => {});
+      }
+      if (enemyUrl && enemyUrl !== soldierUrl) {
+        void loadCharacterTemplate(enemyUrl)
+          .then((t) => {
+            characterTemplates[1] = t;
+          })
+          .catch(() => {});
+      }
+      const weaponUrl = manifest?.weapons?.[0];
+      if (weaponUrl) {
+        void loadModel(weaponUrl)
+          .then(({ scene }) => {
+            externalWeaponTemplate = scene;
+            prepareExternalModel(externalWeaponTemplate, 0.42);
+            attachExternalViewWeapon();
+          })
+          .catch(() => {});
+      }
+    })
+    .catch(() => {});
+}
+
+async function loadModel(
+  url: string,
+): Promise<{ scene: THREE.Group; animations: THREE.AnimationClip[] }> {
+  const clean = url.split("?")[0].toLowerCase();
+  if (clean.endsWith(".glb") || clean.endsWith(".gltf")) {
+    const result = await new GLTFLoader().loadAsync(url);
+    return { scene: result.scene, animations: result.animations };
+  }
+  if (clean.endsWith(".fbx")) {
+    const obj = await new FBXLoader().loadAsync(url);
+    return { scene: obj, animations: obj.animations };
+  }
+  if (clean.endsWith(".obj")) {
+    return { scene: await new OBJLoader().loadAsync(url), animations: [] };
+  }
+  throw new Error(`Unsupported model format: ${url}`);
+}
+
+async function loadCharacterTemplate(url: string): Promise<CharacterTemplate> {
+  const { scene, animations } = await loadModel(url);
+  prepareExternalCharacterModel(scene);
+  return { scene, clips: animations };
+}
+
+function prepareExternalCharacterModel(root: THREE.Group): void {
+  root.traverse((o) => {
+    if (CHARACTER_WEAPON_NODES.has(o.name) && o.name !== "AK") {
+      o.visible = false;
+    }
+  });
+  prepareExternalModel(root, 1.78, (o) => !hasNamedAncestor(o, CHARACTER_WEAPON_NODES));
+}
+
+function prepareExternalModel(
+  root: THREE.Group,
+  targetHeight: number,
+  includeInBounds: (object: THREE.Object3D) => boolean = () => true,
+): void {
+  root.updateWorldMatrix(true, true);
+  const box = boxFromObject(root, includeInBounds);
+  const size = box.getSize(new THREE.Vector3());
+  if (size.y > 0) root.scale.multiplyScalar(targetHeight / size.y);
+  root.updateWorldMatrix(true, true);
+  box.copy(boxFromObject(root, includeInBounds));
+  const center = box.getCenter(new THREE.Vector3());
+  root.position.x -= center.x;
+  root.position.y -= box.min.y;
+  root.position.z -= center.z;
+  root.traverse((o) => {
+    if (o instanceof THREE.Mesh) {
+      o.castShadow = true;
+      o.receiveShadow = true;
+    }
+  });
+}
+
+function boxFromObject(
+  root: THREE.Object3D,
+  includeInBounds: (object: THREE.Object3D) => boolean,
+): THREE.Box3 {
+  const box = new THREE.Box3();
+  const meshBox = new THREE.Box3();
+  root.traverse((o) => {
+    if (!(o instanceof THREE.Mesh) || !isVisibleInHierarchy(o) || !includeInBounds(o)) return;
+    if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+    if (!o.geometry.boundingBox) return;
+    meshBox.copy(o.geometry.boundingBox).applyMatrix4(o.matrixWorld);
+    box.union(meshBox);
+  });
+  return box.isEmpty() ? new THREE.Box3().setFromObject(root) : box;
+}
+
+function hasNamedAncestor(object: THREE.Object3D, names: ReadonlySet<string>): boolean {
+  let current: THREE.Object3D | null = object;
+  while (current) {
+    if (names.has(current.name)) return true;
+    current = current.parent;
+  }
+  return false;
+}
+
+function isVisibleInHierarchy(object: THREE.Object3D): boolean {
+  let current: THREE.Object3D | null = object;
+  while (current) {
+    if (!current.visible) return false;
+    current = current.parent;
+  }
+  return true;
+}
+
+function cloneMaterials(
+  material: THREE.Material | THREE.Material[],
+): THREE.Material | THREE.Material[] {
+  return Array.isArray(material) ? material.map((m) => m.clone()) : material.clone();
+}
+
+function visitMeshMaterials(
+  object: THREE.Object3D,
+  visit: (material: THREE.Material) => void,
+): void {
+  if (!(object instanceof THREE.Mesh)) return;
+  const materials = Array.isArray(object.material) ? object.material : [object.material];
+  for (const material of materials) visit(material);
+}
+
+function setEmissive(material: THREE.Material, color: number): void {
+  const candidate = material as THREE.Material & { emissive?: unknown };
+  if (candidate.emissive instanceof THREE.Color) {
+    candidate.emissive.setHex(color);
+  }
+}
+
+function cloneExternalModel(template: THREE.Group, team: number, accent = true): THREE.Group {
+  const clone = cloneSkeleton(template) as THREE.Group;
+  clone.traverse((o) => {
+    if (o instanceof THREE.Mesh) {
+      o.material = cloneMaterials(o.material);
+      o.castShadow = true;
+      o.receiveShadow = true;
+    }
+  });
+  if (accent) {
+    const badge = new THREE.Mesh(
+      new THREE.BoxGeometry(0.22, 0.16, 0.05),
+      new THREE.MeshLambertMaterial({ color: TEAM_COLORS[team] }),
+    );
+    badge.position.set(0.24, 1.22, 0.28);
+    badge.castShadow = true;
+    clone.add(badge);
+  }
+  return clone;
+}
+
+// Speeds the animator switches on. Normal ground move is 5.2 m/s (a Run); a
+// Walk only shows during accel/decel. Sprint (7.6 m/s) plays the Run clip
+// faster so sprinting reads differently from a normal run.
+const ANIM_MOVE_SPEED = 0.6;
+const ANIM_RUN_SPEED = 3.2;
+const ANIM_SPRINT_SPEED = 6.4;
+const FOOTSTEP_CADENCE = 1.7; // step-phase radians per metre (~2.8 steps/s at run)
+
+// Clone a character template into a fresh animated instance: its own skeleton,
+// per-instance materials (so flash/fade/spawn-ghost don't bleed across bodies),
+// and an AnimationMixer bound to the cloned rig.
+function instantiateCharacter(team: number): CharacterInstance | null {
+  const tpl = characterTemplates[team] ?? characterTemplates[0];
+  if (!tpl) return null;
+  const root = cloneSkeleton(tpl.scene) as THREE.Group;
+  root.traverse((o) => {
+    if (o instanceof THREE.Mesh) {
+      o.material = cloneMaterials(o.material);
+      o.castShadow = true;
+      o.receiveShadow = true;
+      o.frustumCulled = false; // skinned bounds drift off-origin; don't cull limbs
+    }
+  });
+  const mixer = new THREE.AnimationMixer(root);
+  const actions = new Map<string, THREE.AnimationAction>();
+  for (const clip of tpl.clips) actions.set(clip.name, mixer.clipAction(clip));
+  return { root, mixer, actions };
+}
+
+// Crossfade the looping locomotion clip. Shoot/jump/hit variants are full-body
+// clips selected the same way, so the whole body is one action at a time.
+// timeScale is refreshed every call (sprint speeds the Run clip up live).
+function playClip(anim: CharacterAnim, name: string, fade = 0.18, timeScale = 1): void {
+  const next = anim.actions.get(name);
+  if (!next) return;
+  next.setEffectiveTimeScale(timeScale);
+  if (anim.base === name) return;
+  const prev = anim.base ? anim.actions.get(anim.base) : undefined;
+  next.enabled = true;
+  next.setEffectiveWeight(1);
+  next.setLoop(THREE.LoopRepeat, Infinity);
+  next.reset().play();
+  if (prev && prev !== next) next.crossFadeFrom(prev, fade, true);
+  anim.base = name;
+}
+
+// Pick + drive the clip for a remote body from its interpolated motion, and
+// plant positional footsteps on the locomotion cycle.
+function updateCharacterAnim(
+  rp: RemotePlayer,
+  speed: number,
+  vy: number,
+  now: number,
+  dt: number,
+): void {
+  const anim = rp.anim;
+  if (!anim) return;
+  if (vy > 2.6) anim.jumpUntil = now + 360; // a hard upward step => they jumped
+  const airborne = now < anim.jumpUntil;
+  const hit = now < anim.hitUntil;
+  const shooting = now < anim.shootUntil;
+  const running = speed > ANIM_RUN_SPEED;
+  const sprinting = speed > ANIM_SPRINT_SPEED;
+  const moving = speed > ANIM_MOVE_SPEED;
+  let clip: string;
+  let timeScale = 1;
+  if (hit)
+    clip = "HitReact"; // a brief flinch when they take a bullet
+  else if (airborne) clip = "Jump_Idle";
+  else if (shooting) clip = running ? "Run_Shoot" : moving ? "Walk_Shoot" : "Idle_Shoot";
+  else if (running) {
+    clip = "Run";
+    timeScale = sprinting ? 1.3 : 1; // sprint = a faster run
+  } else if (moving) {
+    clip = "Walk";
+    timeScale = 1.15;
+  } else clip = "Idle";
+  playClip(anim, clip, 0.18, timeScale);
+  if (moving && !airborne) {
+    rp.stepPhase += speed * dt * FOOTSTEP_CADENCE;
+    const idx = Math.floor(rp.stepPhase / Math.PI);
+    if (idx !== rp.lastStepIndex) {
+      rp.lastStepIndex = idx;
+      sounds.footstepAt(rp.group.position.x, rp.group.position.y, rp.group.position.z, 0.34);
+    }
+  } else {
+    rp.lastStepIndex = -1;
+  }
+}
+
+function attachExternalSoldier(rp: RemotePlayer): void {
+  if (rp.anim) return;
+  const inst = instantiateCharacter(rp.info.team === 1 ? 1 : 0);
+  if (!inst) return;
+  const fallback = rp.group.userData.visualRoot as THREE.Object3D | undefined;
+  if (fallback) fallback.visible = false; // retire the blocky placeholder rig
+  inst.root.name = "externalCharacter";
+  inst.root.rotation.y = EXTERNAL_CHARACTER_YAW;
+  rp.group.add(inst.root);
+  rp.anim = {
+    mixer: inst.mixer,
+    actions: inst.actions,
+    base: "",
+    shootUntil: 0,
+    jumpUntil: 0,
+    hitUntil: 0,
+  };
+  playClip(rp.anim, "Idle", 0);
+}
+
+function attachExternalViewWeapon(): void {
+  if (!externalWeaponTemplate || viewModel.userData.externalAttached === true) return;
+  const fallback = viewModel.userData.fallbackRoot as THREE.Object3D | undefined;
+  if (fallback) fallback.visible = false;
+  const model = cloneExternalModel(externalWeaponTemplate, 0, false);
+  model.name = "externalWeapon";
+  model.position.set(0, -0.02, -0.12);
+  model.rotation.y = EXTERNAL_VIEW_WEAPON_YAW;
+  viewModel.add(model);
+  viewModel.userData.externalAttached = true;
+}
+
+loadExternalVisualAssets();
 
 // ---------------------------------------------------------------------------
 // Soldiers (blocky humanoids).
@@ -1870,6 +2537,7 @@ function part(w: number, h: number, d: number, color: number): THREE.Mesh {
 
 function makeSoldier(team: number, name: string): THREE.Group {
   const g = new THREE.Group();
+  const bodyRoot = new THREE.Group();
   const color = TEAM_COLORS[team];
 
   // Legs pivot at the hip so they can swing while walking.
@@ -1919,9 +2587,15 @@ function makeSoldier(team: number, name: string): THREE.Group {
   gun.position.set(0.2, -0.28, 0.35);
   headHolder.add(head, visor, helmet, brim, gun);
 
-  g.add(legL, legR, torso, vest, armL, armR, headHolder);
+  bodyRoot.add(legL, legR, torso, vest, armL, armR, headHolder);
+  g.add(bodyRoot);
   g.userData.limbs = { legL, legR, armL, armR };
   g.userData.walkPhase = 0;
+  g.userData.visualRoot = bodyRoot;
+  // Hidden by default: the GLTF model normally attaches before the soldier is
+  // ever seen. Only the grace fallback reveals this blocky rig (slow/failed
+  // model load) so the old procedural soldier never flashes at round start.
+  bodyRoot.visible = false;
 
   // Name tag.
   const canvas = document.createElement("canvas");
@@ -2040,129 +2714,83 @@ function renderFallingChunks(renderT: number): void {
 }
 
 // ---------------------------------------------------------------------------
-// Ragdolls: when a soldier dies, a cosmetic verlet ragdoll flops where they
-// fell and the body stays on the battlefield (capped FIFO, cleared with the
-// map on round reset). Pure visuals — the authoritative sim never sees it.
+// Corpses: when a soldier dies, a clone of their character model plays the
+// rig's "Death" clip where they fell, then the body lingers on the battlefield
+// (capped FIFO, cleared with the map on round reset). Pure visuals — the
+// authoritative sim never sees it.
 
-interface RagPart {
-  mesh: THREE.Mesh;
-  pos: THREE.Vector3;
-  prev: THREE.Vector3;
-  r: number;
-  spin: THREE.Vector3;
+interface Corpse {
+  group: THREE.Group;
+  mixer: THREE.AnimationMixer | null;
+  until: number;
+  materials: THREE.Material[]; // captured once for the fade-out
 }
 
-interface Ragdoll {
-  parts: RagPart[];
-  links: Array<[number, number, number]>; // part i, part j, rest length
-  activeUntil: number;
-}
-
-const ragdolls: Ragdoll[] = [];
-const corpses: Array<{ group: THREE.Group; until: number }> = [];
+const corpses: Corpse[] = [];
 const CORPSE_CAP = 18;
-const CORPSE_TTL_MS = 50_000; // bodies linger, then quietly leave
+const CORPSE_TTL_MS = 50_000; // bodies linger, then fade away
+const CORPSE_FADE_MS = 1500;
 
-function spawnRagdoll(at: THREE.Vector3, yaw: number, team: number): void {
-  const color = TEAM_COLORS[team];
+function spawnCorpse(at: THREE.Vector3, yaw: number, team: number): void {
   const group = new THREE.Group();
+  group.position.set(at.x, at.y, at.z);
+  group.rotation.y = yaw;
+  let mixer: THREE.AnimationMixer | null = null;
+  const inst = instantiateCharacter(team);
+  if (inst) {
+    inst.root.rotation.y = EXTERNAL_CHARACTER_YAW;
+    group.add(inst.root);
+    mixer = inst.mixer;
+    const death = inst.actions.get("Death");
+    if (death) {
+      death.setLoop(THREE.LoopOnce, 1);
+      death.clampWhenFinished = true; // hold the last frame: a body on the ground
+      death.reset().play();
+    }
+  } else {
+    group.add(makeFallbackCorpse(team)); // models still loading: a slumped box
+  }
+  const materials: THREE.Material[] = [];
+  group.traverse((o) =>
+    visitMeshMaterials(o, (m) => {
+      if (!materials.includes(m)) materials.push(m);
+    }),
+  );
   mapGroup.add(group);
-  const parts: RagPart[] = [];
-  const cy = Math.cos(yaw);
-  const sy = Math.sin(yaw);
-  const add = (w: number, h: number, d: number, c: number, ox: number, oy: number): void => {
-    const mesh = part(w, h, d, c);
-    group.add(mesh);
-    const pos = new THREE.Vector3(at.x + ox * cy, at.y + oy, at.z - ox * sy);
-    const kick = new THREE.Vector3(
-      (Math.random() - 0.5) * 2.4,
-      1.6 + Math.random() * 1.6,
-      (Math.random() - 0.5) * 2.4,
-    );
-    parts.push({
-      mesh,
-      pos,
-      prev: pos.clone().addScaledVector(kick, -1 / 30),
-      r: Math.max(w, h, d) / 2,
-      spin: new THREE.Vector3(Math.random() * 6 - 3, Math.random() * 6 - 3, 0),
-    });
-  };
-  add(0.3, 0.3, 0.3, SOLDIER.skin, 0, 1.45); // head
-  add(0.5, 0.55, 0.32, color, 0, 1.0); // torso (vest reads as the body)
-  add(0.14, 0.46, 0.16, SOLDIER.fatigue, -0.36, 1.05); // arms
-  add(0.14, 0.46, 0.16, SOLDIER.fatigue, 0.36, 1.05);
-  add(0.18, 0.6, 0.23, SOLDIER.pants, -0.13, 0.42); // legs
-  add(0.18, 0.6, 0.23, SOLDIER.pants, 0.13, 0.42);
-  const links: Array<[number, number, number]> = [];
-  const link = (i: number, j: number): void => {
-    links.push([i, j, parts[i].pos.distanceTo(parts[j].pos)]);
-  };
-  link(0, 1); // head-torso
-  link(1, 2);
-  link(1, 3); // arms
-  link(1, 4);
-  link(1, 5); // legs
-  link(4, 5); // knees apart
-  ragdolls.push({ parts, links, activeUntil: performance.now() + 2600 });
-  corpses.push({ group, until: performance.now() + CORPSE_TTL_MS });
+  corpses.push({ group, mixer, until: performance.now() + CORPSE_TTL_MS, materials });
   if (corpses.length > CORPSE_CAP) {
     const old = corpses.shift()!;
+    old.mixer?.stopAllAction();
     old.group.parent?.remove(old.group);
   }
 }
 
-function stepRagdolls(dt: number): void {
+function makeFallbackCorpse(team: number): THREE.Group {
+  const g = new THREE.Group();
+  const torso = part(0.5, 0.3, 0.55, TEAM_COLORS[team]);
+  torso.position.y = 0.18;
+  const head = part(0.3, 0.3, 0.3, SOLDIER.skin);
+  head.position.set(0, 0.2, 0.42);
+  g.add(torso, head);
+  return g;
+}
+
+function stepCorpses(dt: number): void {
   const now = performance.now();
-  const h = Math.min(dt, 0.033);
   while (corpses.length > 0 && now > corpses[0].until) {
     const old = corpses.shift()!;
+    old.mixer?.stopAllAction();
     old.group.parent?.remove(old.group);
   }
-  for (let i = ragdolls.length - 1; i >= 0; i--) {
-    const r = ragdolls[i];
-    if (now > r.activeUntil) {
-      ragdolls.splice(i, 1); // meshes stay — the corpse remains
-      continue;
-    }
-    for (const p of r.parts) {
-      const vx = (p.pos.x - p.prev.x) * 0.985;
-      const vy = (p.pos.y - p.prev.y) * 0.985 - 16 * h * h;
-      const vz = (p.pos.z - p.prev.z) * 0.985;
-      p.prev.copy(p.pos);
-      p.pos.x += vx;
-      p.pos.y += vy;
-      p.pos.z += vz;
-      const ground = heightAt(p.pos.x, p.pos.z) + p.r * 0.6;
-      if (p.pos.y < ground) {
-        p.pos.y = ground;
-        // Ground friction: bleed horizontal velocity hard on contact.
-        p.prev.x = p.pos.x - vx * 0.4;
-        p.prev.z = p.pos.z - vz * 0.4;
-        p.spin.multiplyScalar(0.82);
+  for (const c of corpses) {
+    c.mixer?.update(dt); // advance the Death clip (clamps on its last frame)
+    const remaining = c.until - now;
+    if (remaining < CORPSE_FADE_MS) {
+      const k = Math.max(0, remaining / CORPSE_FADE_MS);
+      for (const m of c.materials) {
+        m.transparent = true;
+        m.opacity = k;
       }
-    }
-    for (let it = 0; it < 2; it++) {
-      for (const [a, b, rest] of r.links) {
-        const pa = r.parts[a].pos;
-        const pb = r.parts[b].pos;
-        const dx = pb.x - pa.x;
-        const dy = pb.y - pa.y;
-        const dz = pb.z - pa.z;
-        const d = Math.hypot(dx, dy, dz) || 1;
-        const corr = ((d - rest) / d) * 0.5;
-        pa.x += dx * corr;
-        pa.y += dy * corr;
-        pa.z += dz * corr;
-        pb.x -= dx * corr;
-        pb.y -= dy * corr;
-        pb.z -= dz * corr;
-      }
-    }
-    for (const p of r.parts) {
-      p.mesh.position.copy(p.pos);
-      p.mesh.rotation.x += p.spin.x * h;
-      p.mesh.rotation.z += p.spin.y * h;
-      p.spin.multiplyScalar(1 - h * 1.2);
     }
   }
 }
@@ -2173,15 +2801,11 @@ function flashRemote(idx: number): void {
   const rp = remotes.get(idx);
   if (!rp) return;
   rp.group.traverse((o) => {
-    if (o instanceof THREE.Mesh && o.material instanceof THREE.MeshLambertMaterial) {
-      o.material.emissive.setHex(0xa01010);
-    }
+    visitMeshMaterials(o, (material) => setEmissive(material, 0xa01010));
   });
   setTimeout(() => {
     rp.group.traverse((o) => {
-      if (o instanceof THREE.Mesh && o.material instanceof THREE.MeshLambertMaterial) {
-        o.material.emissive.setHex(0x000000);
-      }
+      visitMeshMaterials(o, (material) => setEmissive(material, 0x000000));
     });
   }, 130);
 }
@@ -2205,6 +2829,7 @@ function dropRemote(idx: number): void {
 
 const viewModel = new THREE.Group();
 {
+  const fallbackRoot = new THREE.Group();
   const dark = new THREE.MeshLambertMaterial({ color: 0x23262b });
   const wood = new THREE.MeshLambertMaterial({ color: 0x4d4338 });
   const barrel = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.06, 0.55), dark);
@@ -2212,13 +2837,31 @@ const viewModel = new THREE.Group();
   const bodyM = new THREE.Mesh(new THREE.BoxGeometry(0.07, 0.12, 0.3), wood);
   const grip = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.14, 0.07), wood);
   grip.position.set(0, -0.11, 0.08);
-  viewModel.add(barrel, bodyM, grip);
-  viewModel.position.set(0.24, -0.22, -0.45);
+  fallbackRoot.add(barrel, bodyM, grip);
+  viewModel.add(fallbackRoot);
+  viewModel.userData.fallbackRoot = fallbackRoot;
+  viewModel.position.set(0.2, -0.3, -0.34);
   camera.add(viewModel);
+  attachExternalViewWeapon();
 }
 scene.add(camera);
+
+// Barrel tip of the AK in view-model space (used as the tracer origin). The AK
+// muzzle sits at the model's -X end which the view-weapon yaw turns onto -Z.
+const MUZZLE_LOCAL = new THREE.Vector3(0, 0.12, -0.74);
 let recoil = 0;
 let meleeSwing = 0;
+let viewBobPhase = 0; // accumulates while moving; drives the weapon bob
+let sprintBlend = 0; // 0..1 eased sprint amount for the view-model sway
+let flinch = 0; // 0..1 decaying camera jolt when hit
+let flinchPitch = 0;
+let flinchYaw = 0;
+
+function kickFlinch(): void {
+  flinch = 1;
+  flinchPitch = 0.6 + Math.random() * 0.5; // jolt the view up
+  flinchYaw = (Math.random() - 0.5) * 1.2; // and off to one side
+}
 
 const buildPreview = new THREE.Mesh(
   new THREE.BoxGeometry(1, 1, 1),
@@ -2292,7 +2935,7 @@ function spawnExplosion(at: THREE.Vector3): void {
   ball.userData.grow = true;
   addEffect(ball, 240);
   spawnDebris(at, 10);
-  sounds.explosion();
+  sounds.explosionAt(at);
   if (predState) {
     const d = at.distanceTo(new THREE.Vector3(predState.x, predState.y + 1, predState.z));
     if (d < 12) shake = Math.min(1, shake + (1 - d / 12));
@@ -2409,6 +3052,9 @@ function processEvents(list: GameEvent[]): void {
           const from = muzzleOf(e.a);
           if (from) {
             spawnTracer(from, at);
+            sounds.shotAt(from);
+            const shooterRp = remotes.get(e.a);
+            if (shooterRp?.anim) shooterRp.anim.shootUntil = performance.now() + 280;
             // Decal where the remote shot landed (skip max-range whiffs):
             // re-cast locally to learn what surface the endpoint sits on.
             const d = at.clone().sub(from);
@@ -2431,10 +3077,6 @@ function processEvents(list: GameEvent[]): void {
         } else {
           dbgMyTracers++;
         }
-        if (e.a !== selfIdx && predState) {
-          const d = at.distanceTo(new THREE.Vector3(predState.x, predState.y, predState.z));
-          sounds.shotFar(d);
-        }
         break;
       }
       case EV_HIT_PLAYER: {
@@ -2443,11 +3085,17 @@ function processEvents(list: GameEvent[]): void {
         const shooter = (e.a >> 4) & 0xf;
         spawnSpark(at, 0xff4a3a);
         flashRemote(victim); // the victim visibly flinches red
+        const vrp = remotes.get(victim);
+        if (vrp?.anim) vrp.anim.hitUntil = performance.now() + 320; // HitReact flinch
         if (victim === selfIdx) {
           el.vignette.style.opacity = "1";
           setTimeout(() => (el.vignette.style.opacity = "0"), 180);
           sounds.hurt();
-        } else if (shooter === selfIdx) {
+          kickFlinch(); // jolt the view when you take a round
+        } else {
+          sounds.hurtAt(at);
+        }
+        if (shooter === selfIdx && victim !== selfIdx) {
           // Our hit, attributed directly by the server — no heuristics.
           myHits++;
           el.hitmark.style.opacity = "1";
@@ -2456,7 +3104,10 @@ function processEvents(list: GameEvent[]): void {
             el.hitmark.style.opacity = "0";
             el.hitmark.style.transform = "translate(-50%,-50%) rotate(45deg) scale(1)";
           }, 240);
-          sounds.hitmarker();
+          // Mirror the server's head check off the impact height for the cue.
+          const headshot = vrp ? at.y - vrp.group.position.y >= HEADSHOT_HEIGHT : false;
+          if (headshot) sounds.headshot();
+          else sounds.bulletHit();
         }
         break;
       }
@@ -2465,9 +3116,11 @@ function processEvents(list: GameEvent[]): void {
         break;
       case EV_PANEL_HIT:
         spawnSpark(at);
+        sounds.hurtAt(at);
         break;
       case EV_MELEE:
         spawnSpark(at, 0xcccccc);
+        sounds.meleeAt(at);
         break;
     }
   }
@@ -2480,7 +3133,7 @@ const _muzzle = new THREE.Vector3();
 // World-space barrel tip of the first-person rifle — tracers leave the gun,
 // not the middle of the screen.
 function muzzleWorld(): THREE.Vector3 {
-  _muzzle.set(0, 0.01, -0.64);
+  _muzzle.set(MUZZLE_LOCAL.x, MUZZLE_LOCAL.y, MUZZLE_LOCAL.z);
   viewModel.updateWorldMatrix(true, false);
   return viewModel.localToWorld(_muzzle);
 }
@@ -2509,20 +3162,44 @@ function eyeOf(idx: number): THREE.Vector3 | null {
   return new THREE.Vector3(last.x, last.y + EYE_HEIGHT, last.z);
 }
 
-// --- Grenade views.
+// --- Grenade views (Kenney frag model; sphere fallback until it loads).
 
-const grenadeViews = new Map<number, THREE.Mesh>();
+const GRENADE_MODEL_URL = "/assets/vendor/kenney/grenade.glb";
+let grenadeTemplate: THREE.Group | null = null;
+const grenadeViews = new Map<number, THREE.Object3D>();
+
+void loadModel(GRENADE_MODEL_URL)
+  .then(({ scene }) => {
+    // Size to the physics grenade and recentre on its bbox so it tumbles about
+    // its middle (the model's pivot is at its base).
+    scene.updateWorldMatrix(true, true);
+    const size = new THREE.Box3().setFromObject(scene).getSize(new THREE.Vector3());
+    scene.scale.multiplyScalar(0.3 / (Math.max(size.x, size.y, size.z) || 1));
+    scene.updateWorldMatrix(true, true);
+    scene.position.sub(new THREE.Box3().setFromObject(scene).getCenter(new THREE.Vector3()));
+    scene.traverse((o) => {
+      if (o instanceof THREE.Mesh) o.castShadow = true;
+    });
+    grenadeTemplate = scene;
+  })
+  .catch(() => {});
+
+function makeGrenadeView(): THREE.Object3D {
+  if (grenadeTemplate) return grenadeTemplate.clone();
+  const mesh = new THREE.Mesh(FX_GEO.sphere, grenadeMat);
+  mesh.scale.setScalar(0.14);
+  mesh.castShadow = true;
+  return mesh;
+}
 
 function updateGrenadeViews(snap: Snapshot): void {
   const seen = new Set<number>();
   for (const e of snap.entities) {
     seen.add(e.id);
     if (!grenadeViews.has(e.id)) {
-      const mesh = new THREE.Mesh(FX_GEO.sphere, grenadeMat);
-      mesh.scale.setScalar(0.14);
-      mesh.castShadow = true;
-      scene.add(mesh);
-      grenadeViews.set(e.id, mesh);
+      const view = makeGrenadeView();
+      scene.add(view);
+      grenadeViews.set(e.id, view);
     }
   }
   for (const [id, mesh] of grenadeViews) {
@@ -2546,9 +3223,10 @@ function frame(): void {
   errOffset.multiplyScalar(Math.exp(-dt * 12));
   recoil *= Math.exp(-dt * 10);
   shake *= Math.exp(-dt * 5);
+  flinch *= Math.exp(-dt * 9);
   if (meleeSwing > 0) meleeSwing = Math.max(0, meleeSwing - dt * 4);
   stepClouds(dt);
-  stepRagdolls(dt);
+  stepCorpses(dt);
   stepFlags(now);
   (grassMat.uniforms.uTime as { value: number }).value = now / 1000;
 
@@ -2566,25 +3244,48 @@ function frame(): void {
       iz + errOffset.z,
     );
     camera.rotation.order = "YXZ";
-    camera.rotation.y = yaw + Math.PI;
-    camera.rotation.x = pitch + recoil * 0.045;
+    camera.rotation.y = yaw + Math.PI + flinch * flinchYaw * 0.05;
+    camera.rotation.x = pitch + recoil * 0.045 + flinch * flinchPitch * 0.06;
     camera.rotation.z = 0;
+    updateAudioListener();
   }
+
+  // First-person weapon feel: a rest pose plus recoil, melee, a walk/sprint
+  // bob, a reload dip, and a distinct sprint sway (gun lowered and canted).
+  const grounded = !!predState?.onGround && (selfStatus & SS_DEAD) === 0;
+  const localSpeed = predState ? Math.hypot(predState.vx, predState.vz) : 0;
+  const movingNow = grounded && localSpeed > ANIM_MOVE_SPEED;
+  const sprintingNow = grounded && localSpeed > ANIM_SPRINT_SPEED;
+  sprintBlend += ((sprintingNow ? 1 : 0) - sprintBlend) * Math.min(1, dt * 9);
+  viewBobPhase += movingNow ? dt * (sprintingNow ? 13 : 8.5) : 0;
+  const bobAmt = movingNow ? Math.min(1, localSpeed / 5.2) : 0;
+  const bobX = Math.sin(viewBobPhase) * 0.013 * bobAmt;
+  const bobY = -Math.abs(Math.cos(viewBobPhase)) * 0.015 * bobAmt;
+  const reloadProg =
+    predState && predState.reloadTicks > 0 ? predState.reloadTicks / RELOAD_TICKS : 0;
+  const dip = reloadProg > 0 ? Math.sin((1 - reloadProg) * Math.PI) : 0; // 0→1→0 over reload
+  const sway = sprintBlend;
   viewModel.position.set(
-    0.24,
-    -0.22 - meleeSwing * 0.12,
-    -0.45 + recoil * 0.06 + meleeSwing * -0.25,
+    0.2 + bobX + sway * 0.05,
+    -0.3 - meleeSwing * 0.12 + bobY - dip * 0.14 - sway * 0.07,
+    -0.34 + recoil * 0.06 + meleeSwing * -0.25 - dip * 0.05 + sway * 0.06,
   );
   // Converge the barrel on the crosshair: aim at a point down the view ray
   // (camera space) so the gun points where bullets land, instead of sitting
-  // parallel to the view axis.
+  // parallel to the view axis. Recoil/melee/reload/sprint layer on top.
   {
     const dx = -viewModel.position.x;
     const dy = -viewModel.position.y - 0.01;
     const dz = VIEWMODEL_CONVERGE_Z - viewModel.position.z;
     viewModel.rotation.order = "YXZ";
-    viewModel.rotation.y = Math.atan2(-dx, -dz);
-    viewModel.rotation.x = Math.atan2(dy, Math.hypot(dx, dz)) + recoil * 0.25 + meleeSwing * 0.9;
+    viewModel.rotation.y = Math.atan2(-dx, -dz) + sway * 0.5 + bobX * 0.6;
+    viewModel.rotation.x =
+      Math.atan2(dy, Math.hypot(dx, dz)) +
+      recoil * 0.25 +
+      meleeSwing * 0.9 -
+      dip * 0.55 - // reload: drop the muzzle
+      sway * 0.3; // sprint: lower the muzzle, not raise it
+    viewModel.rotation.z = sway * 0.35;
   }
   viewModel.visible = (selfStatus & SS_DEAD) === 0;
 
@@ -2611,6 +3312,14 @@ function frame(): void {
   const renderT = now - interpDelayMs;
   renderFallingChunks(renderT);
   for (const rp of remotes.values()) {
+    // Upgrade to the GLTF model the instant the templates finish loading; only
+    // reveal the blocky fallback if the model is still missing after a grace
+    // (slow/failed load) — so the old procedural soldier never flashes at start.
+    if (!rp.anim) {
+      attachExternalSoldier(rp);
+      const fallback = rp.group.userData.visualRoot as THREE.Object3D | undefined;
+      if (fallback && !rp.anim && now - rp.createdAt > 3000) fallback.visible = true;
+    }
     if (rp.buffer.length === 0) continue;
     const buf = rp.buffer;
     let a = buf[0];
@@ -2626,47 +3335,80 @@ function frame(): void {
     const u = Math.max(0, Math.min(1, (renderT - a.t) / span2));
     rp.group.position.set(a.x + (b.x - a.x) * u, a.y + (b.y - a.y) * u, a.z + (b.z - a.z) * u);
     const dyaw = shortestArc(a.yaw, b.yaw);
-    rp.group.rotation.y = a.yaw + dyaw * u + Math.PI;
-    const head = rp.group.getObjectByName("head");
-    if (head) head.rotation.x = -(a.pitch + (b.pitch - a.pitch) * u);
-    // Walk cycle: legs and arms swing opposite, scaled by ground speed.
+    rp.group.rotation.y = a.yaw + dyaw * u;
     const speed = (Math.hypot(b.x - a.x, b.z - a.z) / span2) * 1000;
-    const limbs = rp.group.userData.limbs as {
-      legL: THREE.Group;
-      legR: THREE.Group;
-      armL: THREE.Group;
-      armR: THREE.Group;
-    };
-    const stride = Math.min(1, speed / 5);
-    rp.group.userData.walkPhase = (rp.group.userData.walkPhase as number) + speed * dt * 2.6;
-    const swing = Math.sin(rp.group.userData.walkPhase as number) * 0.62 * stride;
-    limbs.legL.rotation.x = swing;
-    limbs.legR.rotation.x = -swing;
-    limbs.armL.rotation.x = -swing * 0.7;
-    limbs.armR.rotation.x = swing * 0.7;
+    const vy = ((b.y - a.y) / span2) * 1000;
     const dead = (rp.lastFlags & RF_DEAD) !== 0;
     rp.group.visible = !dead;
+    if (!dead) {
+      if (rp.anim) {
+        // Real Quaternius rig: a clip state machine drives the whole body.
+        updateCharacterAnim(rp, speed, vy, now, dt);
+        rp.anim.mixer.update(dt);
+      } else {
+        // Blocky fallback rig: procedural walk cycle until the model loads.
+        const head = rp.group.getObjectByName("head");
+        if (head) head.rotation.x = -(a.pitch + (b.pitch - a.pitch) * u);
+        const limbs = rp.group.userData.limbs as {
+          legL: THREE.Group;
+          legR: THREE.Group;
+          armL: THREE.Group;
+          armR: THREE.Group;
+        };
+        const stride = Math.min(1, speed / 5);
+        rp.group.userData.walkPhase = (rp.group.userData.walkPhase as number) + speed * dt * 2.6;
+        const swing = Math.sin(rp.group.userData.walkPhase as number) * 0.62 * stride;
+        limbs.legL.rotation.x = swing;
+        limbs.legR.rotation.x = -swing;
+        limbs.armL.rotation.x = -swing * 0.7;
+        limbs.armR.rotation.x = swing * 0.7;
+        const stepIndex = Math.floor((rp.group.userData.walkPhase as number) / Math.PI);
+        if (stride > 0.15 && stepIndex !== rp.lastStepIndex) {
+          rp.lastStepIndex = stepIndex;
+          sounds.footstepAt(rp.group.position.x, rp.group.position.y, rp.group.position.z, 0.18);
+        } else if (stride <= 0.15) {
+          rp.lastStepIndex = -1;
+        }
+      }
+    }
     // Spawn-protection ghosting: only touch materials when the state flips,
     // not every frame for every soldier.
     const prot = (rp.lastFlags & RF_PROTECTED) !== 0;
     if (prot !== rp.lastProt) {
       rp.lastProt = prot;
       rp.group.traverse((o) => {
-        if (o instanceof THREE.Mesh && o.material instanceof THREE.MeshLambertMaterial) {
-          o.material.transparent = prot;
-          o.material.opacity = prot ? 0.55 : 1;
-        }
+        visitMeshMaterials(o, (material) => {
+          material.transparent = prot;
+          material.opacity = prot ? 0.55 : 1;
+        });
       });
     }
   }
 
-  // Grenades render from the mirror world bodies.
+  // Grenades render from the mirror world bodies; a local minimum in height
+  // (it was falling, now rising) is a bounce — clink it, scaled by drop speed.
   if (gw) {
     for (const [id, mesh] of grenadeViews) {
       const body = gw.grenades.get(id);
       if (body) {
         const pos = body.translation();
         const rot = body.rotation();
+        const ud = mesh.userData;
+        const prevY = ud.prevY as number | undefined;
+        if (prevY !== undefined) {
+          const vy = pos.y - prevY;
+          if (vy < -0.015) {
+            ud.falling = true;
+            ud.fallSpeed = Math.max((ud.fallSpeed as number) ?? 0, -vy);
+          } else if (ud.falling === true && vy > 0.008) {
+            ud.falling = false;
+            const speed = (ud.fallSpeed as number) ?? 0;
+            ud.fallSpeed = 0;
+            if (speed > 0.03)
+              sounds.grenadeBounceAt(new THREE.Vector3(pos.x, pos.y, pos.z), speed * 6);
+          }
+        }
+        ud.prevY = pos.y;
         mesh.position.set(pos.x, pos.y, pos.z);
         mesh.quaternion.set(rot.x, rot.y, rot.z, rot.w);
       }
@@ -2839,6 +3581,18 @@ declare global {
       fallenCount(): number;
       corpseCount(): number;
       joltFree(): number;
+      soundFamilies(): Record<string, number>;
+      soundLog(): string[];
+      externalAssets(): {
+        soldierLoaded: boolean;
+        enemyLoaded: boolean;
+        clipCount: number;
+        weaponLoaded: boolean;
+        remoteAnimatedCount: number;
+        corpseCount: number;
+        viewWeaponLoaded: boolean;
+      };
+      forceAudio(): void;
       perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
       drive(over: Partial<Omit<InputCmd, "seq">> & { trackIdx?: number }, ticks: number): void;
@@ -2887,6 +3641,21 @@ window.__fps = {
   fallenCount: () => builtList.filter((p) => !p.broken && p.material !== "metal").length,
   corpseCount: () => corpses.length,
   joltFree: () => joltFreeMemory(),
+  soundFamilies: () =>
+    Object.fromEntries(
+      [...soundBuffers.entries()].map(([family, buffers]) => [family, buffers.length]),
+    ),
+  soundLog: () => [...soundLog],
+  externalAssets: () => ({
+    soldierLoaded: characterTemplates[0] !== null,
+    enemyLoaded: characterTemplates[1] !== null,
+    clipCount: characterTemplates[0]?.clips.length ?? 0,
+    weaponLoaded: externalWeaponTemplate !== null,
+    remoteAnimatedCount: [...remotes.values()].filter((rp) => rp.anim !== undefined).length,
+    corpseCount: corpses.length,
+    viewWeaponLoaded: viewModel.userData.externalAttached === true,
+  }),
+  forceAudio: () => ensureAudio(),
   perf: () => ({
     fps: perf.fps,
     avgFrameMs: perf.avgFrameMs,

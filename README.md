@@ -1,8 +1,8 @@
 # Breachpoint
 
 A BattleBit-inspired multiplayer FPS built with [three.js](https://threejs.org) on the
-[Minion](https://minion.game) platform, with [Jolt Physics](https://github.com/jrouwe/JoltPhysics)
-(WASM, cross-platform deterministic build, via the local [jolt-ts](../jolt-ts) wrapper) on
+[Snack](https://snack.game) platform, with [Jolt Physics](https://github.com/jrouwe/JoltPhysics)
+(WASM, cross-platform deterministic build, via the local [jolt-ts](../../jolt-ts) wrapper) on
 both client and server. Two teams of blocky soldiers fight team deathmatch on an arena
 where **the cover is the gameplay**: walls chip under gunfire, sledgehammers breach them,
 grenades blow buildings open — and you can deploy fresh cover of your own.
@@ -162,9 +162,9 @@ npm install
 npm run dev
 ```
 
-Open the Minion host shell at `http://127.0.0.1:3030/`. Each tab is its own guest, so
-two tabs are a 1v1 — plus the bots, who hold the rest of the line. (Ports: `MINION_DEV_PORT` / `MINION_CLIENT_PORT`; `npm run dev` goes
-through turbo which strips env vars — run `npx vite` and `npx minion dev` directly for
+Open the Snack host shell at `http://127.0.0.1:3030/`. Each tab is its own guest, so
+two tabs are a 1v1 — plus the bots, who hold the rest of the line. (Ports: `SNACK_DEV_PORT` / `SNACK_CLIENT_PORT`; `npm run dev` goes
+through turbo which strips env vars — run `npx vite` and `npx snack dev` directly for
 custom ports.)
 
 ## Test

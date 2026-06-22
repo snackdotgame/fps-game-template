@@ -1,0 +1,32 @@
+{
+  "$schema": "./node_modules/@snack-game/cli/snack.schema.json",
+  "version": 1,
+  "assets": {
+    "directory": "assets"
+  },
+  "server": {
+    "entry": "src/server.ts"
+  },
+  "client": {
+    "entry": "src/client.ts"
+  },
+  "game": {
+    "maxPlayers": {
+      "lowerLimit": 1,
+      "upperLimit": 16,
+      "default": 16
+    },
+    "serverConfigSchema": {
+      "botFill": {
+        "type": "number",
+        "default": 12,
+        "label": "Bot count",
+        "description": "Target player count filled by bots. Set to 0 to run without bots."
+      }
+    },
+    "name": "Breachpoint",
+    "visibility": "private",
+    "slug": "breachpoint",
+    "id": "dfcbff67-a970-4e0e-b355-557d9770b1a4"
+  }
+}

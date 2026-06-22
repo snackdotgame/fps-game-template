@@ -7,7 +7,7 @@
 // impacts, explosions) ride a ring of recent events inside the idempotent
 // snapshots.
 
-import { type Connection, server } from "minion:server";
+import { type Connection, server } from "snack:server";
 import {
   BOT_FILL,
   SANDBOX,
@@ -16,7 +16,7 @@ import {
   ROUND_TICKS,
   TICK_MS,
 } from "./shared/constants.js";
-import { craterList, MAP, ZONES } from "./shared/map.js";
+import { craterList, heightAt, MAP, ZONES } from "./shared/map.js";
 import { type PlayerInfo, type ServerMsg } from "./shared/messages.js";
 import {
   decodeInputs,
@@ -36,27 +36,32 @@ import {
 } from "./shared/netCodec.js";
 import {
   aimDirection,
-  type Body,
   eyePosition,
   type InputCmd,
   joltFreeMemory,
   joltModule,
   readChar,
 } from "./shared/physics.js";
+import { BotNav, initBotNav, type BotNavPoint } from "./server/botNav.js";
 import { GameSim, type SimPlayer } from "./shared/sim.js";
 
-// The Minion runtime provides console/performance; the DOM-less lib doesn't type them.
+// The Snack runtime provides console/performance; the DOM-less lib doesn't type them.
 declare const console: { log(...args: unknown[]): void };
 
 const MAX_BUFFERED_INPUTS = 90;
 const PARK_TTL_MS = 5 * 60 * 1000;
+const BOT_DECISION_INTERVAL = 6;
+const BOT_TARGET_VISIBILITY_TICKS = BOT_DECISION_INTERVAL + 2;
+const BOT_STUCK_CHECK_INTERVAL = 45;
 
 // A bot's standing decisions; null for humans.
 interface BotBrain {
   wanderX: number;
+  wanderY: number;
   wanderZ: number;
   repathAtTick: number;
   targetIdx: number; // -1 when no enemy in sight
+  targetVisibleUntilTick: number;
   burstUntil: number;
   pauseUntil: number;
   aimYaw: number;
@@ -67,6 +72,23 @@ interface BotBrain {
   stuckZ: number;
   stuckCheckAt: number;
   grenadeReadyAt: number;
+  path: BotNavPoint[];
+  pathIdx: number;
+  pathTargetX: number;
+  pathTargetY: number;
+  pathTargetZ: number;
+  pathRefreshAtTick: number;
+  pathVersion: number;
+  desiredYaw: number;
+  desiredPitch: number;
+  moveX: number;
+  moveZ: number;
+  fireIntent: boolean;
+  meleeIntent: boolean;
+  jumpIntent: boolean;
+  grenadeIntent: boolean;
+  reloadIntent: boolean;
+  sprintIntent: boolean;
 }
 
 // Connection-side wrapper around a sim slot: identity and input buffering
@@ -96,6 +118,8 @@ interface Parked {
 
 let sim: GameSim;
 let mapEpoch = 1;
+let configuredBotFill = BOT_FILL;
+let botNav: BotNav | null = null;
 
 const players = new Map<string, Player>(); // by connection id, or "bot:<n>"
 const parked = new Map<string, Parked>();
@@ -106,11 +130,31 @@ function simOf(p: Player): SimPlayer {
   return sim.player(p.slot)!;
 }
 
+function readBotFillConfig(): number {
+  const raw = server.config.botFill;
+  const value =
+    typeof raw === "number"
+      ? raw
+      : typeof raw === "string"
+        ? Number(raw)
+        : raw === false
+          ? 0
+          : BOT_FILL;
+  if (!Number.isFinite(value)) return BOT_FILL;
+  return Math.max(0, Math.min(MAX_PLAYERS, Math.round(value)));
+}
+
 export async function main() {
   await joltModule();
   sim = new GameSim(0xbeac4);
   await sim.init();
   sim.phaseEndTick = ROUND_TICKS;
+  configuredBotFill = readBotFillConfig();
+  if (!SANDBOX && configuredBotFill > 0) {
+    await initBotNav();
+    botNav = new BotNav();
+    botNav.warm(sim);
+  }
 
   // Clients never send stream messages; a stream recv settling is the
   // shutdown signal (it rejects when the runtime stops this module).
@@ -217,14 +261,14 @@ function teamCounts(): [number, number] {
 // --- Bots: fill the lobby, leave one-for-one as humans join. -------------------
 
 function syncBots(): void {
-  if (SANDBOX) return;
+  if (SANDBOX || configuredBotFill <= 0) return;
   let humans = 0;
   let bots = 0;
   for (const p of players.values()) {
     if (p.bot) bots++;
     else humans++;
   }
-  const desired = Math.max(0, Math.min(BOT_FILL - humans, MAX_PLAYERS - humans));
+  const desired = Math.max(0, Math.min(configuredBotFill - humans, MAX_PLAYERS - humans));
   while (bots < desired) {
     addBot();
     bots++;
@@ -255,9 +299,11 @@ function addBot(): void {
     conn: null,
     bot: {
       wanderX: 0,
+      wanderY: sp.state.y,
       wanderZ: 0,
       repathAtTick: 0,
       targetIdx: -1,
+      targetVisibleUntilTick: 0,
       burstUntil: 0,
       pauseUntil: 0,
       aimYaw: 0,
@@ -266,8 +312,25 @@ function addBot(): void {
       strafeFlipAt: 0,
       stuckX: sp.state.x,
       stuckZ: sp.state.z,
-      stuckCheckAt: sim.tick + 45,
+      stuckCheckAt: initialBotStuckCheckTick(slot),
       grenadeReadyAt: sim.tick + 300,
+      path: [],
+      pathIdx: 0,
+      pathTargetX: Number.NaN,
+      pathTargetY: Number.NaN,
+      pathTargetZ: Number.NaN,
+      pathRefreshAtTick: 0,
+      pathVersion: 0,
+      desiredYaw: 0,
+      desiredPitch: 0,
+      moveX: 0,
+      moveZ: 0,
+      fireIntent: false,
+      meleeIntent: false,
+      jumpIntent: false,
+      grenadeIntent: false,
+      reloadIntent: false,
+      sprintIntent: false,
     },
     slot,
     userId: `bot:${serial}`,
@@ -291,10 +354,19 @@ function removeBot(key: string): void {
   broadcast({ type: "leave", idx: p.slot });
 }
 
-// One decision pass per tick. Bots play through the same controller and
-// weapon hooks as humans — their shots, grenades, and wall-breaching are the
-// real thing, just driven by a synthetic InputCmd.
+// Bots still emit one input per server tick, but expensive decisions are
+// sharded across slots. With 30 bots, this runs about five full brain updates
+// per tick and lets the rest reuse cached intent.
 function botThink(p: SimPlayer, b: BotBrain, lastSeq: number): InputCmd {
+  if (shouldUpdateBotDecision(p.idx)) updateBotDecision(p, b);
+  return makeBotInput(p, b, lastSeq);
+}
+
+function shouldUpdateBotDecision(slot: number): boolean {
+  return sim.tick % BOT_DECISION_INTERVAL === slot % BOT_DECISION_INTERVAL;
+}
+
+function updateBotDecision(p: SimPlayer, b: BotBrain): void {
   const tick = sim.tick;
   const rng = sim.rng;
   readChar(p.body, p.state);
@@ -302,21 +374,21 @@ function botThink(p: SimPlayer, b: BotBrain, lastSeq: number): InputCmd {
   const eye = eyePosition(s);
 
   // --- Acquire / validate a target (LoS checked with a real raycast). ---
-  if (tick % 5 === 0 || b.targetIdx >= 0) {
-    const current = b.targetIdx >= 0 ? sim.player(b.targetIdx) : null;
-    if (!current || current.dead || !hasLineOfSight(p, current)) {
-      b.targetIdx = -1;
-      if (tick % 5 === 0) {
-        let bestDist = 42;
-        for (const q of sim.players) {
-          if (!q || q.team === p.team || q.dead) continue;
-          readChar(q.body, q.state);
-          const d = Math.hypot(q.state.x - s.x, q.state.z - s.z);
-          if (d < bestDist && hasLineOfSight(p, q)) {
-            bestDist = d;
-            b.targetIdx = q.idx;
-          }
-        }
+  const current = b.targetIdx >= 0 ? sim.player(b.targetIdx) : null;
+  if (current && !current.dead && hasLineOfSight(p, current)) {
+    b.targetVisibleUntilTick = tick + BOT_TARGET_VISIBILITY_TICKS;
+  } else {
+    b.targetIdx = -1;
+    b.targetVisibleUntilTick = 0;
+    let bestDist = 42;
+    for (const q of sim.players) {
+      if (!q || q.team === p.team || q.dead) continue;
+      readChar(q.body, q.state);
+      const d = Math.hypot(q.state.x - s.x, q.state.z - s.z);
+      if (d < bestDist && hasLineOfSight(p, q)) {
+        bestDist = d;
+        b.targetIdx = q.idx;
+        b.targetVisibleUntilTick = tick + BOT_TARGET_VISIBILITY_TICKS;
       }
     }
   }
@@ -332,7 +404,8 @@ function botThink(p: SimPlayer, b: BotBrain, lastSeq: number): InputCmd {
   let desiredYaw = b.aimYaw;
   let desiredPitch = 0;
 
-  const target = b.targetIdx >= 0 ? sim.player(b.targetIdx) : null;
+  const target =
+    b.targetIdx >= 0 && tick <= b.targetVisibleUntilTick ? sim.player(b.targetIdx) : null;
   if (target && !target.dead) {
     const dx = target.state.x - s.x;
     const dz = target.state.z - s.z;
@@ -346,8 +419,7 @@ function botThink(p: SimPlayer, b: BotBrain, lastSeq: number): InputCmd {
       b.burstUntil = tick + 6 + Math.floor(rng() * 8);
       b.pauseUntil = b.burstUntil + 5 + Math.floor(rng() * 10);
     }
-    const aligned = Math.abs(shortestArc(b.aimYaw, desiredYaw)) < 0.07;
-    fire = aligned && tick < b.burstUntil;
+    fire = tick < b.burstUntil;
     // Strafe around the target, keeping medium range.
     if (tick >= b.strafeFlipAt) {
       b.strafeSign = rng() < 0.5 ? -1 : 1;
@@ -378,24 +450,36 @@ function botThink(p: SimPlayer, b: BotBrain, lastSeq: number): InputCmd {
       const targets = ZONES.filter((_, i) => sim.zones[i].owner !== p.team);
       if (targets.length > 0 && rng() < 0.7) {
         const t = targets[Math.floor(rng() * targets.length)];
-        b.wanderX = t.x + (rng() * 2 - 1) * 7;
-        b.wanderZ = t.z + (rng() * 2 - 1) * 7;
+        setBotDestination(
+          b,
+          t.x + (rng() * 2 - 1) * 7,
+          heightAt(t.x, t.z) + 0.15,
+          t.z + (rng() * 2 - 1) * 7,
+        );
       } else {
-        const half = MAP.size / 2 - 6;
-        b.wanderX = (rng() * 2 - 1) * half;
-        b.wanderZ = (rng() * 2 - 1) * half;
-        // Don't camp the enemy spawn zone — keep the fight in the field.
-        const enemySpawnZ = p.team === 0 ? 100 : -100;
-        if (Math.abs(b.wanderZ - enemySpawnZ) < 15 && Math.abs(b.wanderX) < 15) {
-          b.wanderZ = enemySpawnZ - Math.sign(enemySpawnZ) * (16 + rng() * 12);
+        const randomPoint = navForBots()?.randomPoint(sim, rng);
+        if (randomPoint && rng() < 0.65) {
+          setBotDestination(b, randomPoint[0], randomPoint[1], randomPoint[2]);
+        } else {
+          const half = MAP.size / 2 - 6;
+          let x = (rng() * 2 - 1) * half;
+          let z = (rng() * 2 - 1) * half;
+          // Don't camp the enemy spawn zone — keep the fight in the field.
+          const enemySpawnZ = p.team === 0 ? 100 : -100;
+          if (Math.abs(z - enemySpawnZ) < 15 && Math.abs(x) < 15) {
+            z = enemySpawnZ - Math.sign(enemySpawnZ) * (16 + rng() * 12);
+          }
+          setBotDestination(b, x, heightAt(x, z) + 0.15, z);
         }
       }
       b.repathAtTick = tick + 240 + Math.floor(rng() * 240);
     }
-    const len = Math.hypot(toX, toZ) || 1;
-    moveX = toX / len;
-    moveZ = toZ / len;
+    const steer = botSteerDestination(s.x, s.y, s.z, b, rng);
+    const len = Math.hypot(steer.x, steer.z) || 1;
+    moveX = steer.x / len;
+    moveZ = steer.z / len;
     desiredYaw = Math.atan2(moveX, moveZ);
+    if (steer.y > s.y + 0.45 && len < 1.5) jump = true;
     sprint = true;
     if (s.ammo < 12) reload = true;
   }
@@ -416,29 +500,134 @@ function botThink(p: SimPlayer, b: BotBrain, lastSeq: number): InputCmd {
     }
     b.stuckX = s.x;
     b.stuckZ = s.z;
-    b.stuckCheckAt = tick + 45;
+    b.stuckCheckAt = tick + BOT_STUCK_CHECK_INTERVAL;
   }
 
+  b.desiredYaw = desiredYaw;
+  b.desiredPitch = desiredPitch;
+  b.moveX = moveX;
+  b.moveZ = moveZ;
+  b.fireIntent = fire;
+  b.meleeIntent = melee;
+  b.jumpIntent = jump;
+  b.grenadeIntent = grenade;
+  b.reloadIntent = reload;
+  b.sprintIntent = sprint;
+}
+
+function makeBotInput(p: SimPlayer, b: BotBrain, lastSeq: number): InputCmd {
+  const tick = sim.tick;
+  refreshCombatIntent(p, b);
   // Turn toward the desired view at a finite speed so bots feel human-ish.
   const turn = 0.22; // rad/tick (~6.6 rad/s)
-  b.aimYaw += Math.max(-turn, Math.min(turn, shortestArc(b.aimYaw, desiredYaw)));
-  b.aimPitch += Math.max(-turn, Math.min(turn, desiredPitch - b.aimPitch));
+  b.aimYaw += Math.max(-turn, Math.min(turn, shortestArc(b.aimYaw, b.desiredYaw)));
+  b.aimPitch += Math.max(-turn, Math.min(turn, b.desiredPitch - b.aimPitch));
+  const aligned = Math.abs(shortestArc(b.aimYaw, b.desiredYaw)) < 0.07;
 
-  return {
+  const cmd = {
     seq: lastSeq + 1,
-    moveX,
-    moveZ,
+    moveX: b.moveX,
+    moveZ: b.moveZ,
     viewTick: tick & 0xffff, // bots see the live world
     yaw: b.aimYaw,
     pitch: b.aimPitch,
-    jump,
-    sprint,
-    fire,
-    reload,
-    grenade,
-    melee,
+    jump: b.jumpIntent,
+    sprint: b.sprintIntent,
+    fire: b.fireIntent && aligned && tick < b.burstUntil && tick <= b.targetVisibleUntilTick,
+    reload: b.reloadIntent,
+    grenade: b.grenadeIntent,
+    melee: b.meleeIntent,
     build: false,
   };
+  b.jumpIntent = false;
+  b.grenadeIntent = false;
+  b.meleeIntent = false;
+  return cmd;
+}
+
+function refreshCombatIntent(p: SimPlayer, b: BotBrain): void {
+  const target =
+    b.targetIdx >= 0 && sim.tick <= b.targetVisibleUntilTick ? sim.player(b.targetIdx) : null;
+  if (!target || target.dead) return;
+  readChar(p.body, p.state);
+  readChar(target.body, target.state);
+  const eye = eyePosition(p.state);
+  const dx = target.state.x - p.state.x;
+  const dz = target.state.z - p.state.z;
+  const dist = Math.hypot(dx, dz);
+  const wobble = 0.012 + dist * 0.0011;
+  const phase = sim.tick * 0.37 + p.idx * 1.9;
+  b.desiredYaw = Math.atan2(dx, dz) + Math.sin(phase) * wobble;
+  b.desiredPitch =
+    Math.atan2(target.state.y + 1.0 - eye[1], dist) + Math.cos(phase * 0.7) * wobble * 0.5;
+  const nx = dx / (dist || 1);
+  const nz = dz / (dist || 1);
+  b.moveX = -nz * b.strafeSign;
+  b.moveZ = nx * b.strafeSign;
+  if (dist > 22) {
+    b.moveX += nx * 0.8;
+    b.moveZ += nz * 0.8;
+  } else if (dist < 7) {
+    b.moveX -= nx * 0.8;
+    b.moveZ -= nz * 0.8;
+  }
+}
+
+function initialBotStuckCheckTick(slot: number): number {
+  return sim.tick + 6 + ((slot * 17) % BOT_STUCK_CHECK_INTERVAL);
+}
+
+function setBotDestination(b: BotBrain, x: number, y: number, z: number): void {
+  b.wanderX = x;
+  b.wanderY = y;
+  b.wanderZ = z;
+  b.path = [];
+  b.pathIdx = 0;
+  b.pathTargetX = Number.NaN;
+  b.pathTargetY = Number.NaN;
+  b.pathTargetZ = Number.NaN;
+  b.pathRefreshAtTick = 0;
+}
+
+function botSteerDestination(
+  x: number,
+  y: number,
+  z: number,
+  b: BotBrain,
+  rng: () => number,
+): { x: number; y: number; z: number } {
+  const nav = navForBots();
+  if (nav) {
+    const targetShift = Math.hypot(b.pathTargetX - b.wanderX, b.pathTargetZ - b.wanderZ);
+    const shouldRetryMissingPath = b.path.length === 0 && sim.tick >= b.pathRefreshAtTick;
+    if (shouldRetryMissingPath || b.pathVersion !== nav.version || targetShift > 1.2) {
+      const route = nav.findRoute(sim, [x, y, z], [b.wanderX, b.wanderY, b.wanderZ]);
+      b.path = route ?? [];
+      b.pathIdx = b.path.length > 1 ? 1 : 0;
+      b.pathTargetX = b.wanderX;
+      b.pathTargetY = b.wanderY;
+      b.pathTargetZ = b.wanderZ;
+      b.pathRefreshAtTick =
+        b.path.length > 0 ? Number.MAX_SAFE_INTEGER : sim.tick + 90 + Math.floor(rng() * 90);
+      b.pathVersion = nav.version;
+    }
+    while (b.pathIdx < b.path.length - 1) {
+      const point = b.path[b.pathIdx];
+      if (Math.hypot(point[0] - x, point[2] - z) >= 1.05) break;
+      b.pathIdx++;
+    }
+    const point = b.path[b.pathIdx];
+    if (point) {
+      return { x: point[0] - x, y: point[1], z: point[2] - z };
+    }
+  }
+  return { x: b.wanderX - x, y: b.wanderY, z: b.wanderZ - z };
+}
+
+function navForBots(): BotNav | null {
+  if (SANDBOX || configuredBotFill <= 0) return null;
+  botNav ??= new BotNav();
+  return botNav;
 }
 
 function hasLineOfSight(from: SimPlayer, to: SimPlayer): boolean {
@@ -449,39 +638,12 @@ function hasLineOfSight(from: SimPlayer, to: SimPlayer): boolean {
   const tz = to.state.z - eye[2];
   const dist = Math.hypot(tx, ty, tz);
   if (dist < 0.5) return true;
-  const hit = castIgnoring(eye, [tx / dist, ty / dist, tz / dist], dist + 0.5, from.body);
+  const hit = sim.gw.world.castRay(
+    eye,
+    [(tx / dist) * (dist + 0.5), (ty / dist) * (dist + 0.5), (tz / dist) * (dist + 0.5)],
+    { excludeBody: from.body },
+  );
   return hit !== null && hit.body === to.body;
-}
-
-// Raycast that ignores the shooter's own capsule by skipping past it.
-function castIgnoring(
-  origin: readonly number[],
-  dir: readonly number[],
-  length: number,
-  ignore: Body,
-): { body: Body; point: [number, number, number] } | null {
-  let ox = origin[0];
-  let oy = origin[1];
-  let oz = origin[2];
-  let remaining = length;
-  for (let hop = 0; hop < 3; hop++) {
-    const hit = sim.gw.world.castRay(
-      [ox, oy, oz],
-      [dir[0] * remaining, dir[1] * remaining, dir[2] * remaining],
-    );
-    if (!hit || !hit.body) return null;
-    const px = ox + dir[0] * remaining * hit.fraction;
-    const py = oy + dir[1] * remaining * hit.fraction;
-    const pz = oz + dir[2] * remaining * hit.fraction;
-    if (hit.body !== ignore) return { body: hit.body, point: [px, py, pz] };
-    const step = remaining * hit.fraction + 0.45;
-    ox += dir[0] * step;
-    oy += dir[1] * step;
-    oz += dir[2] * step;
-    remaining -= step;
-    if (remaining <= 0) return null;
-  }
-  return null;
 }
 
 function shortestArc(a: number, b: number): number {
@@ -655,7 +817,30 @@ async function stepPhase(): Promise<void> {
 async function resetRound(): Promise<void> {
   mapEpoch++;
   await sim.reset();
-  for (const p of players.values()) p.pending.clear();
+  botNav = null;
+  for (const p of players.values()) {
+    p.pending.clear();
+    if (p.bot) {
+      p.bot.path = [];
+      p.bot.pathIdx = 0;
+      p.bot.pathTargetX = Number.NaN;
+      p.bot.pathTargetY = Number.NaN;
+      p.bot.pathTargetZ = Number.NaN;
+      p.bot.pathRefreshAtTick = 0;
+      p.bot.pathVersion = 0;
+      p.bot.repathAtTick = 0;
+      p.bot.moveX = 0;
+      p.bot.moveZ = 0;
+      p.bot.desiredYaw = p.bot.aimYaw;
+      p.bot.desiredPitch = 0;
+      p.bot.fireIntent = false;
+      p.bot.meleeIntent = false;
+      p.bot.jumpIntent = false;
+      p.bot.grenadeIntent = false;
+      p.bot.reloadIntent = false;
+      p.bot.sprintIntent = false;
+    }
+  }
   broadcast({
     type: "phase",
     phase: sim.phase,

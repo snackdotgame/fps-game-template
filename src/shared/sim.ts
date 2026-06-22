@@ -19,6 +19,7 @@ import {
   EXPLOSION_PANEL_RADIUS,
   EXPLOSION_RADIUS,
   GRENADE_FUSE_TICKS,
+  HEADSHOT_HEIGHT,
   MAX_HP,
   MAX_PLAYERS,
   MELEE_DAMAGE,
@@ -39,6 +40,7 @@ import {
   TICKETS_START,
   ZONE_CAP_RATE,
 } from "./constants.js";
+import { RIFLE } from "./weapons.js";
 import {
   addCrater,
   BUILT_PANEL_ID_BASE,
@@ -193,6 +195,7 @@ interface AttackHit {
   victim: SimPlayer | null;
   panelBody: Body | null;
   point: [number, number, number];
+  headshot: boolean;
 }
 
 const panelById = new Map(MAP.panels.map((p) => [p.id, p]));
@@ -376,6 +379,7 @@ export class GameSim {
     const wall = castWallDistance(this.gw, eye, d, range);
     let bestT = wall.dist;
     let victim: SimPlayer | null = null;
+    let victimFeetY = 0;
     for (const q of this.players) {
       if (!q || q === p || q.dead || q.team === p.team) continue;
       const feet = this.rewoundFeet(q, rewindTicks);
@@ -384,16 +388,28 @@ export class GameSim {
       if (t !== null && t < bestT) {
         bestT = t;
         victim = q;
+        victimFeetY = feet[1];
       }
     }
     if (victim) {
+      const point: [number, number, number] = [
+        eye[0] + d[0] * bestT,
+        eye[1] + d[1] * bestT,
+        eye[2] + d[2] * bestT,
+      ];
       return {
         victim,
         panelBody: null,
-        point: [eye[0] + d[0] * bestT, eye[1] + d[1] * bestT, eye[2] + d[2] * bestT],
+        point,
+        headshot: point[1] - victimFeetY >= HEADSHOT_HEIGHT,
       };
     }
-    return { victim: null, panelBody: wall.dist < range ? wall.body : null, point: wall.point };
+    return {
+      victim: null,
+      panelBody: wall.dist < range ? wall.body : null,
+      point: wall.point,
+      headshot: false,
+    };
   }
 
   private rewindFor(p: SimPlayer, opts: ApplyInputOpts): number {
@@ -420,7 +436,8 @@ export class GameSim {
     const hit = this.resolveAttack(p, eye, d, RIFLE_RANGE, this.rewindFor(p, opts));
     this.pushEvent(EV_TRACER, p.idx, hit.point);
     if (hit.victim) {
-      this.damagePlayer(hit.victim, RIFLE_DAMAGE, p, "rifle");
+      const dmg = hit.headshot ? Math.round(RIFLE_DAMAGE * RIFLE.headshotMult) : RIFLE_DAMAGE;
+      this.damagePlayer(hit.victim, dmg, p, "rifle");
       // a packs victim (low nibble) and shooter (high nibble): idx < 16.
       this.pushEvent(EV_HIT_PLAYER, (hit.victim.idx & 0xf) | ((p.idx & 0xf) << 4), hit.point);
     } else if (hit.panelBody) {

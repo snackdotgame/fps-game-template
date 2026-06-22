@@ -1,4 +1,4 @@
-declare module "minion:server" {
+declare module "snack:server" {
   export type NetworkMessage =
     | string
     | number
@@ -6,6 +6,10 @@ declare module "minion:server" {
     | null
     | NetworkMessage[]
     | { [key: string]: NetworkMessage };
+
+  export type ServerConfigValue = string | number | boolean;
+
+  export type ServerConfig = { readonly [key: string]: ServerConfigValue };
 
   export type DatagramPayload =
     | NetworkMessage
@@ -90,6 +94,7 @@ declare module "minion:server" {
   }
 
   export interface Server {
+    readonly config: ServerConfig;
     readonly running: boolean;
     readonly connections: readonly Connection[];
     readonly datagrams: ServerDatagrams;
@@ -100,8 +105,4 @@ declare module "minion:server" {
   }
 
   export const server: Server;
-}
-
-declare module "@minion/server" {
-  export * from "minion:server";
 }

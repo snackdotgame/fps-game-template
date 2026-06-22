@@ -1,28 +1,30 @@
 {
-  "name": "breachpoint",
+  "name": "fps-game-template",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "turbo run dev:client dev:server --parallel",
     "dev:client": "vite",
-    "dev:server": "minion dev",
+    "dev:server": "snack dev",
     "tc": "tsgo --project tsconfig.client.json --noEmit && tsgo --project tsconfig.server.json --noEmit",
     "typecheck": "tsgo --project tsconfig.client.json --noEmit && tsgo --project tsconfig.server.json --noEmit",
     "lint": "oxlint .",
     "format": "oxfmt --write .",
     "check": "oxfmt --check . && tsgo --project tsconfig.client.json --noEmit && tsgo --project tsconfig.server.json --noEmit && oxlint .",
     "build:client": "vite build",
-    "build:server": "minion build",
-    "build": "vite build && minion build",
-    "deploy": "vite build && minion deploy",
-    "publish": "vite build && minion publish"
+    "build:server": "snack build",
+    "build": "vite build && snack build",
+    "deploy": "vite build && snack deploy",
+    "publish": "vite build && snack publish"
   },
   "dependencies": {
-    "jolt-ts": "file:../jolt-ts",
+    "@recast-navigation/core": "^0.43.1",
+    "@recast-navigation/generators": "^0.43.1",
+    "jolt-ts": "file:../../jolt-ts",
     "three": "^0.184.0"
   },
   "devDependencies": {
-    "@minion-game/cli": "latest",
+    "@snack-game/cli": "latest",
     "@types/three": "^0.184.1",
     "@typescript/native-preview": "7.0.0-dev.20260513.1",
     "esbuild": "0.27.3",

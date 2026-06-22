@@ -1,0 +1,5 @@
+The .ogg sound effects in this directory are from the "Impact Sounds"
+pack (v1.0) by Kenney (www.kenney.nl), released under Creative Commons
+Zero (CC0): http://creativecommons.org/publicdomain/zero/1.0/
+
+Crediting is not required by the license; credited with thanks anyway.

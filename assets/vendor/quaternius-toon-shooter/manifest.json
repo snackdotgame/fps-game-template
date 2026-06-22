@@ -1,0 +1,10 @@
+{
+  "characters": [
+    "/assets/vendor/quaternius-toon-shooter/characters/soldier.gltf",
+    "/assets/vendor/quaternius-toon-shooter/characters/enemy.gltf",
+    "/assets/vendor/quaternius-toon-shooter/characters/hazmat.gltf"
+  ],
+  "weapons": [
+    "/assets/vendor/quaternius-toon-shooter/weapons/ak.gltf"
+  ]
+}

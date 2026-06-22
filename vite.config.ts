@@ -1,18 +1,43 @@
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { defineConfig, type Plugin } from "vite";
 
 const projectRoot = fileURLToPath(new URL(".", import.meta.url));
 const assetsDir = path.join(projectRoot, "assets");
-const minionClientEntryId = "/minion/client-entry";
-const minionClientModuleId = "minion:client";
-const legacyMinionClientModuleId = "@minion/client";
+const snackClientEntryId = "/snack/client-entry";
+const snackClientModuleId = "snack:client";
 const userClientEntryId = "/src/client.ts";
-const resolvedMinionClientEntryId = `\0${minionClientEntryId}`;
-const resolvedMinionClientModuleId = `\0${minionClientModuleId}`;
-const clientDevHost = process.env.MINION_CLIENT_HOST ?? "127.0.0.1";
-const clientDevPort = portFromEnv("MINION_CLIENT_PORT", 3031);
+const resolvedSnackClientEntryId = `\0${snackClientEntryId}`;
+const resolvedSnackClientModuleId = `\0${snackClientModuleId}`;
+const joltRawShim = path.join(projectRoot, "src/shared/joltRawStatic.ts");
+const clientDevHost = process.env.SNACK_CLIENT_HOST ?? "127.0.0.1";
+// port resolution matches `snack dev`: env > snack.json dev.clientPort > 3031
+const clientDevPort = portFromEnv("SNACK_CLIENT_PORT", manifestDevClientPort() ?? 3031);
+
+// the optional `dev` section of snack.json configures local ports:
+//   "dev": { "port": 3030, "clientPort": 3031 }
+function manifestDevClientPort(): number | undefined {
+  let manifest: unknown;
+  try {
+    manifest = JSON.parse(readFileSync(path.join(projectRoot, "snack.json"), "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (typeof manifest !== "object" || manifest === null) {
+    return undefined;
+  }
+  const dev = (manifest as Record<string, unknown>).dev;
+  if (typeof dev !== "object" || dev === null) {
+    return undefined;
+  }
+  const port = (dev as Record<string, unknown>).clientPort;
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) {
+    return undefined;
+  }
+  return port;
+}
 
 function portFromEnv(name: string, fallback: number): number {
   const rawValue = process.env[name];
@@ -27,39 +52,65 @@ function portFromEnv(name: string, fallback: number): number {
   return port;
 }
 
-function minionClientRuntime(): Plugin {
+function snackClientRuntime(): Plugin {
   return {
-    name: "minion-client-runtime",
+    name: "snack-client-runtime",
     enforce: "pre",
     transformIndexHtml: {
       order: "pre",
       handler(html) {
         return html.replace(
           /<script\s+type=["']module["']\s+src=["']\/src\/client\.ts["']><\/script>/,
-          `<script type="module" src="${minionClientEntryId}"></script>`,
+          `<script type="module" src="${snackClientEntryId}"></script>`,
         );
       },
     },
     resolveId(id) {
-      if (id === minionClientEntryId) {
-        return resolvedMinionClientEntryId;
+      if (id === snackClientEntryId) {
+        return resolvedSnackClientEntryId;
       }
-      if (id === minionClientModuleId || id === legacyMinionClientModuleId) {
-        return resolvedMinionClientModuleId;
+      if (id === snackClientModuleId) {
+        return resolvedSnackClientModuleId;
       }
       return null;
     },
     load(id) {
-      if (id === resolvedMinionClientEntryId) {
+      if (id === resolvedSnackClientEntryId) {
         return [
-          `import { startMinionClientRuntime } from ${JSON.stringify(minionClientModuleId)};`,
-          "await startMinionClientRuntime();",
+          `import { startSnackClientRuntime } from ${JSON.stringify(snackClientModuleId)};`,
+          "await startSnackClientRuntime();",
           `await import(${JSON.stringify(userClientEntryId)});`,
           "",
         ].join("\n");
       }
-      if (id === resolvedMinionClientModuleId) {
-        return MINION_CLIENT_RUNTIME_SOURCE;
+      if (id === resolvedSnackClientModuleId) {
+        return SNACK_CLIENT_RUNTIME_SOURCE;
+      }
+      return null;
+    },
+  };
+}
+
+function joltStaticRawRuntime(): Plugin {
+  const isJoltRawModule = (value: string) => {
+    const normalized = path.normalize(value).replaceAll("\\", "/").split("?")[0];
+    return (
+      normalized.endsWith("jolt-ts/dist/raw.js") ||
+      normalized.endsWith("jolt-ts/src/raw.js") ||
+      normalized.endsWith("jolt-ts/src/raw.ts")
+    );
+  };
+
+  return {
+    name: "jolt-static-raw-runtime",
+    enforce: "pre",
+    resolveId(id, importer) {
+      const normalizedImporter = importer ? path.normalize(importer) : "";
+      if (id === "./raw.js" && normalizedImporter.includes(path.normalize("jolt-ts/"))) {
+        return joltRawShim;
+      }
+      if (isJoltRawModule(id)) {
+        return joltRawShim;
       }
       return null;
     },
@@ -82,13 +133,13 @@ async function assertNoAssetSymlinks(root: string, current = root): Promise<void
   }
 }
 
-function minionAssets(): Plugin {
+function snackAssets(): Plugin {
   return {
-    name: "minion-assets",
+    name: "snack-assets",
     configureServer(server) {
       server.middlewares.use(async (request, response, next) => {
         try {
-          const pathname = new URL(request.url ?? "/", "http://minion.local").pathname;
+          const pathname = new URL(request.url ?? "/", "http://snack.local").pathname;
           if (!pathname.startsWith("/assets/")) {
             next();
             return;
@@ -205,11 +256,11 @@ export default defineConfig({
     outDir: "dist/client",
     emptyOutDir: true,
   },
-  plugins: [minionClientRuntime(), minionAssets()],
+  plugins: [joltStaticRawRuntime(), snackClientRuntime(), snackAssets()],
 });
 
-const MINION_CLIENT_RUNTIME_SOURCE = String.raw`
-const READY_MESSAGE = Object.freeze({ type: "minion.ready", version: 1 });
+const SNACK_CLIENT_RUNTIME_SOURCE = String.raw`
+const READY_MESSAGE = Object.freeze({ type: "snack.ready", version: 1 });
 const STREAM_KIND_CONTROL = 0;
 const STREAM_KIND_MESSAGE = 1;
 const LAUNCH_TIMEOUT_MS = 15000;
@@ -220,14 +271,14 @@ const RTT_JITTER_EMA_ALPHA = 1 / 16;
 const MAX_DATAGRAM_BYTES = 65536;
 const MAX_STREAM_BYTES = 1048576;
 const MAX_QUEUED_MESSAGES = 1024;
-const DATAGRAM_COMPATIBILITY_ERROR = "This browser does not expose the WebTransport datagram API required by Minion.Game. Update your browser or use a current Safari, Chrome, Edge, or Firefox build with WebTransport datagram support.";
+const DATAGRAM_COMPATIBILITY_ERROR = "This browser does not expose the WebTransport datagram API required by Snack.Game. Update your browser or use a current Safari, Chrome, Edge, or Firefox build with WebTransport datagram support.";
 
 const runtime = createRuntime();
 const datagramWritables = new WeakMap();
 
 export const client = runtime.client;
 
-export function startMinionClientRuntime() {
+export function startSnackClientRuntime() {
   return runtime.started;
 }
 
@@ -259,7 +310,7 @@ function createRuntime() {
   });
 
   void closed.then(() => {
-    const error = new Error("Minion client connection closed");
+    const error = new Error("Snack client connection closed");
     datagrams.close(error);
     streams.close(error);
   });
@@ -317,13 +368,13 @@ async function resolveConnectInfo(launchReady) {
 
 function waitForLaunchEnvelope(timeoutMs) {
   if (window.parent === window) {
-    return Promise.reject(new Error("Minion launch envelope is required"));
+    return Promise.reject(new Error("Snack launch envelope is required"));
   }
 
   return new Promise((resolve, reject) => {
     const timeout = window.setTimeout(() => {
       window.removeEventListener("message", onLaunchMessage);
-      reject(new Error("Minion launch envelope timed out"));
+      reject(new Error("Snack launch envelope timed out"));
     }, timeoutMs);
 
     function onLaunchMessage(event) {
@@ -346,7 +397,7 @@ function isLaunchEnvelope(value) {
     return false;
   }
 
-  return value.type === "minion.launch"
+  return value.type === "snack.launch"
     && value.version === 1
     && typeof value.launchId === "string"
     && isRecord(value.user)
@@ -880,7 +931,7 @@ function reportRuntimeStartupError(error) {
   try {
     if (window.parent !== window) {
       window.parent.postMessage({
-        type: "minion.runtimeError",
+        type: "snack.runtimeError",
         version: 1,
         message: error instanceof Error ? error.message : String(error),
       }, "*");

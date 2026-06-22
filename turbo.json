@@ -25,7 +25,7 @@
       "outputs": ["dist/client/**"]
     },
     "build:server": {
-      "outputs": ["dist/server/**", "dist/minion.json"]
+      "outputs": ["dist/server/**", "dist/snack.json"]
     }
   }
 }
