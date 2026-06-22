@@ -13,6 +13,7 @@
     "check": "oxfmt --check . && tsgo --project tsconfig.client.json --noEmit && tsgo --project tsconfig.server.json --noEmit && oxlint .",
     "build:client": "vite build",
     "build:server": "snack build",
+    "test:char-sync": "esbuild scripts/char-controller-sync-test.ts --bundle --format=esm --platform=node --external:jolt-ts --external:module --outfile=node_modules/.cache/cc-sync-test.mjs && node node_modules/.cache/cc-sync-test.mjs",
     "build": "vite build && snack build",
     "deploy": "vite build && snack deploy",
     "publish": "vite build && snack publish"
@@ -21,6 +22,7 @@
     "@recast-navigation/core": "^0.43.1",
     "@recast-navigation/generators": "^0.43.1",
     "jolt-ts": "file:../../jolt-ts",
+    "jolt-ts-character-controller": "file:../../jolt-ts-character-controller",
     "three": "^0.184.0"
   },
   "devDependencies": {
