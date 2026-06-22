@@ -5,8 +5,14 @@
     "moduleResolution": "NodeNext",
     "strict": true,
     "noEmit": true,
-    "types": ["./.minion/types/server"],
+    "skipLibCheck": true,
+    "types": ["./.snack/types/server"],
     "lib": ["ES2022", "ESNext.Disposable"]
   },
-  "include": ["src/server.ts", "src/shared/**/*.ts", ".minion/types/**/*.d.ts"]
+  "include": [
+    "src/server.ts",
+    "src/server/**/*.d.ts",
+    "src/shared/**/*.ts",
+    ".snack/types/**/*.d.ts"
+  ]
 }

@@ -5,7 +5,7 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
-    "types": ["vite/client", "./.minion/types/client", "./.minion/types/server"]
+    "types": ["vite/client", "./.snack/types/client", "./.snack/types/server"]
   },
-  "include": ["src/**/*.ts", ".minion/types/**/*.d.ts"]
+  "include": ["src/**/*.ts", ".snack/types/**/*.d.ts"]
 }

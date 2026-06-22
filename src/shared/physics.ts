@@ -113,7 +113,7 @@ const GROUND_FRICTION = 50;
 const JUMP_VEL = 6.8;
 const COYOTE_TICKS = 4;
 const GROUND_PROBE = 0.16; // generous: uneven terrain underfoot
-const STEP_MAX = 0.55; // tallest ledge the step-up assist climbs
+export const STEP_MAX = 0.55; // tallest ledge the step-up assist climbs
 
 // Ladder volumes are map data; the controller climbs whichever one the
 // capsule overlaps. Returns the ladder when the player hugs its wall face.
@@ -543,10 +543,10 @@ export function createGrenadeBody(
     shape: Shape.sphere(GRENADE_RADIUS),
     position: [pos[0], pos[1], pos[2]],
     layer: "moving",
-    friction: 0.95,
-    restitution: 0.22,
-    linearDamping: 0.3,
-    angularDamping: 2.2,
+    friction: 0.45, // low enough that the sphere rolls instead of sticking
+    restitution: 0.4, // a livelier bounce off ground/walls
+    linearDamping: 0.2,
+    angularDamping: 1.4,
     allowSleeping: false,
     motionQuality: "linearCast",
     linearVelocity: [vel[0], vel[1], vel[2]],
@@ -779,8 +779,9 @@ export function stepPlayerController(
   if (!locked && s.reloadTicks === 0) {
     if (input.reload && s.ammo < RIFLE_MAG) {
       s.reloadTicks = RELOAD_TICKS;
-    } else if (input.fire && s.cooldownTicks === 0 && s.ammo > 0) {
-      // Full-auto: held fire keeps shooting on cooldown.
+    } else if (input.fire && !sprinting && s.cooldownTicks === 0 && s.ammo > 0) {
+      // Full-auto: held fire keeps shooting on cooldown. Can't fire while
+      // sprinting — the gun is lowered.
       s.ammo--;
       s.cooldownTicks = RIFLE_COOLDOWN_TICKS;
       opts.onFire?.(eye, dir);

@@ -5,13 +5,14 @@
 //
 // With the dev server running:
 //   PLAYWRIGHT_RESOLVE_FROM=/path/to/some/package.json node scripts/playtest.mjs
-// HOST defaults to http://127.0.0.1:3030/ — override with BP_HOST / BP_CLIENT_PORT.
+// SHELL_URL defaults to http://127.0.0.1:3030/ — override with SNACK_SHELL_URL /
+// SNACK_CLIENT_PORT.
 import { createRequire } from "node:module";
 const require = createRequire(process.env.PLAYWRIGHT_RESOLVE_FROM);
 const { chromium } = require("playwright");
 
-const HOST = process.env.BP_HOST ?? "http://127.0.0.1:3030/";
-const CLIENT_PORT = process.env.BP_CLIENT_PORT ?? "3031";
+const SHELL_URL = process.env.SNACK_SHELL_URL ?? "http://127.0.0.1:3030/";
+const CLIENT_PORT = process.env.SNACK_CLIENT_PORT ?? "3031";
 
 let failures = 0;
 function check(name, ok, detail = "") {
@@ -31,7 +32,7 @@ async function openClient(label) {
   });
   const page = await context.newPage();
   page.on("pageerror", (e) => console.log(`[${label} pageerror]`, String(e).slice(0, 300)));
-  await page.goto(HOST, { waitUntil: "domcontentloaded" });
+  await page.goto(SHELL_URL, { waitUntil: "domcontentloaded" });
   let frame;
   for (let i = 0; i < 120 && !frame; i++) {
     frame = page.frames().find((f) => f.url().includes(`:${CLIENT_PORT}`));
@@ -43,7 +44,7 @@ async function openClient(label) {
     null,
     { timeout: 40000, polling: 100 },
   );
-  // The minion dev transport sometimes drops a connection under load (known
+  // The snack dev transport sometimes drops a connection under load (known
   // platform flake); the host shell then reloads the game iframe. Reattach
   // and retry instead of crashing a six-minute run on one reconnect.
   const state = { frame };

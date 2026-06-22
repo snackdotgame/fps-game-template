@@ -1,4 +1,4 @@
 node_modules
-.minion/cache
-.minion/deploy
+.snack/cache
+.snack/deploy
 dist

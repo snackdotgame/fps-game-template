@@ -1,0 +1,37 @@
+{
+  "families": {
+    "rifle_shot": [
+      "/assets/sounds/snakef8-authentic-gun-sounds/shot_ak_762.wav",
+      "/assets/sounds/snakef8-second-authentic-gun-sounds/shot_rifle_308.wav"
+    ],
+    "rifle_tail": ["/assets/sounds/snakef8-authentic-gun-sounds/tail_ak_762.wav"],
+    "reload": [
+      "/assets/sounds/snakef8-authentic-gun-sounds/reload_ak_full.wav",
+      "/assets/sounds/snakef8-authentic-gun-sounds/reload_ak_rack.wav",
+      "/assets/sounds/snakef8-second-authentic-gun-sounds/reload_ak_mag.wav"
+    ],
+    "melee": [
+      "/assets/sounds/impactPunch_medium_000.ogg",
+      "/assets/sounds/impactPunch_medium_001.ogg",
+      "/assets/sounds/impactPunch_medium_002.ogg",
+      "/assets/sounds/impactPunch_medium_003.ogg",
+      "/assets/sounds/impactPunch_medium_004.ogg",
+      "/assets/sounds/impactSoft_heavy_000.ogg",
+      "/assets/sounds/impactSoft_heavy_001.ogg",
+      "/assets/sounds/impactSoft_heavy_002.ogg",
+      "/assets/sounds/impactSoft_heavy_003.ogg",
+      "/assets/sounds/impactSoft_heavy_004.ogg",
+      "/assets/sounds/impactSoft_medium_000.ogg",
+      "/assets/sounds/impactSoft_medium_001.ogg",
+      "/assets/sounds/impactSoft_medium_002.ogg",
+      "/assets/sounds/impactSoft_medium_003.ogg",
+      "/assets/sounds/impactSoft_medium_004.ogg",
+      "/assets/sounds/impactWood_medium_000.ogg",
+      "/assets/sounds/impactWood_medium_001.ogg",
+      "/assets/sounds/impactWood_medium_002.ogg",
+      "/assets/sounds/impactWood_medium_003.ogg",
+      "/assets/sounds/impactWood_medium_004.ogg"
+    ],
+    "death": []
+  }
+}

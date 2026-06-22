@@ -1,4 +1,4 @@
-declare module "minion:client" {
+declare module "snack:client" {
   export type NetworkMessage =
     | string
     | number
@@ -21,7 +21,7 @@ declare module "minion:client" {
   }
 
   export interface LaunchEnvelope {
-    readonly type: "minion.launch";
+    readonly type: "snack.launch";
     readonly version: 1;
     readonly launchId: string;
     readonly user: {
@@ -94,8 +94,4 @@ declare module "minion:client" {
   }
 
   export const client: Client;
-}
-
-declare module "@minion/client" {
-  export * from "minion:client";
 }
