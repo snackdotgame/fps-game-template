@@ -10,6 +10,7 @@
 
 import initJolt from "jolt-ts/native/jolt/dist/jolt-physics.wasm-compat.js";
 import { type Body, Shape, World } from "jolt-ts";
+import { EcctrlJoltController, type EcctrlSyncState } from "jolt-ts-character-controller";
 import {
   BUILD_COOLDOWN_TICKS,
   SPREAD_AIR,
@@ -84,6 +85,9 @@ export interface CharState {
   vy: number;
   vz: number;
   onGround: boolean;
+  canJump: boolean; // character-controller jump latch (released between jumps)
+  jumpActive: boolean; // a jump impulse is mid-application
+  jumpElapsed: number; // seconds the active jump has been applied
   jumpHeld: boolean;
   fireHeld: boolean;
   grenadeHeld: boolean;
@@ -107,30 +111,12 @@ export const DT = 1 / TICK_RATE;
 export const GRAVITY = 22;
 const WALK_SPEED = 5.2;
 const SPRINT_SPEED = 7.6;
-const GROUND_ACCEL = 60;
-const AIR_ACCEL = 14;
-const GROUND_FRICTION = 50;
 const JUMP_VEL = 6.8;
 const COYOTE_TICKS = 4;
-const GROUND_PROBE = 0.16; // generous: uneven terrain underfoot
-export const STEP_MAX = 0.55; // tallest ledge the step-up assist climbs
-
-// Ladder volumes are map data; the controller climbs whichever one the
-// capsule overlaps. Returns the ladder when the player hugs its wall face.
-const LADDER_REACH = 0.85;
-const LADDER_CLIMB = 3.0;
-
-function ladderAt(x: number, feetY: number, z: number): { nx: number; nz: number } | null {
-  for (const l of MAP.ladders) {
-    const out = (x - l.x) * l.nx + (z - l.z) * l.nz; // off the wall face
-    if (out < -0.1 || out > LADDER_REACH) continue;
-    const along = (x - l.x) * -l.nz + (z - l.z) * l.nx;
-    if (Math.abs(along) > 0.6) continue;
-    if (feetY < -0.5 || feetY > l.y1 - 0.1) continue;
-    return l;
-  }
-  return null;
-}
+export const STEP_MAX = 0.55; // kept for importers; step-up not yet ported to the controller
+// NOTE(branch): the bespoke ground probe, ground/air accel, friction, ladder,
+// and step-up constants were removed when EcctrlJoltController took over
+// locomotion. Re-add equivalents when porting ladders + step-up onto it.
 
 export function makeChar(spawn: readonly number[]): CharState {
   return {
@@ -141,6 +127,9 @@ export function makeChar(spawn: readonly number[]): CharState {
     vy: 0,
     vz: 0,
     onGround: false,
+    canJump: true,
+    jumpActive: false,
+    jumpElapsed: 0,
     jumpHeld: false,
     fireHeld: false,
     grenadeHeld: false,
@@ -197,6 +186,47 @@ export interface GameWorld {
   players: Map<number, Body>; // by player idx
   grenades: Map<number, Body>; // by grenade id
   terrain: Map<number, Body>; // by chunk key ci * TERRAIN_CHUNKS + cj
+  controllers: Map<number, EcctrlJoltController>; // jolt-ts character controller, by player idx
+}
+
+// Body -> controller, so the body-only readChar/writeChar can sync the
+// controller's full deterministic state without threading it through everywhere.
+const playerControllers = new WeakMap<Body, EcctrlJoltController>();
+
+// Controller equilibrium: the floating capsule rests this far above where the
+// grounded capsule sat, so feet = bodyCenterY - PLAYER_HALF_HEIGHT - FLOAT_OFFSET
+// keeps CharState in the same feet-space the rest of the game uses.
+const FLOAT_OFFSET = 0;
+
+// Build the per-player character controller options once (client and server
+// must match exactly for deterministic prediction).
+function makePlayerController(world: World, body: Body): EcctrlJoltController {
+  return new EcctrlJoltController({
+    world,
+    body,
+    useCustomForward: true, // we feed a world-space move direction as "forward"
+    enableToggleRun: false,
+    autoBalance: false,
+    capsuleHalfHeight: PLAYER_HALF_CYL,
+    capsuleRadius: PLAYER_RADIUS,
+    maxWalkVel: WALK_SPEED,
+    maxRunVel: SPRINT_SPEED,
+    jumpVel: JUMP_VEL,
+  });
+}
+
+function syncStateFromChar(s: CharState): EcctrlSyncState {
+  return {
+    position: [s.x, s.y + PLAYER_HALF_HEIGHT + FLOAT_OFFSET, s.z],
+    linearVelocity: [s.vx, s.vy, s.vz],
+    rotation: [0, 0, 0, 1],
+    angularVelocity: [0, 0, 0],
+    gravityDir: [0, -1, 0],
+    onGround: s.onGround,
+    canJump: s.canJump,
+    jumpActive: s.jumpActive,
+    jumpElapsed: s.jumpElapsed,
+  };
 }
 
 export type AliveFn = (pieceId: number) => boolean;
@@ -215,6 +245,7 @@ export async function createGameWorld(destroyed?: ReadonlySet<number>): Promise<
     players: new Map(),
     grenades: new Map(),
     terrain: new Map(),
+    controllers: new Map(),
   };
   const alive: AliveFn = destroyed ? (id) => !destroyed.has(id) : () => true;
 
@@ -256,6 +287,7 @@ export function destroyGameWorld(gw: GameWorld): void {
   gw.players.clear();
   gw.grenades.clear();
   gw.terrain.clear();
+  gw.controllers.clear();
 }
 
 function addTerrainChunkBody(gw: GameWorld, ci: number, cj: number): void {
@@ -521,15 +553,24 @@ export function createPlayerBody(
     userData: { playerIdx: idx } satisfies BodyTag,
   });
   gw.players.set(idx, body);
+  // Real (dynamic) players are driven by the character controller; kinematic
+  // ghosts (remote collision proxies) are posed straight from snapshots.
+  if (!opts?.kinematic) {
+    const controller = makePlayerController(gw.world, body);
+    gw.controllers.set(idx, controller);
+    playerControllers.set(body, controller);
+  }
   return body;
 }
 
 export function removePlayerBody(gw: GameWorld, idx: number): void {
   const body = gw.players.get(idx);
   if (body) {
+    playerControllers.delete(body);
     gw.world.removeBody(body);
     gw.players.delete(idx);
   }
+  gw.controllers.delete(idx);
 }
 
 export function createGrenadeBody(
@@ -566,6 +607,21 @@ export function removeGrenadeBody(gw: GameWorld, id: number): void {
 
 // Copy body pose into a CharState; push it back (reconciliation/teleport).
 export function readChar(body: Body, s: CharState): void {
+  const controller = playerControllers.get(body);
+  if (controller) {
+    const st = controller.getSyncState();
+    s.x = st.position[0];
+    s.y = st.position[1] - PLAYER_HALF_HEIGHT - FLOAT_OFFSET;
+    s.z = st.position[2];
+    s.vx = st.linearVelocity[0];
+    s.vy = st.linearVelocity[1];
+    s.vz = st.linearVelocity[2];
+    s.onGround = st.onGround;
+    s.canJump = st.canJump;
+    s.jumpActive = st.jumpActive;
+    s.jumpElapsed = st.jumpElapsed;
+    return;
+  }
   const pos = body.translation();
   const vel = body.linearVelocity();
   s.x = pos.x;
@@ -577,6 +633,13 @@ export function readChar(body: Body, s: CharState): void {
 }
 
 export function writeChar(body: Body, s: CharState): void {
+  const controller = playerControllers.get(body);
+  if (controller) {
+    // Restore the full controller state (pose + latches) so prediction replay
+    // and server reconciliation reproduce it exactly.
+    controller.applySyncState(syncStateFromChar(s));
+    return;
+  }
   body.setTranslation([s.x, s.y + PLAYER_HALF_HEIGHT, s.z]);
   body.setLinearVelocity(s.vx, s.vy, s.vz);
 }
@@ -635,128 +698,36 @@ export function stepPlayerController(
   input: InputCmd,
   opts: StepOptions = {},
 ): void {
-  const pos = body.translation();
-  const vel = body.linearVelocity();
-  const feetY = pos.y - PLAYER_HALF_HEIGHT;
-
-  // --- Ground probe. ---
-  let grounded = false;
-  for (const [ox, oz] of PROBE_OFFSETS) {
-    const hit = gw.world.castRay(
-      [pos.x + ox, feetY + 0.02, pos.z + oz],
-      [0, -(GROUND_PROBE + 0.02), 0],
-    );
-    if (hit && hit.body && hit.body !== body) {
-      grounded = true;
-      break;
-    }
-  }
-  if (vel.y > 1.0) grounded = false;
-  s.onGround = grounded;
-
-  let mx = input.moveX;
-  let mz = input.moveZ;
-  const mag = Math.sqrt(mx * mx + mz * mz);
-  if (mag > 1) {
-    mx /= mag;
-    mz /= mag;
-  }
+  const controller = playerControllers.get(body);
   const locked = opts.locked === true;
-  if (locked) {
-    mx = 0;
-    mz = 0;
-  }
 
-  // Sprint only applies moving forward-ish relative to view.
+  // --- Locomotion via the jolt-ts character controller. ---
+  // moveX/moveZ is already a world-space, yaw-relative move vector, so feed it
+  // straight in as the controller's custom forward axis and walk along it.
+  const mx = locked ? 0 : input.moveX;
+  const mz = locked ? 0 : input.moveZ;
+  const mag = Math.hypot(mx, mz);
+  const moving = mag > 1e-3;
+  // Sprint only when moving roughly toward where the player is looking.
   const fdx = Math.sin(input.yaw);
   const fdz = Math.cos(input.yaw);
-  const forwardness = mx * fdx + mz * fdz;
-  const sprinting = input.sprint && forwardness > 0.5 && grounded && !locked;
-  const speed = sprinting ? SPRINT_SPEED : WALK_SPEED;
-
-  let vx = vel.x;
-  let vy = vel.y;
-  let vz = vel.z;
-  const accel = grounded ? GROUND_ACCEL : AIR_ACCEL;
-  if (mx !== 0 || mz !== 0) {
-    vx = approach(vx, mx * speed, accel * DT);
-    vz = approach(vz, mz * speed, accel * DT);
-  } else if (grounded) {
-    vx = approach(vx, 0, GROUND_FRICTION * DT);
-    vz = approach(vz, 0, GROUND_FRICTION * DT);
-  }
-
-  // --- Ladders + jump. Climbing is deterministic shared logic: push toward
-  // the wall to go up, pull away to step off, jump to kick off backward.
-  const ladder = locked ? null : ladderAt(pos.x, feetY, pos.z);
-  const jumpPressed = input.jump && !s.jumpHeld && !locked;
-  if (ladder) {
-    if (jumpPressed) {
-      vy = JUMP_VEL * 0.7;
-      vx = ladder.nx * 3.5;
-      vz = ladder.nz * 3.5;
-    } else {
-      const into = -(mx * ladder.nx + mz * ladder.nz);
-      if (into > 0.25) {
-        vy = LADDER_CLIMB;
-        vx = mx * 1.2;
-        vz = mz * 1.2;
-      } else if (into >= -0.25) {
-        // Holding on: cancel gravity and slide.
-        vy = 0;
-        vx *= 0.2;
-        vz *= 0.2;
-      }
-      // Pulling away keeps normal walk velocity and gravity takes over.
-    }
-    grounded = false;
-    s.onGround = false;
-    s.coyoteTicks = 0;
-  } else if (jumpPressed && (grounded || s.coyoteTicks > 0)) {
-    vy = JUMP_VEL;
-    grounded = false;
-    s.onGround = false;
-    s.coyoteTicks = 0;
+  const forwardness = moving ? (mx * fdx + mz * fdz) / mag : 0;
+  const sprinting = !locked && input.sprint && moving && forwardness > 0.5;
+  if (controller) {
+    if (moving) controller.setForwardDirection({ x: mx / mag, y: 0, z: mz / mag });
+    controller.setMovement({ forward: moving, run: sprinting, jump: !locked && input.jump });
+    controller.step(DT);
   }
   s.jumpHeld = input.jump;
-
-  body.setLinearVelocity(vx, vy, vz);
-
-  // --- Step-up assist: stairs and low ledges walk up smoothly instead of
-  // stopping the capsule. Pure raycasts on shared state, so prediction and
-  // server agree exactly. Rays start outside our own capsule (rays that
-  // start inside a convex body hit it at fraction 0).
-  if (grounded && !locked && (mx !== 0 || mz !== 0)) {
-    const mlen = Math.hypot(mx, mz) || 1;
-    const dx = mx / mlen;
-    const dz = mz / mlen;
-    const edge = PLAYER_RADIUS + 0.02;
-    const reach = 0.3;
-    const shin = gw.world.castRay(
-      [pos.x + dx * edge, feetY + 0.13, pos.z + dz * edge],
-      [dx * reach, 0, dz * reach],
-    );
-    if (shin && shin.body && shin.body !== body) {
-      const head = gw.world.castRay(
-        [pos.x + dx * edge, feetY + STEP_MAX + 0.05, pos.z + dz * edge],
-        [dx * reach, 0, dz * reach],
-      );
-      if (!head) {
-        const downFrom = STEP_MAX + 0.05;
-        const down = gw.world.castRay(
-          [pos.x + dx * (edge + reach), feetY + downFrom, pos.z + dz * (edge + reach)],
-          [0, -(downFrom - 0.01), 0],
-        );
-        if (down && down.body && down.body !== body) {
-          const ledgeY = feetY + downFrom - (downFrom - 0.01) * down.fraction;
-          const rise = ledgeY - feetY;
-          if (rise > 0.04 && rise <= STEP_MAX) {
-            body.setTranslation([pos.x, ledgeY + PLAYER_HALF_HEIGHT + 0.02, pos.z]);
-          }
-        }
-      }
-    }
-  }
+  // Post-step body velocity (inherited by thrown grenades); ground state comes
+  // back through readChar below.
+  const vel = body.linearVelocity();
+  const vx = vel.x;
+  const vz = vel.z;
+  const grounded = controller ? controller.getSyncState().onGround : false;
+  s.onGround = grounded;
+  // TODO(branch): ladder climbing and stair step-up are not yet reimplemented
+  // on top of the character controller (the prior bespoke logic handled them).
 
   // --- Weapons (deterministic state; effects via hooks). ---
   if (SANDBOX) {
@@ -824,20 +795,6 @@ export function stepPlayerController(
   // --- Timers. ---
   if (grounded) s.coyoteTicks = COYOTE_TICKS;
   else if (s.coyoteTicks > 0) s.coyoteTicks--;
-}
-
-const PROBE_OFFSETS: ReadonlyArray<readonly [number, number]> = [
-  [0, 0],
-  [0.22, 0],
-  [-0.22, 0],
-  [0, 0.22],
-  [0, -0.22],
-];
-
-function approach(v: number, target: number, step: number): number {
-  if (v < target) return Math.min(v + step, target);
-  if (v > target) return Math.max(v - step, target);
-  return v;
 }
 
 // Distance along the ray to the first WALL (panels/statics), hopping over

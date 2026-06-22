@@ -10,11 +10,12 @@
 
 import type { EcctrlSyncState } from "jolt-ts-character-controller";
 
-export const CHAR_STATE_FLOATS = 16;
-export const CHAR_STATE_BYTES = CHAR_STATE_FLOATS * 4 + 1; // 65
+export const CHAR_STATE_FLOATS = 17; // + jumpElapsed
+export const CHAR_STATE_BYTES = CHAR_STATE_FLOATS * 4 + 1; // 69
 
 const FLAG_ON_GROUND = 1 << 0;
 const FLAG_CAN_JUMP = 1 << 1;
+const FLAG_JUMP_ACTIVE = 1 << 2;
 
 // Write one controller state at `offset`; returns the next free byte offset.
 export function writeCharControllerState(
@@ -43,9 +44,11 @@ export function writeCharControllerState(
   f(state.gravityDir[0]);
   f(state.gravityDir[1]);
   f(state.gravityDir[2]);
+  f(state.jumpElapsed);
   let flags = 0;
   if (state.onGround) flags |= FLAG_ON_GROUND;
   if (state.canJump) flags |= FLAG_CAN_JUMP;
+  if (state.jumpActive) flags |= FLAG_JUMP_ACTIVE;
   view.setUint8(o, flags);
   return o + 1;
 }
@@ -63,6 +66,7 @@ export function readCharControllerState(view: DataView, offset = 0): EcctrlSyncS
   const rotation: [number, number, number, number] = [f(), f(), f(), f()];
   const angularVelocity: [number, number, number] = [f(), f(), f()];
   const gravityDir: [number, number, number] = [f(), f(), f()];
+  const jumpElapsed = f();
   const flags = view.getUint8(o);
   return {
     position,
@@ -72,6 +76,8 @@ export function readCharControllerState(view: DataView, offset = 0): EcctrlSyncS
     gravityDir,
     onGround: (flags & FLAG_ON_GROUND) !== 0,
     canJump: (flags & FLAG_CAN_JUMP) !== 0,
+    jumpActive: (flags & FLAG_JUMP_ACTIVE) !== 0,
+    jumpElapsed,
   };
 }
 

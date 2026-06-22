@@ -198,7 +198,7 @@ export interface Snapshot {
 }
 
 const SELF_FIXED = 4 + 4 + 1 + 1 + 1 + 2; // ack, tick, status, depth, hp, respawn
-const SELF_STATE = 6 * 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1; // pos/vel f64, flags+counters
+const SELF_STATE = 6 * 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 4; // pos/vel f64, flags+counters, jumpElapsed f32
 const REMOTE_BYTES = 1 + 1 + 3 * 4 + 4 + 2;
 const ENTITY_BYTES = 1 + 6 * 4 + 1;
 const CHUNK_BYTES = 2 + 7 * 4;
@@ -253,7 +253,9 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
       (st.fireHeld ? 4 : 0) |
       (st.grenadeHeld ? 8 : 0) |
       (st.meleeHeld ? 16 : 0) |
-      (st.buildHeld ? 32 : 0),
+      (st.buildHeld ? 32 : 0) |
+      (st.canJump ? 64 : 0) |
+      (st.jumpActive ? 128 : 0),
   );
   dv.setUint8(o + 1, st.coyoteTicks);
   dv.setUint8(o + 2, st.cooldownTicks);
@@ -262,6 +264,8 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
   dv.setUint8(o + 5, st.grenades);
   dv.setUint8(o + 6, st.supply);
   o += 7;
+  dv.setFloat32(o, st.jumpElapsed, true);
+  o += 4;
 
   dv.setUint8(o++, snap.remotes.length);
   for (const r of snap.remotes) {
@@ -358,14 +362,17 @@ export function decodeSnapshot(bytes: Uint8Array): Snapshot | null {
     grenadeHeld: (flags & 8) !== 0,
     meleeHeld: (flags & 16) !== 0,
     buildHeld: (flags & 32) !== 0,
+    canJump: (flags & 64) !== 0,
+    jumpActive: (flags & 128) !== 0,
     coyoteTicks: dv.getUint8(o + 1),
     cooldownTicks: dv.getUint8(o + 2),
     reloadTicks: dv.getUint8(o + 3),
     ammo: dv.getUint8(o + 4),
     grenades: dv.getUint8(o + 5),
     supply: dv.getUint8(o + 6),
+    jumpElapsed: dv.getFloat32(o + 7, true),
   };
-  o += 7;
+  o += 11;
 
   const remotes: RemoteSnap[] = [];
   const remoteCount = dv.getUint8(o++);
