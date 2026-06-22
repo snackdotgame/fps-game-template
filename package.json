@@ -15,6 +15,7 @@
     "build:server": "snack build",
     "test:char-sync": "esbuild scripts/char-controller-sync-test.ts --bundle --format=esm --platform=node --external:jolt-ts --external:module --outfile=node_modules/.cache/cc-sync-test.mjs && node node_modules/.cache/cc-sync-test.mjs",
     "test:reconcile": "esbuild scripts/movement-reconcile-test.ts --bundle --format=esm --platform=node --external:jolt-ts --external:jolt-ts/* --external:module --outfile=node_modules/.cache/reconcile-test.mjs && node node_modules/.cache/reconcile-test.mjs",
+    "test:controller": "esbuild scripts/controller-feel-test.ts --bundle --format=esm --platform=node --external:jolt-ts --external:jolt-ts/* --external:module --outfile=node_modules/.cache/controller-feel-test.mjs && node node_modules/.cache/controller-feel-test.mjs",
     "build": "vite build && snack build",
     "deploy": "vite build && snack deploy",
     "publish": "vite build && snack publish"

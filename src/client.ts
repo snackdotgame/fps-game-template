@@ -69,6 +69,7 @@ import {
   type GameWorld,
   type InputCmd,
   makeChar,
+  PLAYER_FLOAT_HEIGHT,
   PLAYER_HALF_HEIGHT,
   readChar,
   removeGrenadeBody,
@@ -1953,7 +1954,10 @@ function syncGhosts(snap: Snapshot): void {
       body = createPlayerBody(gw, 1000 + r.idx, [r.x, r.y, r.z], { kinematic: true });
       ghostBodies.set(r.idx, body);
     }
-    body.setTranslation([r.x, r.y + PLAYER_HALF_HEIGHT, r.z]);
+    // Match the floating collision height of the authoritative dynamic bodies
+    // (the capsule hovers PLAYER_FLOAT_HEIGHT above feet) so local prediction
+    // collides with remote ghosts at the same place the server sees them.
+    body.setTranslation([r.x, r.y + PLAYER_HALF_HEIGHT + PLAYER_FLOAT_HEIGHT, r.z]);
     body.setLinearVelocity(0, 0, 0);
   }
   for (const [idx, body] of ghostBodies) {

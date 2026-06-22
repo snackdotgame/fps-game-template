@@ -106,17 +106,40 @@ export const PLAYER_HALF_CYL = 0.45;
 export const PLAYER_HALF_HEIGHT = PLAYER_RADIUS + PLAYER_HALF_CYL; // 0.8
 export const PLAYER_HEIGHT = PLAYER_HALF_HEIGHT * 2; // 1.6
 export const EYE_HEIGHT = 1.45; // above feet
+// ecctrl floats the capsule this far above ground contact (the controller's
+// `floatHeight`). The collision capsule hovers here; feet-space CharState
+// subtracts it back out (see FLOAT_OFFSET) so gameplay still measures true feet.
+export const PLAYER_FLOAT_HEIGHT = 0.2;
 
 export const DT = 1 / TICK_RATE;
-export const GRAVITY = 22;
+// ~1.4x Earth gravity: lighter than an arcade-snappy 22 but still grounded.
+// JUMP_VEL is tuned alongside it to preserve the jump height (~1.38 m apex,
+// measured — ecctrl's float spring assists the launch above the naive v^2/2g).
+export const GRAVITY = 14;
 const WALK_SPEED = 5.2;
 const SPRINT_SPEED = 7.6;
-const JUMP_VEL = 6.8;
+const JUMP_VEL = 5.6;
 const COYOTE_TICKS = 4;
-export const STEP_MAX = 0.55; // kept for importers; step-up not yet ported to the controller
-// NOTE(branch): the bespoke ground probe, ground/air accel, friction, ladder,
-// and step-up constants were removed when EcctrlJoltController took over
-// locomotion. Re-add equivalents when porting ladders + step-up onto it.
+export const STEP_MAX = 0.55; // kept for importers; stair step-up handled by the controller now
+// NOTE(branch): the bespoke ground probe, ground/air accel, friction, and
+// step-up constants were dropped when EcctrlJoltController took over locomotion.
+// Ladders are still handled here (the controller has no ladder concept).
+const LADDER_REACH = 0.85;
+const LADDER_CLIMB = 3.0;
+
+// Ladder volumes are map data; the controller climbs whichever one the capsule
+// overlaps. Returns the ladder when the player hugs its wall face.
+function ladderAt(x: number, feetY: number, z: number): { nx: number; nz: number } | null {
+  for (const l of MAP.ladders) {
+    const out = (x - l.x) * l.nx + (z - l.z) * l.nz; // off the wall face
+    if (out < -0.1 || out > LADDER_REACH) continue;
+    const along = (x - l.x) * -l.nz + (z - l.z) * l.nx;
+    if (Math.abs(along) > 0.6) continue;
+    if (feetY < -0.5 || feetY > l.y1 - 0.1) continue;
+    return l;
+  }
+  return null;
+}
 
 export function makeChar(spawn: readonly number[]): CharState {
   return {
@@ -193,14 +216,24 @@ export interface GameWorld {
 // controller's full deterministic state without threading it through everywhere.
 const playerControllers = new WeakMap<Body, EcctrlJoltController>();
 
-// Controller equilibrium: the floating capsule rests this far above where the
-// grounded capsule sat, so feet = bodyCenterY - PLAYER_HALF_HEIGHT - FLOAT_OFFSET
+// Controller equilibrium: the floating capsule rests `floatHeight` above where
+// a grounded capsule sat, so feet = bodyCenterY - PLAYER_HALF_HEIGHT - FLOAT_OFFSET
 // keeps CharState in the same feet-space the rest of the game uses.
-const FLOAT_OFFSET = 0;
+const FLOAT_OFFSET = PLAYER_FLOAT_HEIGHT;
+
+// ecctrl's default capsule (r=0.3, h=0.3) at the engine's default density is
+// ~0.283 kg, and springK/dampingC are tuned for that. The float spring is the
+// one controller force that is NOT mass-normalized, so on our heavy default-
+// density capsule (~526 kg) the spring is ~1900x too soft and the player slowly
+// bobs ~0.4 m up and down. Scale springK/dampingC with the actual body mass to
+// reproduce ecctrl's intended float on any body (per the ecctrl docs: "If you
+// increase collider density heavily, retune springK, dampingC").
+const ECCTRL_REF_MASS = 0.283;
 
 // Build the per-player character controller options once (client and server
 // must match exactly for deterministic prediction).
 function makePlayerController(world: World, body: Body): EcctrlJoltController {
+  const massScale = body.mass() / ECCTRL_REF_MASS;
   return new EcctrlJoltController({
     world,
     body,
@@ -212,6 +245,13 @@ function makePlayerController(world: World, body: Body): EcctrlJoltController {
     maxWalkVel: WALK_SPEED,
     maxRunVel: SPRINT_SPEED,
     jumpVel: JUMP_VEL,
+    floatHeight: PLAYER_FLOAT_HEIGHT,
+    springK: 80 * massScale,
+    dampingC: 6 * massScale,
+    // Don't let the controller amplify gravity: the player falls at the world's
+    // GRAVITY like every other body (ecctrl's default fallingGravityScale=3 made
+    // the heavy capsule plummet at ~66 m/s^2). Rising already uses gravityFactor 1.
+    fallingGravityScale: 1,
   });
 }
 
@@ -542,7 +582,7 @@ export function createPlayerBody(
   const body = gw.world.createBody({
     type: opts?.kinematic ? "kinematic" : "dynamic",
     shape: Shape.capsule({ halfHeight: PLAYER_HALF_CYL, radius: PLAYER_RADIUS }),
-    position: [feet[0], feet[1] + PLAYER_HALF_HEIGHT, feet[2]],
+    position: [feet[0], feet[1] + PLAYER_HALF_HEIGHT + FLOAT_OFFSET, feet[2]],
     layer: "moving",
     friction: 0,
     restitution: 0,
@@ -625,7 +665,7 @@ export function readChar(body: Body, s: CharState): void {
   const pos = body.translation();
   const vel = body.linearVelocity();
   s.x = pos.x;
-  s.y = pos.y - PLAYER_HALF_HEIGHT;
+  s.y = pos.y - PLAYER_HALF_HEIGHT - FLOAT_OFFSET;
   s.z = pos.z;
   s.vx = vel.x;
   s.vy = vel.y;
@@ -640,7 +680,7 @@ export function writeChar(body: Body, s: CharState): void {
     controller.applySyncState(syncStateFromChar(s));
     return;
   }
-  body.setTranslation([s.x, s.y + PLAYER_HALF_HEIGHT, s.z]);
+  body.setTranslation([s.x, s.y + PLAYER_HALF_HEIGHT + FLOAT_OFFSET, s.z]);
   body.setLinearVelocity(s.vx, s.vy, s.vz);
 }
 
@@ -700,34 +740,76 @@ export function stepPlayerController(
 ): void {
   const controller = playerControllers.get(body);
   const locked = opts.locked === true;
+  const pos = body.translation();
+  const feetY = pos.y - PLAYER_HALF_HEIGHT - FLOAT_OFFSET;
 
   // --- Locomotion via the jolt-ts character controller. ---
-  // moveX/moveZ is already a world-space, yaw-relative move vector, so feed it
-  // straight in as the controller's custom forward axis and walk along it.
+  // moveX/moveZ is already a world-space, yaw-relative move vector, so feed its
+  // unit direction in as the controller's custom forward axis.
   const mx = locked ? 0 : input.moveX;
   const mz = locked ? 0 : input.moveZ;
   const mag = Math.hypot(mx, mz);
   const moving = mag > 1e-3;
+  const ndx = moving ? mx / mag : 0;
+  const ndz = moving ? mz / mag : 0;
   // Sprint only when moving roughly toward where the player is looking.
-  const fdx = Math.sin(input.yaw);
-  const fdz = Math.cos(input.yaw);
-  const forwardness = moving ? (mx * fdx + mz * fdz) / mag : 0;
+  const forwardness = ndx * Math.sin(input.yaw) + ndz * Math.cos(input.yaw);
   const sprinting = !locked && input.sprint && moving && forwardness > 0.5;
-  if (controller) {
-    if (moving) controller.setForwardDirection({ x: mx / mag, y: 0, z: mz / mag });
+  const jumpPressed = !locked && input.jump && !s.jumpHeld;
+
+  // Ladders: the controller has no ladder concept, so handle them here. Climb
+  // while pushing into / holding the ladder (or jump off it); pulling away
+  // falls through to normal controller movement + gravity.
+  const ladder = locked ? null : ladderAt(pos.x, feetY, pos.z);
+  const into = ladder ? -(ndx * ladder.nx + ndz * ladder.nz) : 0;
+  const onLadder = ladder !== null && (jumpPressed || into >= -0.25);
+
+  if (controller && onLadder && ladder) {
+    const lv = body.linearVelocity();
+    let lvx = lv.x;
+    let lvy = lv.y;
+    let lvz = lv.z;
+    if (jumpPressed) {
+      lvy = JUMP_VEL * 0.7; // kick off the ladder
+      lvx = ladder.nx * 3.5;
+      lvz = ladder.nz * 3.5;
+    } else if (into > 0.25) {
+      lvy = LADDER_CLIMB; // climb up
+      lvx = ndx * 1.2;
+      lvz = ndz * 1.2;
+    } else {
+      lvy = 0; // hold on: cancel gravity and slide slowly
+      lvx *= 0.2;
+      lvz *= 0.2;
+    }
+    // Drive the body directly this tick (no float/gravity) while keeping the
+    // controller's restorable state consistent for reconciliation.
+    controller.applySyncState({
+      position: [pos.x, pos.y, pos.z],
+      linearVelocity: [lvx, lvy, lvz],
+      rotation: [0, 0, 0, 1],
+      angularVelocity: [0, 0, 0],
+      gravityDir: [0, -1, 0],
+      onGround: false,
+      canJump: !jumpPressed,
+      jumpActive: false,
+      jumpElapsed: 0,
+    });
+    s.onGround = false;
+  } else if (controller) {
+    if (moving) controller.setForwardDirection({ x: ndx, y: 0, z: ndz });
     controller.setMovement({ forward: moving, run: sprinting, jump: !locked && input.jump });
     controller.step(DT);
+    s.onGround = controller.getSyncState().onGround;
+  } else {
+    s.onGround = false;
   }
   s.jumpHeld = input.jump;
-  // Post-step body velocity (inherited by thrown grenades); ground state comes
-  // back through readChar below.
+  // Body velocity (inherited by thrown grenades).
   const vel = body.linearVelocity();
   const vx = vel.x;
   const vz = vel.z;
-  const grounded = controller ? controller.getSyncState().onGround : false;
-  s.onGround = grounded;
-  // TODO(branch): ladder climbing and stair step-up are not yet reimplemented
-  // on top of the character controller (the prior bespoke logic handled them).
+  const grounded = s.onGround;
 
   // --- Weapons (deterministic state; effects via hooks). ---
   if (SANDBOX) {
