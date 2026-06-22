@@ -253,6 +253,7 @@ export class GameSim {
   private nextBuiltPanelId = BUILT_PANEL_ID_BASE;
   private pendingHpUpdates = new Map<number, number>();
   private pendingDestroys: number[] = [];
+  private pendingRubble: PanelDef[] = [];
   // Slabs whose damage set changed this tick — collision rebuilds are batched.
   private readonly dirtySlabs = new Set<number>();
   private readonly pieceAlive = (id: number): boolean => !this.destroyedPanels.has(id);
@@ -824,7 +825,7 @@ export class GameSim {
     };
     addPanelBody(this.gw, def);
     this.builtPanels.set(def.id, def);
-    this.outbox.push({ type: "build", panel: def, byIdx: -1 });
+    this.pendingRubble.push(def); // batched into one "rubble" message per tick
   }
 
   private collapseBuilding(buildingId: number): void {
@@ -846,6 +847,10 @@ export class GameSim {
     if (this.pendingHpUpdates.size > 0) {
       this.outbox.push({ type: "panelhp", updates: [...this.pendingHpUpdates.entries()] });
       this.pendingHpUpdates = new Map();
+    }
+    if (this.pendingRubble.length > 0) {
+      this.outbox.push({ type: "rubble", panels: this.pendingRubble });
+      this.pendingRubble = [];
     }
     if (this.pendingDestroys.length === 0) return;
     this.outbox.push({ type: "destroy", panelIds: this.pendingDestroys });

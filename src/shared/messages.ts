@@ -44,6 +44,10 @@ export type ServerMsg =
   | { type: "settle"; chunkId: number; pieces: PanelDef[] }
   | { type: "crater"; crater: Crater }
   | { type: "build"; panel: PanelDef; byIdx: number }
+  // Explosion debris fragments, batched into one message per tick: a single
+  // grenade can shed dozens, and one reliable write per fragment floods the
+  // stream (writes get dropped → destruction desyncs until the next reload).
+  | { type: "rubble"; panels: PanelDef[] }
   | { type: "score"; scores: [number, number] }
   | {
       type: "phase";

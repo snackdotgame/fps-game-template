@@ -82,7 +82,7 @@ export const EXPLOSION_PANEL_OUTER_DAMAGE = 65;
 export const RUBBLE_HEIGHT = 0.55;
 
 export type Team = 0 | 1;
-export const TEAM_NAMES = ["Orange", "Blue"];
+export const TEAM_NAMES = ["Red", "Blue"];
 
 // Bots fill the server up to this many participants so there's always
 // something to fight; each joining human replaces one bot (and bots return

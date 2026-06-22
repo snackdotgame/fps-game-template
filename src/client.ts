@@ -84,8 +84,8 @@ import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
 
-const TEAM_COLORS = [0xe8743a, 0x3a7be8];
-const TEAM_COLORS_CSS = ["#e8743a", "#3a7be8"];
+const TEAM_COLORS = [0xd23f3f, 0x3a7be8]; // red vs blue
+const TEAM_COLORS_CSS = ["#d23f3f", "#3a7be8"];
 
 // ---------------------------------------------------------------------------
 // Renderer / scene.
@@ -1276,12 +1276,12 @@ const sounds = {
   },
   shotFar: (d: number) => noiseBurst(0.12, Math.max(0.02, 0.14 - d * 0.002), true),
   explosionAt: (at: THREE.Vector3) => {
-    // A sharp full-spectrum crack for the attack, the heavy impact sample at
-    // near-natural pitch for body, and a short low thump underneath — punchy,
-    // not the old pitched-down, sub-bass-drone muffle.
-    noiseBurst(0.22, 0.6, false, at);
-    void playSoundAt("impactSoft_heavy", at, 0.85, 0.95);
-    blip(80, 0.32, 0.22, "sine", at);
+    // A big, LOUD blast — should dominate gunfire: a sharp crack, a longer
+    // low rumble for body, the heavy impact sample, and a deep sub boom.
+    noiseBurst(0.3, 1.4, false, at); // sharp crack
+    noiseBurst(0.6, 1.0, true, at); // low rumble body
+    void playSoundAt("impactSoft_heavy", at, 1.5, 0.9); // blast body
+    blip(70, 0.5, 0.5, "sine", at); // deep sub boom
   },
   hitmarker: () => blip(1450, 0.07, 0.2),
   // Landed a bullet on an enemy: a meaty flesh thwack plus the confirm tick.
@@ -1760,6 +1760,15 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       }
       break;
     }
+    case "rubble": {
+      // Explosion debris, batched. Pure visuals/collision — no build sound.
+      for (const panel of msg.panels) {
+        builtList.push(panel);
+        if (gw) addPanelBody(gw, panel);
+        addBuiltPanelVisual(panel);
+      }
+      break;
+    }
     case "score": {
       scores = [msg.scores[0], msg.scores[1]];
       break;
@@ -2222,21 +2231,13 @@ function loadExternalVisualAssets(): void {
     .then((manifest: ToonShooterManifest | null) => {
       const urls = manifest?.characters ?? [];
       const soldierUrl = urls.find((u) => /soldier/i.test(u)) ?? urls[0];
-      const enemyUrl = urls.find((u) => /enemy/i.test(u)) ?? soldierUrl;
-      // Load both characters + the weapon in parallel so the models are ready
-      // as soon as possible (the frame loop swaps each team in on arrival).
+      // One soldier model for both teams, tinted red vs blue per instance.
+      // Loading a single character keeps the models ready fast (the frame loop
+      // swaps them in on arrival, before the box rig is ever revealed).
       if (soldierUrl) {
         void loadCharacterTemplate(soldierUrl)
           .then((t) => {
             characterTemplates[0] = t;
-            if (!enemyUrl || enemyUrl === soldierUrl) characterTemplates[1] ??= t;
-          })
-          .catch(() => {});
-      }
-      if (enemyUrl && enemyUrl !== soldierUrl) {
-        void loadCharacterTemplate(enemyUrl)
-          .then((t) => {
-            characterTemplates[1] = t;
           })
           .catch(() => {});
       }
@@ -2366,6 +2367,11 @@ function setEmissive(material: THREE.Material, color: number): void {
   }
 }
 
+function setColor(material: THREE.Material, color: number): void {
+  const candidate = material as THREE.Material & { color?: unknown };
+  if (candidate.color instanceof THREE.Color) candidate.color.setHex(color);
+}
+
 function cloneExternalModel(template: THREE.Group, team: number, accent = true): THREE.Group {
   const clone = cloneSkeleton(template) as THREE.Group;
   clone.traverse((o) => {
@@ -2402,9 +2408,14 @@ function instantiateCharacter(team: number): CharacterInstance | null {
   const tpl = characterTemplates[team] ?? characterTemplates[0];
   if (!tpl) return null;
   const root = cloneSkeleton(tpl.scene) as THREE.Group;
+  const teamTint = TEAM_COLORS[team] ?? TEAM_COLORS[0];
   root.traverse((o) => {
     if (o instanceof THREE.Mesh) {
       o.material = cloneMaterials(o.material);
+      // Tint the main uniform/helmet to the team colour: red vs blue soldiers.
+      visitMeshMaterials(o, (m) => {
+        if (m.name === "Character_Main") setColor(m, teamTint);
+      });
       o.castShadow = true;
       o.receiveShadow = true;
       o.frustumCulled = false; // skinned bounds drift off-origin; don't cull limbs
@@ -2457,12 +2468,14 @@ function updateCharacterAnim(
     clip = "HitReact"; // a brief flinch when they take a bullet
   else if (airborne) clip = "Jump_Idle";
   else if (shooting) clip = running ? "Run_Shoot" : moving ? "Walk_Shoot" : "Idle_Shoot";
-  else if (running) {
-    clip = "Run";
-    timeScale = sprinting ? 1.3 : 1; // sprint = a faster run
+  else if (sprinting) {
+    clip = "Run"; // head-down sprint, weapon lowered (and can't fire)
+    timeScale = 1.2;
   } else if (moving) {
-    clip = "Walk";
-    timeScale = 1.15;
+    // Jog carrying the weapon in both hands at the ready (Run_Gun), time-scaled
+    // to ground speed so the feet don't slide.
+    clip = "Run_Gun";
+    timeScale = Math.max(0.8, Math.min(1.2, speed / 5.2));
   } else clip = "Idle";
   playClip(anim, clip, 0.18, timeScale);
   if (moving && !airborne) {
@@ -2840,11 +2853,16 @@ const viewModel = new THREE.Group();
   fallbackRoot.add(barrel, bodyM, grip);
   viewModel.add(fallbackRoot);
   viewModel.userData.fallbackRoot = fallbackRoot;
+  // Hidden by default so the blocky placeholder gun never flashes while
+  // connecting; the AK model attaches over it, and the grace fallback below
+  // only reveals it if the model is slow/fails to load.
+  fallbackRoot.visible = false;
   viewModel.position.set(0.2, -0.3, -0.34);
   camera.add(viewModel);
   attachExternalViewWeapon();
 }
 scene.add(camera);
+const VIEW_WEAPON_BORN = performance.now();
 
 // Barrel tip of the AK in view-model space (used as the tracer origin). The AK
 // muzzle sits at the model's -X end which the view-weapon yaw turns onto -Z.
@@ -3288,6 +3306,12 @@ function frame(): void {
     viewModel.rotation.z = sway * 0.35;
   }
   viewModel.visible = (selfStatus & SS_DEAD) === 0;
+  // Grace fallback: only show the blocky placeholder gun if the AK model never
+  // arrived after a few seconds (so it doesn't flash during connect).
+  if (viewModel.userData.externalAttached !== true && now - VIEW_WEAPON_BORN > 3000) {
+    const fb = viewModel.userData.fallbackRoot as THREE.Object3D | undefined;
+    if (fb) fb.visible = true;
+  }
 
   // Build preview while holding Q-able state (always shown when alive + supply).
   if (predState && (selfStatus & SS_DEAD) === 0 && keys.has("KeyQ") && predState.supply > 0) {
