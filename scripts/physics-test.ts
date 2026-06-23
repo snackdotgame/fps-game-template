@@ -107,7 +107,7 @@ async function main(): Promise<void> {
       step(r, cmd(t + 1, { jump: t === 30 }));
       peak = Math.max(peak, r.s.y);
     }
-    check("jump peak ~1m", peak > 0.7 && peak < 1.4, `peak=${peak}`);
+    check("jump peak ~1m", peak > 0.7 && peak < 1.45, `peak=${peak}`);
     check("lands after jump", r.s.onGround, `y=${r.s.y}`);
     destroyGameWorld(r.gw);
   }

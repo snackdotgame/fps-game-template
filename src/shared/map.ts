@@ -32,7 +32,9 @@ export type PanelMaterial =
   | "concrete" // precast panel — fewer, bigger, tougher pieces
   | "glass" // windowpane — one hit shatters it
   | "rubble" // chunk left behind by a destroyed piece (spawned at runtime)
-  | "metal"; // deployed cover sheet (built at runtime)
+  | "metal" // deployed cover sheet (built at runtime)
+  | "stone" // flagstone floor slab
+  | "stair"; // staircase tread — effectively indestructible so floors stay reachable
 
 export interface PanelDef {
   id: number;
@@ -73,6 +75,8 @@ export const PANEL_HP: Record<PanelMaterial, number> = {
   glass: 10, // any hit shatters it
   rubble: 40,
   metal: 120,
+  stone: 140, // tough flagstone flooring
+  stair: 100000, // effectively indestructible (also blast-exempt in sim)
 };
 
 export interface BuildingDef {
@@ -450,6 +454,70 @@ function masonryRun(
   endSlab(g, slabFirst);
 }
 
+// An interior partition wall: a cut running along `axis` at the fixed
+// cross-coordinate, spanning [lo,hi].
+interface InteriorWall {
+  axis: "x" | "z";
+  fixed: number;
+  lo: number;
+  hi: number;
+}
+
+// Slice-BSP of an interior rectangle into rooms; returns the internal walls
+// (the cuts). The cut hierarchy is a TREE, so emitting one doorway per wall
+// already makes every room reachable — no separate connectivity pass needed.
+// `cx,cz` are the building center; cuts steer clear of the exterior walls'
+// centered window/door openings so interior walls never butt into a window.
+function partitionInterior(
+  x0: number,
+  z0: number,
+  x1: number,
+  z1: number,
+  cx: number,
+  cz: number,
+  rng: () => number,
+): InteriorWall[] {
+  const MIN = 3.0; // smallest room dimension (clear)
+  const out: InteriorWall[] = [];
+  const snap = (v: number): number => Math.round(v / 0.5) * 0.5;
+  const avoid = (pos: number, center: number, lo: number, hi: number): number => {
+    if (Math.abs(pos - center) >= 1.3) return pos;
+    const pushed = pos < center ? center - 1.3 : center + 1.3;
+    return Math.max(lo, Math.min(hi, pushed));
+  };
+  const rec = (ax0: number, az0: number, ax1: number, az1: number, depth: number): void => {
+    const w = ax1 - ax0;
+    const d = az1 - az0;
+    if (Math.max(w, d) < 2 * MIN) return;
+    if (depth >= 1 && rng() < 0.18 * depth) return; // stochastic stop -> varied room counts
+    let splitX = w >= d;
+    if (Math.abs(w - d) < 1.2) splitX = rng() < 0.5;
+    if (splitX && w < 2 * MIN) splitX = false;
+    if (!splitX && d < 2 * MIN) splitX = true;
+    if (splitX) {
+      const lo = ax0 + MIN;
+      const hi = ax1 - MIN;
+      if (hi <= lo) return;
+      let pos = snap(lo + (hi - lo) * (0.5 + (rng() - 0.5) * 0.5));
+      pos = avoid(Math.max(lo, Math.min(hi, pos)), cx, lo, hi);
+      out.push({ axis: "z", fixed: pos, lo: az0, hi: az1 });
+      rec(ax0, az0, pos, az1, depth + 1);
+      rec(pos, az0, ax1, az1, depth + 1);
+    } else {
+      const lo = az0 + MIN;
+      const hi = az1 - MIN;
+      if (hi <= lo) return;
+      let pos = snap(lo + (hi - lo) * (0.5 + (rng() - 0.5) * 0.5));
+      pos = avoid(Math.max(lo, Math.min(hi, pos)), cz, lo, hi);
+      out.push({ axis: "x", fixed: pos, lo: ax0, hi: ax1 });
+      rec(ax0, az0, ax1, pos, depth + 1);
+      rec(ax0, pos, ax1, az1, depth + 1);
+    }
+  };
+  rec(x0, z0, x1, z1, 0);
+  return out;
+}
+
 export type BuildingStyle = "brick" | "log" | "concrete";
 
 export interface BuildingOpts {
@@ -641,11 +709,44 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
         ex: 1.05,
         ey: 0.12,
         ez: 0.5,
-        material: "plank",
+        material: "stair",
         buildingId: id,
       });
     }
     endSlab(g, flightFirst);
+  }
+
+  // Ground floor: a flat, walkable surface so interiors read as rooms, not open
+  // dirt — stone flagstones for masonry houses, board planks for log cabins.
+  // (The pad under every building is flattened, so this sits flush.)
+  {
+    const floorFirst = nextPanelId;
+    const wood = style === "log";
+    const tlen = wood ? 1.8 : 1.4;
+    const twid = wood ? 1.2 : 1.4;
+    const th = wood ? 0.1 : 0.14;
+    const fy = th / 2 + 0.03;
+    const nfx = Math.max(1, Math.round(w / tlen));
+    const nfz = Math.max(1, Math.round(d / twid));
+    const tx = w / nfx;
+    const tz = d / nfz;
+    for (let iz = 0; iz < nfz; iz++) {
+      for (let ix = 0; ix < nfx; ix++) {
+        roofIds.push(nextPanelId);
+        g.panels.push({
+          id: nextPanelId++,
+          x: x0 + (ix + 0.5) * tx,
+          y: fy,
+          z: z0 + (iz + 0.5) * tz,
+          ex: tx - 0.03,
+          ey: th,
+          ez: tz - 0.03,
+          material: wood ? "plank" : "stone",
+          buildingId: id,
+        });
+      }
+    }
+    endSlab(g, floorFirst);
   }
 
   // Floors between stories (and the roof sheet when flat): staggered planks
@@ -694,6 +795,51 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
       }
     }
     endSlab(g, levelFirst);
+  }
+
+  // Interior partition: each story is carved into rooms with doorways. On
+  // multi-story buildings the stairwell column (west) is left open as a hall —
+  // the partition only divides the area east of it, so no cut crosses the
+  // flights. The same plan repeats per story, so interior walls stack and stay
+  // structurally bonded. One doorway per cut already connects every room (the
+  // cut hierarchy is a tree), and a few wide walls get a second for flanking.
+  {
+    const inset = unit.t / 2 + 0.03;
+    const iz0 = z0 + inset;
+    const iz1 = z1 - inset;
+    const ix1 = x1 - inset;
+    const rx0 = (stories > 1 ? x0 + 3.4 : x0) + inset;
+    const roomWalls = partitionInterior(rx0, iz0, ix1, iz1, cx, cz, o.rng);
+    const doorGap = (mid: number, baseY: number): GapRect => ({
+      lo: mid - 0.55,
+      hi: mid + 0.55,
+      y0: baseY,
+      y1: baseY + 2.05,
+    });
+    for (let story = 0; story < stories; story++) {
+      const baseY = story * WALL_HEIGHT;
+      for (const wseg of roomWalls) {
+        const span = wseg.hi - wseg.lo;
+        if (span < 1.8) continue;
+        const gaps: GapRect[] = [doorGap(wseg.lo + 0.8 + o.rng() * (span - 1.6), baseY)];
+        if (span > 6.5 && o.rng() < 0.35) {
+          gaps.push(doorGap(wseg.lo + 0.8 + o.rng() * (span - 1.6), baseY));
+        }
+        masonryRun(
+          g,
+          wseg.axis,
+          wseg.lo,
+          wseg.hi,
+          wseg.fixed,
+          baseY,
+          rowsPerStory,
+          unit,
+          style,
+          id,
+          gaps,
+        );
+      }
+    }
   }
 
   // Balcony platform + solid parapet (good cover up there).
@@ -809,7 +955,13 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
     w,
     d,
     wallPanelIds: mine
-      .filter((p) => p.material !== "plank" && p.material !== "glass")
+      .filter(
+        (p) =>
+          p.material !== "plank" &&
+          p.material !== "glass" &&
+          p.material !== "stone" &&
+          p.material !== "stair",
+      )
       .map((p) => p.id),
     roofPanelIds: [...roofIds, ...glassIds],
     // Higher than before the release cascade existed: walls now genuinely
