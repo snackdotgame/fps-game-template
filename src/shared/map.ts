@@ -1189,27 +1189,11 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
   });
 }
 
-// Quaternion [x,y,z,w] rotating +Y onto the (dx,dy,dz) direction — used to aim
-// branch cylinders (which are modelled along Y) out along a limb.
-function quatFromY(dx: number, dy: number, dz: number): [number, number, number, number] {
-  const len = Math.hypot(dx, dy, dz) || 1;
-  const ux = dx / len;
-  const uy = dy / len;
-  const uz = dz / len;
-  // axis = cross(+Y, u) = (uz, 0, -ux); angle = acos(uy)
-  const al = Math.hypot(uz, ux);
-  if (al < 1e-5) return uy >= 0 ? [0, 0, 0, 1] : [1, 0, 0, 0];
-  const ang = Math.acos(Math.max(-1, Math.min(1, uy)));
-  const s = Math.sin(ang / 2) / al;
-  return [uz * s, 0, -ux * s, Math.cos(ang / 2)];
-}
-
-// Procedural trees: conifers (ragged stacked tiers) and broadleaf (a clear
-// trunk that splits into limbs, each carrying a clump of leaf-card foliage), in
-// size classes with a tapered, sometimes leaning trunk. The trunk is the
-// structure — break two segments and it falls. Each tree tags its canopy/trunk
-// pieces with a seed band so pieceColor gives it one coherent species/season
-// (incl. autumn & dry) while clumps still vary.
+// Procedural trees: conifers (ragged stacked tiers) and broadleaf (layered,
+// asymmetric, drooping crowns), in size classes with a tapered, sometimes
+// leaning trunk. The trunk is the structure — break two segments and it falls.
+// Each tree tags its canopy/trunk pieces with a seed band so pieceColor gives
+// it one coherent species/season (incl. autumn & dry) while clumps still vary.
 function tree(g: Gen, x: number, z: number, rng: () => number): void {
   const slabFirst = nextPanelId;
   const id = nextBuildingId++;
@@ -1287,85 +1271,48 @@ function tree(g: Gen, x: number, z: number, rng: () => number): void {
       buildingId: id,
     });
   };
-  // An angled limb (trunk-material cylinder) from b to t; falls with the tree
-  // (roof piece), not part of the structural count.
-  const branch = (
-    b: [number, number, number],
-    t: [number, number, number],
-    girth: number,
-  ): void => {
-    const dx = t[0] - b[0];
-    const dy = t[1] - b[1];
-    const dz = t[2] - b[2];
-    canopyIds.push(nextPanelId);
-    g.panels.push({
-      id: nextPanelId++,
-      x: (b[0] + t[0]) / 2,
-      y: (b[1] + t[1]) / 2,
-      z: (b[2] + t[2]) / 2,
-      ex: girth,
-      ey: Math.hypot(dx, dy, dz),
-      ez: girth,
-      material: "trunk",
-      rot: quatFromY(dx, dy, dz),
-      seed: bark | (serial++ << 2),
-      buildingId: id,
-    });
-  };
-  const trunkAt = (hf: number): [number, number, number] => [
-    x + Math.sin(leanA) * leanAmt * span * hf,
-    base + span * hf,
-    z + Math.cos(leanA) * leanAmt * span * hf,
-  ];
   if (conifer) {
-    // Stacked tiers of leaf cards hugging the trunk, narrowing to a spire.
-    const tiers = 4 + (big ? 2 : 0);
-    const baseR = big ? 2.2 : 1.6;
-    for (let ti = 0; ti < tiers; ti++) {
-      const f = 1 - ti / tiers;
-      const rad = 0.35 + baseR * f;
-      const cy = top - (tiers - 1 - ti) * (span * 0.16) - 0.1;
-      const ring = 4 + Math.floor(f * 3);
+    const tiers = 3 + (big ? 1 : 0);
+    const baseR = big ? 2.0 : 1.5;
+    for (let t = 0; t < tiers; t++) {
+      const f = 1 - t / tiers;
+      const rad = 0.5 + baseR * f;
+      const cy = top - (tiers - 1 - t) * 0.95 - 0.2;
+      const ring = 3 + Math.floor(f * 2);
       for (let k = 0; k < ring; k++) {
-        const a = (k / ring) * Math.PI * 2 + ti * 0.7;
+        const a = (k / ring) * Math.PI * 2 + t * 0.7;
         clump(
-          topX + Math.cos(a) * rad * 0.6,
-          cy,
-          topZ + Math.sin(a) * rad * 0.6,
-          rad * 0.8 + 0.4,
-          rad * 0.7 + 0.5,
-          rad * 0.8 + 0.4,
+          topX + Math.cos(a) * rad * 0.7,
+          cy - 0.12,
+          topZ + Math.sin(a) * rad * 0.7,
+          rad * 0.7 + 0.4,
+          0.55,
+          rad * 0.7 + 0.4,
         );
       }
     }
-    clump(topX, top + 0.6, topZ, 0.9, 1.3, 0.9); // spire
+    clump(topX, top + 0.7, topZ, 0.7, 1.0, 0.7); // spire
   } else {
-    // A clear trunk that splits into limbs, each carrying a clump of foliage,
-    // plus a crown over the top — so leaves sit ON branches, not floating.
-    const crownR = (big ? 2.6 : small ? 1.3 : 2.0) + rng() * 0.4;
-    const nBranch = 3 + (big ? 2 : 0) + Math.floor(rng() * 2);
-    clump(topX, top + 0.2, topZ, crownR, crownR * 0.85, crownR);
-    for (let i = 0; i < nBranch; i++) {
-      const yaw = (i / nBranch) * Math.PI * 2 + rng() * 0.7;
-      const b = trunkAt(0.62 + rng() * 0.3);
-      const reach = crownR * (0.7 + rng() * 0.5);
-      const t3: [number, number, number] = [
-        b[0] + Math.cos(yaw) * reach,
-        b[1] + 0.6 + rng() * 1.2,
-        b[2] + Math.sin(yaw) * reach,
-      ];
-      branch(b, t3, girth0 * (0.32 + rng() * 0.12));
-      const cs = crownR * (0.55 + rng() * 0.3);
-      clump(t3[0], t3[1] + cs * 0.2, t3[2], cs, cs * 0.8, cs);
-      if (rng() < 0.6) {
-        const a2 = yaw + (rng() - 0.5);
+    const crownR = (big ? 2.4 : small ? 1.2 : 1.8) + rng() * 0.4;
+    const layers = 3 + (big ? 1 : 0);
+    const ax = Math.cos(leanA + 1) * 0.3 * crownR; // light-seeking asymmetry
+    const az = Math.sin(leanA + 1) * 0.3 * crownR;
+    for (let L = 0; L < layers; L++) {
+      const lf = (L + 0.6) / (layers + 0.6);
+      const layerR = crownR * Math.sin(Math.PI * lf);
+      const cy = top - 0.3 + L * 0.85;
+      const ring = 3 + Math.round(layerR * 1.1);
+      for (let k = 0; k < ring; k++) {
+        const a = (k / ring) * Math.PI * 2 + L;
+        const rr = layerR * (0.55 + 0.45 * rng());
+        const s = 0.7 + layerR * 0.32 * (0.7 + 0.6 * rng());
         clump(
-          t3[0] + Math.cos(a2) * cs * 0.5,
-          t3[1] + 0.1,
-          t3[2] + Math.sin(a2) * cs * 0.5,
-          cs * 0.8,
-          cs * 0.7,
-          cs * 0.8,
+          topX + ax + Math.cos(a) * rr,
+          cy - rr * 0.15,
+          topZ + az + Math.sin(a) * rr,
+          s,
+          s * 0.8,
+          s,
         );
       }
     }
