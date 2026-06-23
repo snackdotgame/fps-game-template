@@ -25,6 +25,7 @@
       }
     },
     "name": "Breachpoint",
+    "titleImage": "assets/vendor/quaternius-toon-shooter/Preview.jpg",
     "visibility": "public",
     "slug": "breachpoint",
     "id": "dfcbff67-a970-4e0e-b355-557d9770b1a4"
