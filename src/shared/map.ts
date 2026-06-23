@@ -1341,6 +1341,210 @@ function rocks(g: Gen, x: number, z: number, rng: () => number): void {
   endSlab(g, slabFirst);
 }
 
+// --- Small props: cheap box clusters that make the place feel lived-in. All
+// reuse existing materials and become destructible cover.
+
+// A low leafy bush: a squashed dome of canopy boxes (no trunk).
+function bush(g: Gen, x: number, z: number, rng: () => number): void {
+  const slabFirst = nextPanelId;
+  const base = baseHeightAt(x, z);
+  const band = rng() < 0.18 ? 6 : rng() < 0.32 ? 1 : 0;
+  const n = 4 + Math.floor(rng() * 4);
+  for (let i = 0; i < n; i++) {
+    const a = rng() * Math.PI * 2;
+    const r = rng() * 0.6;
+    const s = 0.5 + rng() * 0.5;
+    g.panels.push({
+      id: nextPanelId++,
+      x: x + Math.cos(a) * r,
+      y: base + s * 0.45,
+      z: z + Math.sin(a) * r,
+      ex: s,
+      ey: s * 0.8,
+      ez: s,
+      material: "canopy",
+      seed: band | (i << 3),
+    });
+  }
+  endSlab(g, slabFirst);
+}
+
+// A fallen log (horizontal) and usually a stump beside it.
+function fallenLog(g: Gen, x: number, z: number, rng: () => number): void {
+  const slabFirst = nextPanelId;
+  const base = baseHeightAt(x, z);
+  const alongX = rng() < 0.5;
+  const len = 2.4 + rng() * 2;
+  const d = 0.42;
+  g.panels.push({
+    id: nextPanelId++,
+    x,
+    y: base + d * 0.4,
+    z,
+    ex: alongX ? len : d,
+    ey: d,
+    ez: alongX ? d : len,
+    material: "log",
+    seed: 1,
+  });
+  if (rng() < 0.6) {
+    g.panels.push({
+      id: nextPanelId++,
+      x: x + (rng() - 0.5) * 2.2,
+      y: base + 0.3,
+      z: z + (rng() - 0.5) * 2.2,
+      ex: 0.5,
+      ey: 0.6,
+      ez: 0.5,
+      material: "trunk",
+      seed: 0,
+    });
+  }
+  endSlab(g, slabFirst);
+}
+
+// A village well: a chest-high stone ring under a little plank roof on posts.
+function well(g: Gen, x: number, z: number): void {
+  const slabFirst = nextPanelId;
+  const base = baseHeightAt(x, z);
+  const ring = 8;
+  const R = 0.85;
+  for (let i = 0; i < ring; i++) {
+    const a = (i / ring) * Math.PI * 2;
+    g.panels.push({
+      id: nextPanelId++,
+      x: x + Math.cos(a) * R,
+      y: base + 0.45,
+      z: z + Math.sin(a) * R,
+      ex: 0.46,
+      ey: 0.9,
+      ez: 0.46,
+      material: "stone",
+      seed: 1,
+    });
+  }
+  for (const s of [-1, 1]) {
+    g.panels.push({
+      id: nextPanelId++,
+      x: x + s * R,
+      y: base + 1.7,
+      z,
+      ex: 0.16,
+      ey: 2.4,
+      ez: 0.16,
+      material: "post",
+    });
+  }
+  g.panels.push({
+    id: nextPanelId++,
+    x,
+    y: base + 3.0,
+    z,
+    ex: 2.5,
+    ey: 0.18,
+    ez: 1.4,
+    material: "plank",
+  });
+  endSlab(g, slabFirst);
+}
+
+// A cluster of barrels (waist-high cover).
+function barrels(g: Gen, x: number, z: number, rng: () => number): void {
+  const slabFirst = nextPanelId;
+  const base = baseHeightAt(x, z);
+  const n = 2 + Math.floor(rng() * 3);
+  for (let i = 0; i < n; i++) {
+    const a = rng() * Math.PI * 2;
+    const r = i === 0 ? 0 : 0.45 + rng() * 0.4;
+    g.panels.push({
+      id: nextPanelId++,
+      x: x + Math.cos(a) * r,
+      y: base + 0.46,
+      z: z + Math.sin(a) * r,
+      ex: 0.56,
+      ey: 0.92,
+      ez: 0.56,
+      material: "crate",
+    });
+  }
+  endSlab(g, slabFirst);
+}
+
+// A roadside lamp post.
+function lampPost(g: Gen, x: number, z: number): void {
+  const slabFirst = nextPanelId;
+  const base = baseHeightAt(x, z);
+  g.panels.push({
+    id: nextPanelId++,
+    x,
+    y: base + 1.55,
+    z,
+    ex: 0.14,
+    ey: 3.1,
+    ez: 0.14,
+    material: "post",
+  });
+  g.panels.push({
+    id: nextPanelId++,
+    x,
+    y: base + 3.2,
+    z,
+    ex: 0.32,
+    ey: 0.34,
+    ez: 0.32,
+    material: "glass",
+  });
+  endSlab(g, slabFirst);
+}
+
+// Reeds at the water's edge: thin tall blades (dry-olive band).
+function reeds(g: Gen, x: number, z: number, rng: () => number): void {
+  const slabFirst = nextPanelId;
+  const base = baseHeightAt(x, z);
+  const n = 4 + Math.floor(rng() * 5);
+  for (let i = 0; i < n; i++) {
+    const h = 0.8 + rng() * 0.7;
+    g.panels.push({
+      id: nextPanelId++,
+      x: x + (rng() - 0.5) * 0.9,
+      y: base + h * 0.5,
+      z: z + (rng() - 0.5) * 0.9,
+      ex: 0.1,
+      ey: h,
+      ez: 0.1,
+      material: "canopy",
+      seed: 6 | (i << 3),
+    });
+  }
+  endSlab(g, slabFirst);
+}
+
+// A low hedge run between two points (good chest-high cover, encloses yards).
+function hedge(g: Gen, x0: number, z0: number, x1: number, z1: number): void {
+  const slabFirst = nextPanelId;
+  const len = Math.hypot(x1 - x0, z1 - z0);
+  const n = Math.max(1, Math.round(len));
+  for (let i = 0; i < n; i++) {
+    const t = (i + 0.5) / n;
+    const x = x0 + (x1 - x0) * t;
+    const z = z0 + (z1 - z0) * t;
+    if (onRoad(x, z) > 0 || waterCarveAt(x, z) > 0.1) continue;
+    const h = 1.0 + (i % 2) * 0.12;
+    g.panels.push({
+      id: nextPanelId++,
+      x,
+      y: baseHeightAt(x, z) + h * 0.5,
+      z,
+      ex: 0.95,
+      ey: h,
+      ez: 0.95,
+      material: "canopy",
+      seed: 1 | (i << 3),
+    });
+  }
+  endSlab(g, slabFirst);
+}
+
 // ---------------------------------------------------------------------------
 // Layout: a settlement of varied clusters — one true village (a market plaza
 // and the biggest buildings) plus plain hamlets and lone farmsteads, so not
@@ -1670,6 +1874,14 @@ function buildMap(): MapDef {
     return true;
   };
 
+  // A well on each hamlet green (the village has its market square instead;
+  // zone B sits on the center house, so skip it).
+  for (const zn of LAYOUT.zones) {
+    if (zn.letter === "B") continue;
+    well(g, zn.x, zn.z);
+    placed.push([zn.x, zn.z, 2.4]);
+  }
+
   // Market stalls in the village plaza: a crate of cover apiece.
   for (const [sx, sz] of LAYOUT.stalls) {
     if (!clearOf(sx, sz, 1.4)) continue;
@@ -1805,6 +2017,113 @@ function buildMap(): MapDef {
       endSlab(g, crateFirst);
       placed.push([x, z, 1.6]);
       break;
+    }
+  }
+
+  // Hedgerows: field/yard boundaries lacing the open ground.
+  for (let i = 0; i < 22; i++) {
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 10);
+      const z = (rng() * 2 - 1) * (half - 10);
+      if (!clearOf(x, z, 3)) continue;
+      const ang = rng() * Math.PI;
+      const L = 4 + rng() * 6;
+      hedge(
+        g,
+        x - Math.cos(ang) * L * 0.5,
+        z - Math.sin(ang) * L * 0.5,
+        x + Math.cos(ang) * L * 0.5,
+        z + Math.sin(ang) * L * 0.5,
+      );
+      placed.push([x, z, 3]);
+      break;
+    }
+  }
+
+  // Bushes / shrubs dotted across meadows and grove edges.
+  for (let i = 0; i < 46; i++) {
+    for (let attempt = 0; attempt < 14; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 5);
+      const z = (rng() * 2 - 1) * (half - 5);
+      if (!clearOf(x, z, 1.1)) continue;
+      bush(g, x, z, rng);
+      placed.push([x, z, 1.1]);
+      break;
+    }
+  }
+
+  // Woodpiles and barrel stacks (functional clutter, more around the core).
+  for (let i = 0; i < 14; i++) {
+    for (let attempt = 0; attempt < 20; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 6);
+      const z = (rng() * 2 - 1) * (half - 6);
+      if (!clearOf(x, z, 1.8)) continue;
+      const axis: "x" | "z" = rng() < 0.5 ? "x" : "z";
+      const a0 = (axis === "x" ? x : z) - 1;
+      masonryRun(
+        g,
+        axis,
+        a0,
+        a0 + 2,
+        axis === "x" ? z : x,
+        baseHeightAt(x, z),
+        3,
+        LOG,
+        "log",
+        undefined,
+      );
+      placed.push([x, z, 1.8]);
+      break;
+    }
+  }
+  for (let i = 0; i < 16; i++) {
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 6);
+      const z = (rng() * 2 - 1) * (half - 6);
+      if (!clearOf(x, z, 1.3)) continue;
+      barrels(g, x, z, rng);
+      placed.push([x, z, 1.3]);
+      break;
+    }
+  }
+
+  // Fallen logs + stumps, mostly near the tree groves.
+  for (let i = 0; i < 14; i++) {
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 6);
+      const z = (rng() * 2 - 1) * (half - 6);
+      if (!clearOf(x, z, 2)) continue;
+      fallenLog(g, x, z, rng);
+      placed.push([x, z, 2]);
+      break;
+    }
+  }
+
+  // Lamp posts along the main road (sampled off the centerline, core only).
+  for (let i = 0; i < ROAD_SEGS.length; i += 3) {
+    const s = ROAD_SEGS[i];
+    if (s.half < 3) continue; // main road only
+    const dx = s.bx - s.ax;
+    const dz = s.bz - s.az;
+    const len = Math.hypot(dx, dz) || 1;
+    const side = i % 6 === 0 ? 1 : -1;
+    const lx = (s.ax + s.bx) / 2 + (-dz / len) * (s.half + 1.1) * side;
+    const lz = (s.az + s.bz) / 2 + (dx / len) * (s.half + 1.1) * side;
+    if (!clearOf(lx, lz, 1)) continue;
+    lampPost(g, lx, lz);
+    placed.push([lx, lz, 1]);
+  }
+
+  // Reeds where the river meets the bank.
+  for (let i = 0; i < RIVER_PTS.length; i += 4) {
+    const [px, pz, phalf] = RIVER_PTS[i];
+    if (Math.abs(px) > half - 6) continue;
+    for (const sgn of [-1, 1]) {
+      if (rng() < 0.45) continue;
+      const rz = pz + sgn * (phalf + 0.8);
+      if (Math.abs(rz) > half - 6) continue;
+      if (onRoad(px, rz) > 0) continue;
+      reeds(g, px + (rng() - 0.5) * 3, rz, rng);
     }
   }
 
