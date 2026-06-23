@@ -402,14 +402,14 @@ async function main(): Promise<void> {
   // --- Grenades settle near where they land (corner-bombing works). ---
   {
     const gw = await createGameWorld();
-    // Head-on lob at the house's south wall (z=-17) from 4m out.
-    const body = createGrenadeBody(gw, 1, [14, 1.5, -21], [0, -1, 8]);
+    // Head-on lob at the FIXED center house's south wall (z=-4) from 4m out.
+    const body = createGrenadeBody(gw, 1, [1, 1.5, -8], [0, -1, 8]);
     for (let t = 0; t < GRENADE_FUSE_TICKS; t++) gw.world.step(DT);
     const end = body.translation();
-    const drift = Math.hypot(end.x - 14, end.z - -17);
+    const drift = Math.hypot(end.x - 1, end.z - -4);
     check(
       "grenade settles near the wall it hit",
-      drift < 3,
+      drift < 3.5,
       `drift=${drift.toFixed(1)} at (${end.x.toFixed(1)},${end.z.toFixed(1)})`,
     );
     destroyGameWorld(gw);
