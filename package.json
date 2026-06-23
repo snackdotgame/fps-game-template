@@ -25,6 +25,7 @@
     "@recast-navigation/generators": "^0.43.1",
     "jolt-ts": "file:../../jolt-ts",
     "jolt-ts-character-controller": "file:../../jolt-ts-character-controller",
+    "simplex-noise": "^4.0.3",
     "three": "^0.184.0"
   },
   "devDependencies": {

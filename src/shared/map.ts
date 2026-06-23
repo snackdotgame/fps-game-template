@@ -1,11 +1,14 @@
 // The battlefield, procedurally generated from a fixed seed so client and
-// server build identical worlds. Terrain is a value-noise heightfield
-// (flattened under buildings and spawns); every structure is masonry of
-// material-shaped destructible PIECES — clay bricks laid in running bond,
-// stacked cabin logs, roof planks, tree trunks and foliage clumps, sandbags,
-// supply crates. Gunfire chips out single bricks, explosions blow holes, and
-// enough structural loss collapses the whole building. The only things that
-// can't be destroyed are the ground and the arena's perimeter walls.
+// server build identical worlds. Terrain is a domain-warped simplex-fbm
+// heightfield with a few gentle hill stamps (flattened under buildings, roads
+// and spawns); every structure is masonry of material-shaped destructible
+// PIECES — clay bricks laid in running bond, stacked cabin logs, roof planks,
+// tree trunks and foliage clumps, sandbags, supply crates. Gunfire chips out
+// single bricks, explosions blow holes, and enough structural loss collapses
+// the whole building. The world has no perimeter walls — it extends into a
+// backdrop and an out-of-bounds timer keeps players in.
+
+import { createNoise2D } from "simplex-noise";
 
 export const MAP_SEED = 0xb17b17;
 
@@ -168,7 +171,53 @@ function valueNoise(x: number, z: number, cell: number): number {
 }
 
 const SIZE = 224; // a small-battlefield-scale arena (16 terrain chunks)
-const TERRAIN_AMPLITUDE = 1.6;
+const TERRAIN_AMPLITUDE = 2.1;
+
+// Deterministic simplex noise for the terrain relief (its own PRNG sub-stream
+// so it never disturbs the layout rng). createNoise2D builds a permutation from
+// the seed, so client and server (both running this module) get identical
+// terrain.
+const terrainNoise2D = createNoise2D(mulberry32(MAP_SEED ^ 0x5eed));
+
+// Fractal Brownian motion in [-1,1].
+function fbm2(x: number, z: number, octaves: number, freq: number): number {
+  let amp = 1;
+  let sum = 0;
+  let norm = 0;
+  let f = freq;
+  for (let o = 0; o < octaves; o++) {
+    sum += amp * terrainNoise2D(x * f, z * f);
+    norm += amp;
+    amp *= 0.5;
+    f *= 2;
+  }
+  return sum / norm;
+}
+
+// A few gentle hill stamps, placed in 180°-rotationally-symmetric pairs so
+// neither team gets a height advantage. [cx, cz, radius, amplitude].
+const HILLS: Array<[number, number, number, number]> = [
+  [72, -74, 36, 1.9],
+  [-72, 74, 36, 1.9],
+  [-86, -40, 30, 1.4],
+  [86, 40, 30, 1.4],
+];
+
+// Raw pre-fade terrain height: domain-warped simplex fbm (organic ridges and
+// valleys), redistributed so lowlands are flatter, plus max-combined hill
+// stamps. Always >= 0 so the open field never dips below the water surface.
+function reliefAt(x: number, z: number): number {
+  const wx = x + 11 * fbm2(x + 100, z + 100, 2, 1 / 55);
+  const wz = z + 11 * fbm2(x + 200, z + 200, 2, 1 / 55);
+  let e = fbm2(wx, wz, 4, 1 / 46) * 0.5 + 0.5; // [0,1]
+  e = Math.pow(e, 1.6); // flatten the lowlands, keep the highs
+  let h = e * TERRAIN_AMPLITUDE;
+  for (const [hx, hz, r, amp] of HILLS) {
+    const d = Math.hypot(x - hx, z - hz);
+    if (d < r) h += amp * smooth(1 - d / r);
+  }
+  return h;
+}
 
 // Footprints that must stay flat: building pads, spawn zones, and road
 // clearings. Filled by planLayout() before any geometry is seated, so the pads
@@ -358,12 +407,11 @@ export function waterCarveAt(x: number, z: number): number {
   return dug;
 }
 
-// The pre-road terrain: noise relief minus the water carve, both flattened
+// The pre-road terrain: simplex relief minus the water carve, both flattened
 // inside pads. Road baking samples THIS (so it never recurses into itself).
 function terrainBase(x: number, z: number): number {
-  const raw = valueNoise(x + 1000, z + 1000, 14) * 0.7 + valueNoise(x + 2000, z + 2000, 5.5) * 0.3;
   const fade = shapeFade(x, z);
-  return raw * TERRAIN_AMPLITUDE * fade - waterCarveAt(x, z) * fade;
+  return reliefAt(x, z) * fade - waterCarveAt(x, z) * fade;
 }
 
 // The pristine pre-battle terrain, with roads/paths flattened in. Structure
