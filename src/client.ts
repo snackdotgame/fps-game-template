@@ -41,7 +41,6 @@ import {
 import { RUBBLE_HEIGHT } from "./shared/constants.js";
 import { BUILT_PANEL_ID_BASE } from "./shared/map.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
-import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { parseServerMsg, type PlayerInfo } from "./shared/messages.js";
 import {
   decodeSnapshot,
@@ -176,77 +175,6 @@ const MAT = {
   rubble: new THREE.MeshStandardMaterial({ color: 0x6e6a62, roughness: 1, flatShading: true }),
 };
 
-// A procedural foliage texture: a ragged cluster of many small veined leaf
-// shapes (light grey on transparent, so instance color tints it to the canopy's
-// season band). Alpha-tested, so each card reads as a clump of actual leaves
-// with an irregular leafy edge — the approach ez-tree uses (textured leaf cards)
-// adapted to a deterministic procedural texture.
-function makeLeafTexture(): THREE.Texture {
-  const N = 256;
-  const cv = document.createElement("canvas");
-  cv.width = N;
-  cv.height = N;
-  const ctx = cv.getContext("2d")!;
-  ctx.clearRect(0, 0, N, N);
-  const c = N / 2;
-  // One pointed, veined leaf at the origin, rotated/scaled by the caller.
-  const leaf = (len: number, tone: number): void => {
-    const w = len * 0.6;
-    ctx.fillStyle = `rgb(${Math.round(tone * 0.95)},${Math.round(tone)},${Math.round(tone * 0.86)})`;
-    ctx.beginPath();
-    ctx.moveTo(0, -len * 0.5);
-    ctx.quadraticCurveTo(w * 0.5, 0, 0, len * 0.5);
-    ctx.quadraticCurveTo(-w * 0.5, 0, 0, -len * 0.5);
-    ctx.fill();
-    ctx.strokeStyle = `rgba(${Math.round(tone * 0.7)},${Math.round(tone * 0.78)},${Math.round(tone * 0.6)},0.7)`;
-    ctx.lineWidth = Math.max(1, len * 0.04);
-    ctx.beginPath();
-    ctx.moveTo(0, -len * 0.45);
-    ctx.lineTo(0, len * 0.45);
-    ctx.stroke();
-  };
-  for (let i = 0; i < 95; i++) {
-    const a = Math.random() * Math.PI * 2;
-    const r = Math.sqrt(Math.random()) * c * 0.95;
-    const x = c + Math.cos(a) * r;
-    const y = c + Math.sin(a) * r;
-    const len = 14 + Math.random() * 22;
-    const tone = 170 + Math.random() * 78; // light grey; instance color sets hue
-    ctx.save();
-    ctx.translate(x, y);
-    ctx.rotate(Math.random() * Math.PI * 2);
-    leaf(len, tone);
-    ctx.restore();
-  }
-  const tex = new THREE.CanvasTexture(cv);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.anisotropy = 4;
-  return tex;
-}
-const leafTex = makeLeafTexture();
-// Leafy foliage: alpha-tested leaf cards (ez-tree style), tinted per-clump by
-// instance color, double-sided with dithering to soften the alpha edges.
-const leafMat = new THREE.MeshStandardMaterial({
-  map: leafTex,
-  alphaTest: 0.4,
-  side: THREE.DoubleSide,
-  dithering: true,
-  roughness: 1,
-  metalness: 0,
-});
-
-// Three crossed quads (a "leaf-card" cluster) — instanced + scaled per clump so
-// foliage reads as a fluffy mass of leaves from any angle.
-function makeLeafCardsGeo(): THREE.BufferGeometry {
-  const quads: THREE.BufferGeometry[] = [];
-  for (const deg of [0, 60, 120]) {
-    const q = new THREE.PlaneGeometry(1, 1);
-    q.rotateY((deg * Math.PI) / 180);
-    quads.push(q);
-  }
-  return mergeGeometries(quads);
-}
-
 // A faceted boulder: an icosphere displaced by a cheap deterministic noise so
 // no two rocks (scaled/rotated per piece) read the same. Flat-shaded via
 // voxelMat. (ez-tree uses pre-made GLB rock models; this keeps rocks procedural
@@ -269,15 +197,14 @@ function makeRockGeo(): THREE.BufferGeometry {
 }
 
 // Unit geometries, scaled per instance to each piece's extents: beveled boxes
-// for masonry (the bevel catches light, so every brick reads as a brick),
-// faceted cylinders for logs and trunks, soft-cornered lumps for rocks, crossed
-// leaf cards for foliage.
+// for masonry (the bevel catches light, so every brick reads as a brick) and
+// foliage clumps, faceted cylinders for logs and trunks, faceted boulders for
+// rocks.
 const GEO = {
   box: new THREE.BoxGeometry(1, 1, 1),
   bevel: new RoundedBoxGeometry(1, 1, 1, 1, 0.055),
   rock: makeRockGeo(),
   cyl: new THREE.CylinderGeometry(0.5, 0.5, 1, 7),
-  leaf: makeLeafCardsGeo(),
   decal: new THREE.PlaneGeometry(1, 1),
 };
 
@@ -291,7 +218,7 @@ const PIECE_STYLE: Record<
   plank: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a7a52 },
   post: { geo: GEO.bevel, mat: voxelMat, debris: 0x6e5439 },
   trunk: { geo: GEO.cyl, mat: voxelMat, debris: 0x6e5439 },
-  canopy: { geo: GEO.leaf, mat: leafMat, debris: 0x4d7a3a },
+  canopy: { geo: GEO.bevel, mat: voxelMat, debris: 0x4d7a3a },
   crate: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a7a52 },
   sandbag: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a8f72 },
   rock: { geo: GEO.rock, mat: voxelMat, debris: 0x8d8a84 },
@@ -1182,9 +1109,7 @@ function buildMapVisuals(): void {
   for (const [material, defs] of byMat) {
     const style = PIECE_STYLE[material];
     const mesh = new THREE.InstancedMesh(style.geo, style.mat, defs.length);
-    // Foliage is alpha-card geometry — solid box shadows from it look wrong, so
-    // it receives shadow but doesn't cast.
-    mesh.castShadow = material !== "glass" && material !== "canopy";
+    mesh.castShadow = material !== "glass";
     mesh.receiveShadow = true;
     for (let i = 0; i < defs.length; i++) {
       pieceColor(defs[i], _col);
