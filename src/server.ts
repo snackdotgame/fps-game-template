@@ -16,7 +16,7 @@ import {
   ROUND_TICKS,
   TICK_MS,
 } from "./shared/constants.js";
-import { craterList, heightAt, MAP, ZONES } from "./shared/map.js";
+import { craterList, heightAt, PLAY_HALF, ZONES } from "./shared/map.js";
 import { type PlayerInfo, type ServerMsg } from "./shared/messages.js";
 import {
   decodeInputs,
@@ -457,11 +457,14 @@ function updateBotDecision(p: SimPlayer, b: BotBrain): void {
           t.z + (rng() * 2 - 1) * 7,
         );
       } else {
+        const bound = PLAY_HALF - 5; // keep bots inside the play area (no OOB suicides)
         const randomPoint = navForBots()?.randomPoint(sim, rng);
         if (randomPoint && rng() < 0.65) {
-          setBotDestination(b, randomPoint[0], randomPoint[1], randomPoint[2]);
+          const rx = Math.max(-bound, Math.min(bound, randomPoint[0]));
+          const rz = Math.max(-bound, Math.min(bound, randomPoint[2]));
+          setBotDestination(b, rx, heightAt(rx, rz) + 0.15, rz);
         } else {
-          const half = MAP.size / 2 - 6;
+          const half = bound;
           let x = (rng() * 2 - 1) * half;
           let z = (rng() * 2 - 1) * half;
           // Don't camp the enemy spawn zone — keep the fight in the field.

@@ -25,6 +25,7 @@ import {
   MELEE_DAMAGE,
   MELEE_PANEL_DAMAGE,
   MELEE_RANGE,
+  OOB_LIMIT_TICKS,
   PROTECT_TICKS,
   REGEN_DELAY_TICKS,
   REGEN_PER_TICK,
@@ -51,6 +52,7 @@ import {
   PANEL_HP,
   type PanelDef,
   type PanelMaterial,
+  PLAY_HALF,
   resetCraters,
   slabOfPiece,
   spawnPoint,
@@ -154,6 +156,7 @@ export interface SimPlayer {
   lastDamageTick: number;
   kills: number;
   deaths: number;
+  oobSinceTick: number; // tick this player left the play area, or -1 if in bounds
 }
 
 export interface Grenade {
@@ -307,6 +310,7 @@ export class GameSim {
       lastDamageTick: 0,
       kills: 0,
       deaths: 0,
+      oobSinceTick: -1,
     };
     this.players[slot] = p;
     return p;
@@ -970,11 +974,41 @@ export class GameSim {
         p.hp = MAX_HP;
         p.dead = false;
         p.protectUntilTick = this.tick + PROTECT_TICKS;
+        p.oobSinceTick = -1;
+      }
+      // Out of bounds: no perimeter walls, so straying past the play boundary
+      // starts a countdown; not returning in time is fatal.
+      if (p.dead || this.phase !== "playing") {
+        p.oobSinceTick = -1;
+      } else {
+        const oob = Math.abs(p.state.x) > PLAY_HALF || Math.abs(p.state.z) > PLAY_HALF;
+        if (!oob) {
+          p.oobSinceTick = -1;
+        } else if (p.oobSinceTick < 0) {
+          p.oobSinceTick = this.tick;
+        } else if (this.tick - p.oobSinceTick >= OOB_LIMIT_TICKS) {
+          this.killOutOfBounds(p);
+        }
       }
       if (!p.dead && p.hp < MAX_HP && this.tick - p.lastDamageTick > REGEN_DELAY_TICKS) {
         p.hp = Math.min(MAX_HP, p.hp + REGEN_PER_TICK);
       }
     }
+  }
+
+  // A deserter who didn't return to the battlefield in time. Counts as a death
+  // (burns a ticket) like any other.
+  private killOutOfBounds(p: SimPlayer): void {
+    p.hp = 0;
+    p.dead = true;
+    p.deaths++;
+    p.oobSinceTick = -1;
+    p.respawnAtTick = this.tick + RESPAWN_TICKS;
+    this.scores[p.team] = Math.max(0, this.scores[p.team] - 1);
+    this.outbox.push({ type: "kill", killer: p.idx, victim: p.idx, weapon: "oob" });
+    const spawn = spawnPoint(p.team, p.idx);
+    p.state = makeChar(spawn);
+    writeChar(p.body, p.state);
   }
 
   private stepZones(): void {

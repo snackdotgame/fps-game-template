@@ -26,6 +26,9 @@ export const BLEED_INTERVAL_TICKS = 60; // majority bleed cadence (2s)
 // Player.
 export const MAX_HP = 100;
 export const RESPAWN_TICKS = 3 * TICK_RATE;
+// Out of bounds: there are no perimeter walls, so straying past the play
+// boundary (map PLAY_HALF) starts a countdown; not returning in time is fatal.
+export const OOB_LIMIT_TICKS = 8 * TICK_RATE; // ~8s grace to return
 export const PROTECT_TICKS = 2 * TICK_RATE; // spawn protection
 export const REGEN_DELAY_TICKS = 6 * TICK_RATE;
 export const REGEN_PER_TICK = 0.5;
