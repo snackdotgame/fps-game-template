@@ -170,40 +170,28 @@ function valueNoise(x: number, z: number, cell: number): number {
 const SIZE = 224; // a small-battlefield-scale arena (16 terrain chunks)
 const TERRAIN_AMPLITUDE = 1.6;
 
-// Footprints that must stay flat: building pads and spawn zones. The first
-// nine sites are the original village around the center; the rest spread
-// the battlefield out toward the corners.
-const FLAT_PADS: Array<[number, number, number, number]> = [
-  // [cx, cz, halfW, halfD]
-  [0, 0, 7.5, 6.5],
-  [-15, -12, 6.5, 6.5],
-  [15, 12, 6.5, 6.5],
-  [16, -14, 6.5, 5.5],
-  [-16, 14, 6.5, 5.5],
-  [32, 4, 6.5, 6.5],
-  [-32, -25, 6.5, 5.5],
-  [-31, 27, 6.5, 5.5],
-  [14, -30, 6.5, 5.5],
-  [60, 0, 6.5, 6.5],
-  [-60, -5, 6.5, 6.5],
-  [0, 62, 6.5, 6.5],
-  [-3, -65, 6.5, 6.5],
-  [62, 62, 6.5, 5.5],
-  [-62, 58, 6.5, 5.5],
-  [-65, -62, 6.5, 5.5],
-  [60, -64, 6.5, 5.5],
-  [95, 28, 6.5, 5.5],
-  [-95, -30, 6.5, 5.5],
-  [30, 90, 6.5, 5.5],
-  [-35, -92, 6.5, 5.5],
-  [0, -100, 10, 6], // team 0 spawn
-  [0, 100, 10, 6], // team 1 spawn
-];
+// Footprints that must stay flat: building pads, spawn zones, and road
+// clearings. Filled by planLayout() before any geometry is seated, so the pads
+// derive from the buildings actually placed (mutable, not hand-authored).
+let FLAT_PADS: Array<[number, number, number, number]> = [];
 
-// How exposed (x,z) is to terrain shaping: 1 in the open field, fading to 0
-// inside flat pads and at the perimeter. Both the noise relief and crater
-// digging are scaled by this, so buildings never get undermined.
-function shapeFade(x: number, z: number): number {
+// A straight piece of a road/path centerline, with its surface height baked at
+// each end (sampled from the pre-road terrain) so the road lies flat instead of
+// rippling over the noise.
+interface RoadSeg {
+  ax: number;
+  az: number;
+  bx: number;
+  bz: number;
+  ay: number;
+  by: number;
+  half: number; // half width
+}
+let ROAD_SEGS: RoadSeg[] = [];
+
+// 1 in the open field, fading to 0 inside any flat pad. The noise relief and
+// crater digging are scaled by this, so buildings never get undermined.
+function padFade(x: number, z: number): number {
   let f = 1;
   for (const [cx, cz, hw, hd] of FLAT_PADS) {
     const dx = Math.max(0, Math.abs(x - cx) - hw);
@@ -211,9 +199,58 @@ function shapeFade(x: number, z: number): number {
     const dist = Math.hypot(dx, dz);
     if (dist < 2.5) f *= smooth(dist / 2.5);
   }
-  const edge = SIZE / 2 - Math.max(Math.abs(x), Math.abs(z));
-  if (edge < 3) f *= smooth(Math.max(0, edge) / 3);
   return f;
+}
+
+// The arena no longer has perimeter walls, so terrain relief continues right
+// out to (and past) the edge into the backdrop — only the pads flatten it.
+function shapeFade(x: number, z: number): number {
+  return padFade(x, z);
+}
+
+// Roads flatten the terrain toward a smooth piecewise-linear profile within a
+// falloff band — the same trick the pads use, so the road surface, its
+// collision mesh, and bot nav stay consistent (everything reads heightAt).
+function roadFieldAt(x: number, z: number): { w: number; targetY: number } {
+  let bestD = Infinity;
+  let bestT = 0;
+  let bestSeg: RoadSeg | null = null;
+  for (const s of ROAD_SEGS) {
+    if (x < Math.min(s.ax, s.bx) - 9 || x > Math.max(s.ax, s.bx) + 9) continue;
+    if (z < Math.min(s.az, s.bz) - 9 || z > Math.max(s.az, s.bz) + 9) continue;
+    const dx = s.bx - s.ax;
+    const dz = s.bz - s.az;
+    const len2 = dx * dx + dz * dz || 1;
+    const t = Math.max(0, Math.min(1, ((x - s.ax) * dx + (z - s.az) * dz) / len2));
+    const d = Math.hypot(x - (s.ax + dx * t), z - (s.az + dz * t));
+    if (d < bestD) {
+      bestD = d;
+      bestT = t;
+      bestSeg = s;
+    }
+  }
+  if (!bestSeg) return { w: 0, targetY: 0 };
+  const band = 2.5;
+  if (bestD > bestSeg.half + band) return { w: 0, targetY: 0 };
+  const targetY = bestSeg.ay + (bestSeg.by - bestSeg.ay) * bestT;
+  const edge = bestD <= bestSeg.half ? 1 : smooth(1 - (bestD - bestSeg.half) / band);
+  return { w: edge * padFade(x, z), targetY }; // pads win over roads
+}
+
+// Is (x,z) on a road surface (for visuals/queries)? Distance to nearest
+// centerline within its half width.
+export function onRoad(x: number, z: number): number {
+  for (const s of ROAD_SEGS) {
+    if (x < Math.min(s.ax, s.bx) - 6 || x > Math.max(s.ax, s.bx) + 6) continue;
+    if (z < Math.min(s.az, s.bz) - 6 || z > Math.max(s.az, s.bz) + 6) continue;
+    const dx = s.bx - s.ax;
+    const dz = s.bz - s.az;
+    const len2 = dx * dx + dz * dz || 1;
+    const t = Math.max(0, Math.min(1, ((x - s.ax) * dx + (z - s.az) * dz) / len2));
+    const d = Math.hypot(x - (s.ax + dx * t), z - (s.az + dz * t));
+    if (d < s.half + 0.4) return 1 - d / (s.half + 0.4);
+  }
+  return 0;
 }
 
 // --- Water: one meandering river plus a couple of lakes, carved into the
@@ -229,7 +266,9 @@ const RIVER_HALF_WIDTH = 7.5;
 // river.) The width breathes along its length, widening into pools and
 // pinching at riffles.
 function riverCenterZ(x: number): number {
-  return 33 + 30 * (valueNoise(x + 600, 0, 118) - 0.5) + 13 * (valueNoise(x + 1700, 0, 44) - 0.5);
+  // Kept to a ~z[25,43] band so it cleanly separates the south-bank village
+  // from the north fields/hamlets, with a gentle two-octave wander.
+  return 34 + 12 * (valueNoise(x + 600, 0, 118) - 0.5) + 5 * (valueNoise(x + 1700, 0, 44) - 0.5);
 }
 function riverHalfWidthAt(x: number): number {
   return RIVER_HALF_WIDTH * (0.62 + 0.7 * valueNoise(x + 1234, 0, 40));
@@ -286,12 +325,22 @@ export function waterCarveAt(x: number, z: number): number {
   return dug;
 }
 
-// The pristine pre-battle terrain. Structure generation seats pieces on this,
-// so later craters never move existing geometry.
-export function baseHeightAt(x: number, z: number): number {
+// The pre-road terrain: noise relief minus the water carve, both flattened
+// inside pads. Road baking samples THIS (so it never recurses into itself).
+function terrainBase(x: number, z: number): number {
   const raw = valueNoise(x + 1000, z + 1000, 14) * 0.7 + valueNoise(x + 2000, z + 2000, 5.5) * 0.3;
   const fade = shapeFade(x, z);
   return raw * TERRAIN_AMPLITUDE * fade - waterCarveAt(x, z) * fade;
+}
+
+// The pristine pre-battle terrain, with roads/paths flattened in. Structure
+// generation seats pieces on this, so later craters never move existing
+// geometry.
+export function baseHeightAt(x: number, z: number): number {
+  const h = terrainBase(x, z);
+  if (ROAD_SEGS.length === 0) return h;
+  const r = roadFieldAt(x, z);
+  return r.w > 0 ? h + (r.targetY - h) * r.w : h;
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,110 +1150,340 @@ function rocks(g: Gen, x: number, z: number, rng: () => number): void {
 }
 
 // ---------------------------------------------------------------------------
+// Layout: a settlement of varied clusters — one true village (a market plaza
+// and the biggest buildings) plus plain hamlets and lone farmsteads, so not
+// every cluster is a village and not every one has a plaza — wired together by
+// a road network. Buildings front the streets; a road fords the river where it
+// crosses. Fully deterministic from the map seed.
+
+interface LotPlan {
+  cx: number;
+  cz: number;
+  w: number;
+  d: number;
+  front: 0 | 1 | 2 | 3;
+  stories: number;
+  style: BuildingStyle;
+  roof: "flat" | "gable";
+  ladder: boolean;
+}
+
+interface Layout {
+  lots: LotPlan[];
+  zones: Array<{ letter: string; x: number; z: number; r: number }>;
+  stalls: Array<[number, number]>;
+}
+
+let LAYOUT: Layout = { lots: [], zones: [], stalls: [] };
+
+function planLayout(rng: () => number): Layout {
+  const half = SIZE / 2;
+  const pads: Array<[number, number, number, number]> = [];
+  const lots: LotPlan[] = [];
+  const stalls: Array<[number, number]> = [];
+  const nodes: Array<[number, number]> = [];
+  const localStreets: Array<[number, number, number, number]> = [];
+
+  // Balanced-but-shuffled material mix.
+  const styleBag: BuildingStyle[] = [];
+  for (let i = 0; i < 48; i++) styleBag.push((["brick", "log", "concrete"] as const)[i % 3]);
+  for (let i = styleBag.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [styleBag[i], styleBag[j]] = [styleBag[j], styleBag[i]];
+  }
+  let si = 0;
+
+  const lotClear = (cx: number, cz: number, w: number, d: number): boolean => {
+    const hw = w / 2 + 1.3;
+    const hd = d / 2 + 1.3;
+    if (Math.abs(cx) > half - 7 || Math.abs(cz) > half - 7) return false;
+    if (cx > 20 && cx < 28 && Math.abs(cz) < 45) return false; // east duel lane stays open
+    for (const [ox, oz] of [
+      [0, 0],
+      [hw, hd],
+      [hw, -hd],
+      [-hw, hd],
+      [-hw, -hd],
+    ] as const) {
+      if (waterCarveAt(cx + ox, cz + oz) > 0.12) return false;
+    }
+    for (const [px, pz, phw, phd] of pads) {
+      if (Math.abs(cx - px) < hw + phw && Math.abs(cz - pz) < hd + phd) return false;
+    }
+    return true;
+  };
+  // Which wall (0=+z,1=-z,2=+x,3=-x) faces direction (dx,dz).
+  const sideFacing = (dx: number, dz: number): 0 | 1 | 2 | 3 =>
+    Math.abs(dx) >= Math.abs(dz) ? (dx > 0 ? 2 : 3) : dz > 0 ? 0 : 1;
+
+  // Spawns: flat pads + the two road endpoints.
+  pads.push([0, -100, 11, 7]);
+  pads.push([0, 100, 11, 7]);
+  nodes.push([0, -100]);
+  nodes.push([0, 100]);
+
+  // The fixed center house — the tests anchor to its +z door and west
+  // stairwell, so it never moves.
+  lots.push({
+    cx: 0,
+    cz: 0,
+    w: 10,
+    d: 8,
+    front: 0,
+    stories: 2,
+    style: "brick",
+    roof: "flat",
+    ladder: false,
+  });
+  pads.push([0, 0, 6.8, 5.8]);
+
+  interface Anchor {
+    type: "village" | "hamlet" | "farm";
+    x: number;
+    z: number;
+    axis: number;
+    count: number;
+  }
+  // The river runs ~z[25,43], so clusters sit clear of that band: most of the
+  // settlement on the south bank around the center house, two hamlets + farms
+  // on the north fields. One village (plaza), the rest plain hamlets/farms.
+  const anchors: Anchor[] = [
+    { type: "village", x: 0, z: -4, axis: 0, count: 7 },
+    { type: "hamlet", x: -54, z: -2, axis: Math.PI / 2, count: 5 },
+    { type: "hamlet", x: 56, z: 2, axis: Math.PI / 2, count: 5 },
+    { type: "hamlet", x: -60, z: -60, axis: 0, count: 4 },
+    { type: "hamlet", x: 58, z: -62, axis: 0, count: 4 },
+    { type: "hamlet", x: -52, z: 64, axis: 0, count: 4 },
+    { type: "hamlet", x: 54, z: 66, axis: 0, count: 4 },
+    { type: "farm", x: 0, z: 74, axis: Math.PI / 2, count: 2 },
+    { type: "farm", x: -40, z: -86, axis: 0, count: 2 },
+    { type: "farm", x: 42, z: -88, axis: 0, count: 2 },
+    { type: "farm", x: 92, z: -30, axis: Math.PI / 2, count: 1 },
+    { type: "farm", x: -92, z: -32, axis: Math.PI / 2, count: 1 },
+    { type: "farm", x: 90, z: 64, axis: 0, count: 1 },
+    { type: "farm", x: -90, z: 60, axis: 0, count: 1 },
+  ];
+
+  for (const a of anchors) {
+    const dir: [number, number] = [Math.cos(a.axis), Math.sin(a.axis)];
+    const perp: [number, number] = [-dir[1], dir[0]];
+    nodes.push([a.x, a.z]);
+    // A clearing pad keeps the cluster centre open and flat (plaza / green / yard).
+    const clearR = a.type === "village" ? 7 : a.type === "hamlet" ? 5 : 3.5;
+    pads.push([a.x, a.z, clearR, clearR]);
+    const spacing = 8.5;
+    const spanLen = Math.max(a.count - 1, 0.6) * spacing;
+    let placed = 0;
+    for (let i = 0; i < a.count * 3 && placed < a.count; i++) {
+      const slot = a.count === 1 ? 0 : placed / (a.count - 1) - 0.5;
+      const along = slot * spanLen + (rng() - 0.5) * 3;
+      const sideSign = placed % 2 === 0 ? 1 : -1;
+      const big = a.type === "village" && placed < 3;
+      const w = Math.min(13, (big ? 9.5 : 6.5) + rng() * 4);
+      const d = Math.min(11, 6 + rng() * (big ? 4.5 : 3));
+      const setback = a.type === "farm" ? 3 + rng() * 6 : 1.0 + rng() * 1.5;
+      const off = 2 + setback + d / 2;
+      const cx = a.x + dir[0] * along + perp[0] * off * sideSign;
+      const cz = a.z + dir[1] * along + perp[1] * off * sideSign;
+      if (!lotClear(cx, cz, w, d)) continue;
+      const front = sideFacing(-perp[0] * sideSign, -perp[1] * sideSign);
+      const stories = big ? 2 + (rng() < 0.5 ? 1 : 0) : rng() < 0.5 ? 1 : rng() < 0.82 ? 2 : 3;
+      lots.push({
+        cx,
+        cz,
+        w,
+        d,
+        front,
+        stories,
+        style: styleBag[si++ % styleBag.length],
+        roof: rng() < 0.5 ? "gable" : "flat",
+        ladder: rng() < 0.5,
+      });
+      pads.push([cx, cz, w / 2 + 0.9, d / 2 + 0.9]);
+      placed++;
+    }
+    if (a.count >= 2) {
+      localStreets.push([
+        a.x - dir[0] * spanLen * 0.55,
+        a.z - dir[1] * spanLen * 0.55,
+        a.x + dir[0] * spanLen * 0.55,
+        a.z + dir[1] * spanLen * 0.55,
+      ]);
+    }
+    if (a.type === "village") {
+      for (let s = 0; s < 6; s++) {
+        stalls.push([a.x + (rng() - 0.5) * 11, a.z + (rng() - 0.5) * 9]);
+      }
+    }
+  }
+
+  // Pads are final — publish so terrainBase + road baking flatten correctly.
+  FLAT_PADS = pads;
+
+  // Road network: a minimum spanning tree over the spawn + cluster nodes
+  // (river crossings penalised), the spawn-to-spawn path widened into the main
+  // road, the rest left as lanes, plus each multi-building cluster's local
+  // street. Heights are baked per segment from the pre-road terrain.
+  const N = nodes.length;
+  const inTree = new Array<boolean>(N).fill(false);
+  const parent = new Array<number>(N).fill(-1);
+  const bestW = new Array<number>(N).fill(Infinity);
+  bestW[0] = 0;
+  const edgeW = (i: number, j: number): number => {
+    let w = Math.hypot(nodes[i][0] - nodes[j][0], nodes[i][1] - nodes[j][1]);
+    for (let k = 1; k < 5; k++) {
+      const t = k / 5;
+      if (waterCarveAt(nodes[i][0] + (nodes[j][0] - nodes[i][0]) * t, nodes[i][1] + (nodes[j][1] - nodes[i][1]) * t) > 0.1) {
+        w += 35;
+      }
+    }
+    return w;
+  };
+  for (let it = 0; it < N; it++) {
+    let u = -1;
+    for (let i = 0; i < N; i++) if (!inTree[i] && (u < 0 || bestW[i] < bestW[u])) u = i;
+    if (u < 0) break;
+    inTree[u] = true;
+    for (let v = 0; v < N; v++) {
+      if (inTree[v]) continue;
+      const w = edgeW(u, v);
+      if (w < bestW[v]) {
+        bestW[v] = w;
+        parent[v] = u;
+      }
+    }
+  }
+  const adj: number[][] = Array.from({ length: N }, () => []);
+  for (let v = 0; v < N; v++) {
+    if (parent[v] >= 0) {
+      adj[v].push(parent[v]);
+      adj[parent[v]].push(v);
+    }
+  }
+  // Main road = the tree path from spawn 0 (node 0) to spawn 1 (node 1).
+  const prev = new Array<number>(N).fill(-2);
+  prev[0] = -1;
+  const queue = [0];
+  for (let h = 0; h < queue.length; h++) {
+    for (const nb of adj[queue[h]]) {
+      if (prev[nb] === -2) {
+        prev[nb] = queue[h];
+        queue.push(nb);
+      }
+    }
+  }
+  const mainNodes = new Set<number>();
+  for (let c = 1; c !== -1 && c !== -2; c = prev[c]) mainNodes.add(c);
+
+  const roads: RoadSeg[] = [];
+  const pushSeg = (ax: number, az: number, bx: number, bz: number, halfW: number): void => {
+    const len = Math.hypot(bx - ax, bz - az);
+    const n = Math.max(1, Math.ceil(len / 7));
+    for (let k = 0; k < n; k++) {
+      const x0 = ax + (bx - ax) * (k / n);
+      const z0 = az + (bz - az) * (k / n);
+      const x1 = ax + (bx - ax) * ((k + 1) / n);
+      const z1 = az + (bz - az) * ((k + 1) / n);
+      roads.push({
+        ax: x0,
+        az: z0,
+        bx: x1,
+        bz: z1,
+        ay: terrainBase(x0, z0),
+        by: terrainBase(x1, z1),
+        half: halfW,
+      });
+    }
+  };
+  for (let v = 0; v < N; v++) {
+    if (parent[v] < 0) continue;
+    const p = parent[v];
+    const main = mainNodes.has(v) && mainNodes.has(p) && (prev[v] === p || prev[p] === v);
+    pushSeg(nodes[v][0], nodes[v][1], nodes[p][0], nodes[p][1], main ? 3.2 : 2.2);
+  }
+  for (const [ax, az, bx, bz] of localStreets) pushSeg(ax, az, bx, bz, 2.0);
+  ROAD_SEGS = roads;
+
+  // Conquest zones: the village heart plus four hamlet greens — a cross over
+  // the battlefield, all on clearing pads (flat) and clear of water.
+  const zones = [
+    { letter: "A", x: -54, z: -2, r: 12 },
+    { letter: "B", x: 0, z: 0, r: 12 },
+    { letter: "C", x: 56, z: 2, r: 12 },
+    { letter: "D", x: -52, z: 64, r: 12 },
+    { letter: "E", x: 54, z: 66, r: 12 },
+  ];
+  return { lots, zones, stalls };
+}
+
+// ---------------------------------------------------------------------------
 
 function buildMap(): MapDef {
   nextPanelId = 1;
   nextBuildingId = 0;
+  FLAT_PADS = [];
+  ROAD_SEGS = [];
   const rng = mulberry32(MAP_SEED);
   const g: Gen = { statics: [], panels: [], buildings: [], slabs: [], ladders: [] };
   const half = SIZE / 2;
 
-  // Perimeter walls (terrain fades to 0 at the edge so these seat flush).
-  g.statics.push({ x: 0, y: 1.5, z: -half, w: SIZE, h: 3, d: 1, kind: "wall" });
-  g.statics.push({ x: 0, y: 1.5, z: half, w: SIZE, h: 3, d: 1, kind: "wall" });
-  g.statics.push({ x: -half, y: 1.5, z: 0, w: 1, h: 3, d: SIZE, kind: "wall" });
-  g.statics.push({ x: half, y: 1.5, z: 0, w: 1, h: 3, d: SIZE, kind: "wall" });
+  // No perimeter walls: the world extends into a backdrop and an out-of-bounds
+  // timer keeps players in (see sim/client). The layout fills FLAT_PADS +
+  // ROAD_SEGS before any geometry is seated on the terrain.
+  LAYOUT = planLayout(rng);
 
-  // Buildings on their flat pads (positions match FLAT_PADS). The center
-  // house is FIXED (the tests anchor to its door and stairwell); everything
-  // else rolls construction style, stories, door count, roof shape, and
-  // ladders from the seed.
-  building(g, 0, 0, 10, 8, {
-    stories: 2,
-    style: "brick",
-    doorSides: [0],
-    roof: "flat",
-    ladder: false,
-    rng,
-  });
-  // Guaranteed material mix, shuffled deterministically.
-  const styles: BuildingStyle[] = [
-    "brick",
-    "log",
-    "concrete",
-    "brick",
-    "concrete",
-    "log",
-    "brick",
-    "concrete",
-    "brick",
-    "log",
-    "concrete",
-    "brick",
-    "log",
-    "concrete",
-    "brick",
-    "concrete",
-    "log",
-    "brick",
-    "concrete",
-    "brick",
-  ];
-  for (let i = styles.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    [styles[i], styles[j]] = [styles[j], styles[i]];
-  }
-  const sites: Array<[number, number, number, number]> = [
-    [-15, -12, 8, 8],
-    [15, 12, 8, 8],
-    [16, -14, 8, 6],
-    [-16, 14, 8, 6],
-    [32, 4, 8, 8],
-    [-32, -25, 8, 6],
-    [-31, 27, 8, 6],
-    [14, -30, 8, 6],
-    [60, 0, 8, 8],
-    [-60, -5, 8, 8],
-    [0, 62, 8, 8],
-    [-3, -65, 8, 8],
-    [62, 62, 8, 6],
-    [-62, 58, 8, 6],
-    [-65, -62, 8, 6],
-    [60, -64, 8, 6],
-    [95, 28, 8, 6],
-    [-95, -30, 8, 6],
-    [30, 90, 8, 6],
-    [-35, -92, 8, 6],
-  ];
-  sites.forEach(([cx, cz, w, d], i) => {
-    const stories = rng() < 0.45 ? 1 : rng() < 0.72 ? 2 : 3;
-    const firstDoor = Math.floor(rng() * 4) as 0 | 1 | 2 | 3;
+  // Buildings: each lot fronts its street; the first lot is the fixed center
+  // house. Singles occasionally get a back door too.
+  for (const lot of LAYOUT.lots) {
     const doorSides: Array<0 | 1 | 2 | 3> =
-      rng() < 0.4 ? [firstDoor, ((firstDoor + 2) % 4) as 0 | 1 | 2 | 3] : [firstDoor];
-    building(g, cx, cz, w, d, {
-      stories,
-      style: styles[i],
+      lot.stories === 1 && rng() < 0.35
+        ? [lot.front, ((lot.front + 2) % 4) as 0 | 1 | 2 | 3]
+        : [lot.front];
+    building(g, lot.cx, lot.cz, lot.w, lot.d, {
+      stories: lot.stories,
+      style: lot.style,
       doorSides,
-      roof: rng() < 0.45 ? "gable" : "flat",
-      ladder: rng() < 0.6,
+      roof: lot.roof,
+      ladder: lot.ladder,
       rng,
     });
-  });
+  }
 
-  // Procedural placement for everything else, rejected against keep-outs.
+  // Procedural scatter for everything else, rejected against keep-outs.
   const placed: Array<[number, number, number]> = []; // x, z, radius
   const clearOf = (x: number, z: number, r: number): boolean => {
-    if (Math.abs(x) > half - 3 || Math.abs(z) > half - 3) return false;
+    if (Math.abs(x) > half - 4 || Math.abs(z) > half - 4) return false;
+    if (x > 20 && x < 28 && Math.abs(z) < 45) return false; // east duel lane
+    if (waterCarveAt(x, z) > 0.1) return false; // stay out of the water
+    if (onRoad(x, z) > 0) return false; // keep roads/paths clear
     for (const [cx, cz, hw, hd] of FLAT_PADS) {
       if (Math.abs(x - cx) < hw + r && Math.abs(z - cz) < hd + r) return false;
     }
-    if (x > 20.5 && x < 27.5 && Math.abs(z) < 45) return false; // east duel lane
-    if (waterCarveAt(x, z) > 0.08) return false; // stay out of the water
     for (const [px, pz, pr] of placed) {
       if (Math.hypot(x - px, z - pz) < r + pr) return false;
     }
     return true;
   };
+
+  // Market stalls in the village plaza: a crate of cover apiece.
+  for (const [sx, sz] of LAYOUT.stalls) {
+    if (!clearOf(sx, sz, 1.4)) continue;
+    const crateFirst = nextPanelId;
+    const base = baseHeightAt(sx, sz);
+    const s = 0.9 + rng() * 0.5;
+    g.panels.push({
+      id: nextPanelId++,
+      x: sx,
+      y: base + s / 2,
+      z: sz,
+      ex: s,
+      ey: s,
+      ez: s,
+      material: "crate",
+    });
+    endSlab(g, crateFirst);
+    placed.push([sx, sz, 1.4]);
+  }
 
   // Sandbag emplacements (three staggered courses of bags).
   for (let i = 0; i < 32; i++) {
@@ -1233,11 +1512,40 @@ function buildMap(): MapDef {
     }
   }
 
-  // Trees.
-  for (let i = 0; i < 85; i++) {
-    for (let attempt = 0; attempt < 30; attempt++) {
-      const x = (rng() * 2 - 1) * (half - 5);
-      const z = (rng() * 2 - 1) * (half - 5);
+  // Trees: clumped into groves rather than sprinkled uniformly. Grove centers
+  // avoid the built-up core and lean toward the edges/water; each spawns a
+  // tight clump (concentrated toward its middle). A handful of lone trees and
+  // the rejection radius keep it from reading as a regular grid.
+  const groves: Array<[number, number, number]> = [];
+  for (let i = 0; i < 22; i++) {
+    for (let attempt = 0; attempt < 24; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 12);
+      const z = (rng() * 2 - 1) * (half - 12);
+      if (Math.hypot(x, z) < 34 && rng() < 0.8) continue; // mostly keep the core open
+      groves.push([x, z, 6 + rng() * 10]);
+      break;
+    }
+  }
+  for (const [gx, gz, gr] of groves) {
+    const n = 4 + Math.floor(rng() * 7);
+    for (let i = 0; i < n; i++) {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const ang = rng() * Math.PI * 2;
+        const rr = Math.sqrt(rng()) * gr; // denser toward the grove center
+        const x = gx + Math.cos(ang) * rr;
+        const z = gz + Math.sin(ang) * rr;
+        if (!clearOf(x, z, 2.0)) continue;
+        tree(g, x, z, rng);
+        placed.push([x, z, 2.0]);
+        break;
+      }
+    }
+  }
+  // Lone trees and copses dotted across the open fields.
+  for (let i = 0; i < 26; i++) {
+    for (let attempt = 0; attempt < 16; attempt++) {
+      const x = (rng() * 2 - 1) * (half - 6);
+      const z = (rng() * 2 - 1) * (half - 6);
       if (!clearOf(x, z, 2.4)) continue;
       tree(g, x, z, rng);
       placed.push([x, z, 2.4]);
@@ -1312,8 +1620,9 @@ function buildMap(): MapDef {
 export const MAP = buildMap();
 
 // ---------------------------------------------------------------------------
-// Conquest zones: capturable flags at five of the building sites, spread in
-// a cross over the battlefield. Hold the majority to bleed enemy tickets.
+// Conquest zones: capturable flags at the village heart and four hamlet
+// greens, spread in a cross over the battlefield. Hold the majority to bleed
+// enemy tickets. Computed by the layout so they always sit on real clearings.
 
 export interface ZoneDef {
   letter: string;
@@ -1322,13 +1631,7 @@ export interface ZoneDef {
   r: number;
 }
 
-export const ZONES: ZoneDef[] = [
-  { letter: "A", x: -60, z: -5, r: 12 },
-  { letter: "B", x: 0, z: 0, r: 12 },
-  { letter: "C", x: 60, z: 0, r: 12 },
-  { letter: "D", x: 0, z: 62, r: 12 },
-  { letter: "E", x: -3, z: -65, r: 12 },
-];
+export const ZONES: ZoneDef[] = LAYOUT.zones;
 
 // Slab index for a map piece id (binary search over the sorted id ranges).
 export function slabOfPiece(pieceId: number): number {
