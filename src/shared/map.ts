@@ -221,39 +221,69 @@ function shapeFade(x: number, z: number): number {
 // and the water never undermines a structure). Wadeable: max ~1.1m deep.
 
 export const WATER_SURFACE_Y = -0.22;
-const WATER_DEPTH = 1.35;
-const RIVER_HALF_WIDTH = 7;
+const WATER_DEPTH = 1.3;
+const RIVER_HALF_WIDTH = 7.5;
 
-// River centerline, precomputed as a coarse polyline.
-function riverZ(x: number): number {
-  return 38 + 18 * Math.sin(x / 37) + 10 * Math.sin(x / 13 + 2);
+// River centerline: a non-periodic meander from low-frequency value noise.
+// (A sum of sines reads as a regular wave; layered noise wanders like a real
+// river.) The width breathes along its length, widening into pools and
+// pinching at riffles.
+function riverCenterZ(x: number): number {
+  return 33 + 30 * (valueNoise(x + 600, 0, 118) - 0.5) + 13 * (valueNoise(x + 1700, 0, 44) - 0.5);
+}
+function riverHalfWidthAt(x: number): number {
+  return RIVER_HALF_WIDTH * (0.62 + 0.7 * valueNoise(x + 1234, 0, 40));
 }
 
-const RIVER_PTS: Array<[number, number]> = [];
-for (let x = -SIZE / 2; x <= SIZE / 2; x += 4) RIVER_PTS.push([x, riverZ(x)]);
+// River polyline: [x, centerZ, halfWidth], sampled densely (and a little past
+// each edge) so the nearest-point distance is smooth.
+const RIVER_PTS: Array<[number, number, number]> = [];
+for (let x = -SIZE / 2 - 8; x <= SIZE / 2 + 8; x += 3) {
+  RIVER_PTS.push([x, riverCenterZ(x), riverHalfWidthAt(x)]);
+}
 
 const LAKES: Array<[number, number, number, number]> = [
   // [cx, cz, rx, rz]
-  [-70, -55, 17, 12],
-  [85, -30, 13, 10],
+  [-80, -64, 16, 12],
+  [90, -42, 13, 10],
 ];
 
-// How deep the water carve is at (x,z), before pad fading. 0 = dry land.
+// Channel cross-section as a function of normalized distance from the
+// centerline (t = dist/halfWidth): a flat thalweg, steep cut banks, then a
+// slightly raised levee at the lip (the small negative lobe). The levee is what
+// sells "carved" — real rivers throw up bank berms that catch the light, where
+// a lone smoothstep just paints a round trough.
+function channelProfile(t: number): number {
+  if (t < 0.5) return 1; // flat bed
+  if (t < 0.9) return smooth((0.9 - t) / 0.4); // steep banks
+  if (t < 1.4) return -0.05 * smooth((t - 0.9) / 0.5) * smooth((1.4 - t) / 0.5); // levee berm
+  return 0;
+}
+
+// How deep the water carve is at (x,z), before pad/road fading. >0 digs the
+// channel or a lake; the small <0 lip raises a bank berm. 0 = untouched land.
 export function waterCarveAt(x: number, z: number): number {
-  let dug = 0;
-  // River: distance to the centerline polyline (cheap x-window reject).
   let best = Infinity;
-  for (const [px, pz] of RIVER_PTS) {
-    if (Math.abs(px - x) > 12) continue;
+  let bestHalf = RIVER_HALF_WIDTH;
+  for (const [px, pz, ph] of RIVER_PTS) {
+    if (Math.abs(px - x) > 16) continue;
     const d = Math.hypot(x - px, z - pz);
-    if (d < best) best = d;
+    if (d < best) {
+      best = d;
+      bestHalf = ph;
+    }
   }
-  if (best < RIVER_HALF_WIDTH) dug = Math.max(dug, smooth(1 - best / RIVER_HALF_WIDTH));
+  let dug = 0;
+  if (best < bestHalf * 1.4) {
+    dug = channelProfile(best / bestHalf) * WATER_DEPTH;
+    // Gravel-bar roughness so the bed isn't glassy flat (positive carve only).
+    if (dug > 0) dug *= 1 + 0.12 * (valueNoise(x + 5000, z + 5000, 3.5) - 0.5);
+  }
   for (const [cx, cz, rx, rz] of LAKES) {
     const e = Math.hypot((x - cx) / rx, (z - cz) / rz);
-    if (e < 1) dug = Math.max(dug, smooth(1 - e));
+    if (e < 1) dug = Math.max(dug, smooth(1 - e) * WATER_DEPTH);
   }
-  return dug * WATER_DEPTH;
+  return dug;
 }
 
 // The pristine pre-battle terrain. Structure generation seats pieces on this,
