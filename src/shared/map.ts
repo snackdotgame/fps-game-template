@@ -242,8 +242,10 @@ function roadFieldAt(x: number, z: number): { w: number; targetY: number } {
   return { w: edge * padFade(x, z), targetY }; // pads win over roads
 }
 
-// Is (x,z) on a road surface (for visuals/queries)? Distance to nearest
-// centerline within its half width.
+// Road surface at (x,z): 0 = off-road, else the nearest road's half-width
+// (so callers can tell the wide cobbled main road from narrow dirt lanes, and
+// `onRoad(x,z) > 0` still reads as "is road"). Road colour is baked straight
+// into the terrain mesh from this — no overlay, so no z-fighting.
 export function onRoad(x: number, z: number): number {
   for (const s of ROAD_SEGS) {
     if (x < Math.min(s.ax, s.bx) - 6 || x > Math.max(s.ax, s.bx) + 6) continue;
@@ -253,9 +255,35 @@ export function onRoad(x: number, z: number): number {
     const len2 = dx * dx + dz * dz || 1;
     const t = Math.max(0, Math.min(1, ((x - s.ax) * dx + (z - s.az) * dz) / len2));
     const d = Math.hypot(x - (s.ax + dx * t), z - (s.az + dz * t));
-    if (d < s.half + 0.4) return 1 - d / (s.half + 0.4);
+    if (d < s.half + 0.5) return s.half;
   }
   return 0;
+}
+
+// Road paint weight at (x,z): 1 on the road, feathering to 0 across a short
+// verge, plus whether it's the wide cobbled main road. Mirrors roadFieldAt's
+// footprint so the painted surface lines up with the flattened terrain — the
+// client bakes this straight into the terrain faces (no overlay, no z-fight).
+export function roadAt(x: number, z: number): { w: number; cobble: boolean } {
+  let best = Infinity;
+  let bestSeg: RoadSeg | null = null;
+  for (const s of ROAD_SEGS) {
+    if (x < Math.min(s.ax, s.bx) - 6 || x > Math.max(s.ax, s.bx) + 6) continue;
+    if (z < Math.min(s.az, s.bz) - 6 || z > Math.max(s.az, s.bz) + 6) continue;
+    const dx = s.bx - s.ax;
+    const dz = s.bz - s.az;
+    const len2 = dx * dx + dz * dz || 1;
+    const t = Math.max(0, Math.min(1, ((x - s.ax) * dx + (z - s.az) * dz) / len2));
+    const d = Math.hypot(x - (s.ax + dx * t), z - (s.az + dz * t));
+    if (d < best) {
+      best = d;
+      bestSeg = s;
+    }
+  }
+  if (!bestSeg) return { w: 0, cobble: false };
+  const verge = 0.7;
+  const w = best <= bestSeg.half ? 1 : Math.max(0, 1 - (best - bestSeg.half) / verge);
+  return { w: w * padFade(x, z), cobble: bestSeg.half > 3 };
 }
 
 // --- Water: one meandering river plus a couple of lakes, carved into the
@@ -1494,12 +1522,20 @@ function buildMap(): MapDef {
   LAYOUT = planLayout(rng);
 
   // Buildings: each lot fronts its street; the first lot is the fixed center
-  // house. Singles occasionally get a back door too.
-  for (const lot of LAYOUT.lots) {
-    const doorSides: Array<0 | 1 | 2 | 3> =
-      lot.stories === 1 && rng() < 0.35
-        ? [lot.front, ((lot.front + 2) % 4) as 0 | 1 | 2 | 3]
-        : [lot.front];
+  // house. Most buildings get multiple entrances (a back door for through-flow,
+  // often a side door too) so fights have several ways in/out — building()
+  // relocates any west door off the stairwell on multi-story houses.
+  LAYOUT.lots.forEach((lot, li) => {
+    const f = lot.front;
+    // The fixed center house keeps exactly its north door (tests breach its
+    // solid south wall); every other building gets multiple entrances.
+    const fixedCenter = li === 0 && lot.cx === 0 && lot.cz === 0;
+    const doorSides: Array<0 | 1 | 2 | 3> = [f];
+    if (!fixedCenter) {
+      if (rng() < 0.78) doorSides.push(((f + 2) % 4) as 0 | 1 | 2 | 3); // opposite
+      if (rng() < 0.45) doorSides.push(((f + 1) % 4) as 0 | 1 | 2 | 3); // a side
+      if (rng() < 0.22) doorSides.push(((f + 3) % 4) as 0 | 1 | 2 | 3); // the other side
+    }
     building(g, lot.cx, lot.cz, lot.w, lot.d, {
       stories: lot.stories,
       style: lot.style,
@@ -1508,7 +1544,7 @@ function buildMap(): MapDef {
       ladder: lot.ladder,
       rng,
     });
-  }
+  });
 
   // Procedural scatter for everything else, rejected against keep-outs.
   const placed: Array<[number, number, number]> = []; // x, z, radius

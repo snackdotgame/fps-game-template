@@ -30,7 +30,7 @@ import {
   PLAY_HALF,
   resetCraters,
   ringMesh,
-  roadSegments,
+  roadAt,
   slabOfPiece,
   TERRAIN_CHUNK,
   TERRAIN_CHUNKS,
@@ -113,10 +113,10 @@ scene.background = new THREE.Color(0xb8cfe0);
 scene.fog = new THREE.Fog(0xb8cfe0, 90, 230);
 
 const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.08, 360);
-const hemi = new THREE.HemisphereLight(0xe8f1fa, 0x6e6a5e, 1.0);
+const hemi = new THREE.HemisphereLight(0xdcebfb, 0x5a6147, 0.62);
 scene.add(hemi);
-const sun = new THREE.DirectionalLight(0xfff2dd, 2.0);
-sun.position.set(35, 50, -25);
+const sun = new THREE.DirectionalLight(0xfff1d6, 2.0);
+sun.position.set(48, 40, -26); // lower & raking, for more terrain relief
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.camera.near = 1;
@@ -406,10 +406,98 @@ const terrainMat = new THREE.MeshStandardMaterial({
   metalness: 0,
   flatShading: true,
 });
-const TERRAIN_LOW = new THREE.Color(0x5e8a4a);
-const TERRAIN_HIGH = new THREE.Color(0x8aa763);
+// Richer ground palette: several greens/browns plus rock + sand, blended by
+// macro color-noise, slope, height, shoreline and roads (see colorTerrainFace).
+const T_GRASS_A = new THREE.Color(0x5a8746);
+const T_GRASS_B = new THREE.Color(0x6f9850);
+const T_GRASS_C = new THREE.Color(0x466e3b);
+const T_DRY = new THREE.Color(0x8d934f);
+const T_HIGH = new THREE.Color(0x96a76a);
+const T_ROCK = new THREE.Color(0x6b6256);
+const T_ROCK_HI = new THREE.Color(0x847b6d);
+const T_SAND = new THREE.Color(0xb6a578);
 const TERRAIN_SCORCH = new THREE.Color(0x4f463b);
 const TERRAIN_BED = new THREE.Color(0x6a6f52); // silty riverbed
+const ROAD_DIRT = new THREE.Color(0x7a6446);
+const ROAD_COBBLE = new THREE.Color(0x8a857d);
+
+function smoothstep01(x: number, a: number, b: number): number {
+  const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+// Cheap 2D value noise in [0,1] for macro color variation (client-only, so it
+// need not match the server's valueNoise).
+function vnoise(x: number, z: number, freq: number): number {
+  const xs = x * freq;
+  const zs = z * freq;
+  const ix = Math.floor(xs);
+  const iz = Math.floor(zs);
+  const fx = xs - ix;
+  const fz = zs - iz;
+  const sx = fx * fx * (3 - 2 * fx);
+  const sz = fz * fz * (3 - 2 * fz);
+  const h = (a: number, b: number): number => {
+    let n = Math.imul((a | 0) + Math.imul(b | 0, 0x9e3779b9), 2654435761);
+    n ^= n >>> 15;
+    return ((n >>> 8) % 10000) / 10000;
+  };
+  const a = h(ix, iz);
+  const b = h(ix + 1, iz);
+  const c = h(ix, iz + 1);
+  const d = h(ix + 1, iz + 1);
+  return a + (b - a) * sx + (c - a) * sz + (a - b - c + d) * sx * sz;
+}
+
+// Analytic ambient occlusion from the heightfield: faces lower than their
+// neighborhood (hollows, crater bowls, the river channel) darken; bumps lift.
+function computeFaceAO(cx: number, cy: number, cz: number): number {
+  const r = 3;
+  const avg =
+    (baseHeightAt(cx + r, cz) +
+      baseHeightAt(cx - r, cz) +
+      baseHeightAt(cx, cz + r) +
+      baseHeightAt(cx, cz - r)) *
+    0.25;
+  return Math.max(0.76, Math.min(1.06, 1 + (cy - avg) * 0.35));
+}
+
+const _trock = new THREE.Color();
+const _troad = new THREE.Color();
+
+// The shared per-face ground color: macro-noise green patches, dry/high
+// bleaching, slope rock, shoreline sand, crater scorch, riverbed silt, baked
+// roads, and analytic AO. Used by both the core terrain and the apron/backdrop.
+function colorTerrainFace(c: THREE.Color, cx: number, cy: number, cz: number, ny: number): void {
+  const m1 = vnoise(cx, cz, 0.045);
+  const m2 = vnoise(cx + 99, cz + 33, 0.13);
+  c.copy(T_GRASS_A).lerp(T_GRASS_B, m1);
+  c.lerp(T_GRASS_C, smoothstep01(m2, 0.55, 1));
+  c.lerp(T_DRY, smoothstep01(m2, 0, 0.25) * 0.55);
+  c.lerp(T_HIGH, Math.max(0, Math.min(1, (cy - 0.4) / 1.2)) * 0.4);
+  const slope = 1 - ny;
+  const rock = smoothstep01(slope, 0.3, 0.6);
+  if (rock > 0) {
+    _trock.copy(T_ROCK).lerp(T_ROCK_HI, vnoise(cx + 7, cz + 7, 0.2));
+    c.lerp(_trock, rock);
+  }
+  const aboveWater = cy - WATER_SURFACE_Y;
+  const shore = smoothstep01(aboveWater, 0.5, 0) * smoothstep01(aboveWater, -0.15, 0.06);
+  c.lerp(T_SAND, Math.min(1, shore) * 0.85 * (1 - rock));
+  const dug = baseHeightAt(cx, cz) - cy;
+  if (dug > 0.08) c.lerp(TERRAIN_SCORCH, Math.min(1, dug / 0.6));
+  if (cy < WATER_SURFACE_Y + 0.05) {
+    c.lerp(TERRAIN_BED, Math.min(1, (WATER_SURFACE_Y + 0.05 - cy) / 0.5));
+  }
+  const road = roadAt(cx, cz);
+  if (road.w > 0) {
+    _troad.copy(road.cobble ? ROAD_COBBLE : ROAD_DIRT);
+    _troad.multiplyScalar(0.86 + vnoise(cx * 2, cz * 2, 1) * 0.26);
+    c.lerp(_troad, road.w);
+  }
+  c.multiplyScalar(computeFaceAO(cx, cy, cz));
+  c.multiplyScalar(0.95 + vnoise(cx * 3.1, cz * 3.1, 1) * 0.1);
+}
 
 const poleMat = new THREE.MeshStandardMaterial({ color: 0x3a3d42, roughness: 0.7 });
 const flagGeo = new THREE.PlaneGeometry(1.55, 0.95);
@@ -542,22 +630,15 @@ function makeTerrainChunkMesh(ci: number, cj: number): THREE.Mesh {
   geo = geo.toNonIndexed(); // flat faceted normals + per-face color
   geo.computeVertexNormals();
   const pos = geo.getAttribute("position");
+  const norm = geo.getAttribute("normal");
   const colors: number[] = [];
   const c = new THREE.Color();
   for (let f = 0; f < pos.count; f += 3) {
     const cx = (pos.getX(f) + pos.getX(f + 1) + pos.getX(f + 2)) / 3;
     const cy = (pos.getY(f) + pos.getY(f + 1) + pos.getY(f + 2)) / 3;
     const cz = (pos.getZ(f) + pos.getZ(f + 1) + pos.getZ(f + 2)) / 3;
-    const t = Math.max(0, Math.min(1, cy / 1.5));
-    c.copy(TERRAIN_LOW).lerp(TERRAIN_HIGH, t);
-    // Crater bowls read as scorched earth; riverbeds as silt.
-    const dug = baseHeightAt(cx, cz) - cy;
-    if (dug > 0.08) c.lerp(TERRAIN_SCORCH, Math.min(1, dug / 0.6));
-    if (cy < WATER_SURFACE_Y + 0.05) {
-      c.lerp(TERRAIN_BED, Math.min(1, (WATER_SURFACE_Y + 0.05 - cy) / 0.5));
-    }
-    const j = 0.93 + hash01(Math.round(cx * 7 + cz * 131), 5) * 0.14;
-    colors.push(c.r * j, c.g * j, c.b * j, c.r * j, c.g * j, c.b * j, c.r * j, c.g * j, c.b * j);
+    colorTerrainFace(c, cx, cy, cz, norm.getY(f));
+    colors.push(c.r, c.g, c.b, c.r, c.g, c.b, c.r, c.g, c.b);
   }
   geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
   const mesh = new THREE.Mesh(geo, terrainMat);
@@ -589,6 +670,7 @@ function makeRingVisual(inner: number, outer: number, cell: number, fade: boolea
   geo = geo.toNonIndexed();
   geo.computeVertexNormals();
   const pos = geo.getAttribute("position");
+  const norm = geo.getAttribute("normal");
   const colors: number[] = [];
   const c = new THREE.Color();
   const fogCol = new THREE.Color(0xb8cfe0);
@@ -596,67 +678,17 @@ function makeRingVisual(inner: number, outer: number, cell: number, fade: boolea
     const cx = (pos.getX(f) + pos.getX(f + 1) + pos.getX(f + 2)) / 3;
     const cy = (pos.getY(f) + pos.getY(f + 1) + pos.getY(f + 2)) / 3;
     const cz = (pos.getZ(f) + pos.getZ(f + 1) + pos.getZ(f + 2)) / 3;
-    c.copy(TERRAIN_LOW).lerp(TERRAIN_HIGH, Math.max(0, Math.min(1, cy / 1.5)));
+    colorTerrainFace(c, cx, cy, cz, norm.getY(f));
     if (fade) {
       const dist = Math.max(Math.abs(cx), Math.abs(cz));
       const k = Math.max(0, Math.min(1, (dist - APRON_OUTER) / (BACKDROP_OUTER - APRON_OUTER)));
       c.lerp(fogCol, k * 0.85);
     }
-    const j = 0.93 + hash01(Math.round(cx * 7 + cz * 131), 5) * 0.14;
-    for (let v = 0; v < 3; v++) colors.push(c.r * j, c.g * j, c.b * j);
+    for (let v = 0; v < 3; v++) colors.push(c.r, c.g, c.b);
   }
   geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
   const mesh = new THREE.Mesh(geo, terrainMat);
   mesh.receiveShadow = !fade;
-  return mesh;
-}
-
-// Roads/paths: flat ribbons laid on the (already flattened) terrain, dirt for
-// lanes and cobble-grey for the main road, with per-vertex tonal jitter.
-const roadMat = new THREE.MeshStandardMaterial({
-  vertexColors: true,
-  roughness: 0.97,
-  metalness: 0,
-  polygonOffset: true,
-  polygonOffsetFactor: -4,
-  polygonOffsetUnits: -4,
-});
-const ROAD_DIRT = new THREE.Color(0x796344);
-const ROAD_COBBLE = new THREE.Color(0x86817b);
-
-function buildRoadVisual(): THREE.Mesh {
-  const positions: number[] = [];
-  const colors: number[] = [];
-  const c = new THREE.Color();
-  for (const s of roadSegments()) {
-    const dx = s.bx - s.ax;
-    const dz = s.bz - s.az;
-    const len = Math.hypot(dx, dz) || 1;
-    const nx = -dz / len;
-    const nz = dx / len;
-    const hw = s.half;
-    const base = hw > 3 ? ROAD_COBBLE : ROAD_DIRT;
-    const corners: Array<[number, number]> = [
-      [s.ax + nx * hw, s.az + nz * hw],
-      [s.ax - nx * hw, s.az - nz * hw],
-      [s.bx + nx * hw, s.bz + nz * hw],
-      [s.bx - nx * hw, s.bz - nz * hw],
-    ];
-    const ys = corners.map(([x, z]) => heightAt(x, z) + 0.05);
-    const emit = (i: number): void => {
-      positions.push(corners[i][0], ys[i], corners[i][1]);
-      const jit = 0.82 + hash01(Math.round(corners[i][0] * 5 + corners[i][1] * 9), 7) * 0.34;
-      c.copy(base).multiplyScalar(jit);
-      colors.push(c.r, c.g, c.b);
-    };
-    for (const i of [0, 2, 1, 1, 2, 3]) emit(i);
-  }
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
-  geo.computeVertexNormals();
-  const mesh = new THREE.Mesh(geo, roadMat);
-  mesh.receiveShadow = true;
   return mesh;
 }
 
@@ -924,10 +956,9 @@ function buildMapVisuals(): void {
     }
   }
   // The world beyond the core: a collidable apron then a fog-bound backdrop.
+  // (Roads are baked into the terrain faces in colorTerrainFace — no overlay.)
   mapGroup.add(makeRingVisual(MAP.size / 2 - 4, APRON_OUTER, 8, false));
   mapGroup.add(makeRingVisual(APRON_OUTER, BACKDROP_OUTER, 18, true));
-  // Roads/paths laid on the terrain.
-  mapGroup.add(buildRoadVisual());
 
   // Conquest flags: a pole at each zone center, cloth raising toward the
   // capturing team's color.
