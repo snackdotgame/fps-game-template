@@ -332,7 +332,9 @@ async function main(): Promise<void> {
   {
     const houses = MAP.buildings.filter((b) => b.kind === "building");
     const trees = MAP.buildings.filter((b) => b.kind === "tree");
-    let ok = houses.length === 21 && trees.length >= 60;
+    // The settlement is procedurally laid out (clusters + rejection), so the
+    // exact building count varies; assert a sane range, not a magic number.
+    let ok = houses.length >= 14 && houses.length <= 44 && trees.length >= 60;
     // Concrete buildings use far fewer (bigger) panels than brick ones.
     for (const b of houses) ok &&= b.wallPanelIds.length >= 90 && b.roofPanelIds.length >= 40;
     for (const b of trees) {
@@ -369,8 +371,8 @@ async function main(): Promise<void> {
       `logs=${logs.length}`,
     );
     check(
-      "everything but the perimeter is destructible",
-      MAP.statics.length === 4 &&
+      "everything is destructible (no perimeter walls anymore)",
+      MAP.statics.length === 0 &&
         ["plank", "post", "trunk", "canopy", "crate", "sandbag"].every(
           (m) => (byMat.get(m) ?? 0) > 0,
         ),
