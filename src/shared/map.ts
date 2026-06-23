@@ -1400,31 +1400,6 @@ function rocks(g: Gen, x: number, z: number, rng: () => number): void {
 // --- Small props: cheap box clusters that make the place feel lived-in. All
 // reuse existing materials and become destructible cover.
 
-// A low leafy bush: a squashed dome of canopy boxes (no trunk).
-function bush(g: Gen, x: number, z: number, rng: () => number): void {
-  const slabFirst = nextPanelId;
-  const base = baseHeightAt(x, z);
-  const band = rng() < 0.18 ? 6 : rng() < 0.32 ? 1 : 0;
-  const n = 4 + Math.floor(rng() * 4);
-  for (let i = 0; i < n; i++) {
-    const a = rng() * Math.PI * 2;
-    const r = rng() * 0.6;
-    const s = 0.5 + rng() * 0.5;
-    g.panels.push({
-      id: nextPanelId++,
-      x: x + Math.cos(a) * r,
-      y: base + s * 0.45,
-      z: z + Math.sin(a) * r,
-      ex: s,
-      ey: s * 0.8,
-      ez: s,
-      material: "canopy",
-      seed: band | (i << 3),
-    });
-  }
-  endSlab(g, slabFirst);
-}
-
 // A fallen log (horizontal) and usually a stump beside it.
 function fallenLog(g: Gen, x: number, z: number, rng: () => number): void {
   const slabFirst = nextPanelId;
@@ -2092,18 +2067,6 @@ function buildMap(): MapDef {
         z + Math.sin(ang) * L * 0.5,
       );
       placed.push([x, z, 3]);
-      break;
-    }
-  }
-
-  // Bushes / shrubs dotted across meadows and grove edges.
-  for (let i = 0; i < 46; i++) {
-    for (let attempt = 0; attempt < 14; attempt++) {
-      const x = (rng() * 2 - 1) * (half - 5);
-      const z = (rng() * 2 - 1) * (half - 5);
-      if (!clearOf(x, z, 1.1)) continue;
-      bush(g, x, z, rng);
-      placed.push([x, z, 1.1]);
       break;
     }
   }

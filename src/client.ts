@@ -175,35 +175,14 @@ const MAT = {
   rubble: new THREE.MeshStandardMaterial({ color: 0x6e6a62, roughness: 1, flatShading: true }),
 };
 
-// A faceted boulder: an icosphere displaced by a cheap deterministic noise so
-// no two rocks (scaled/rotated per piece) read the same. Flat-shaded via
-// voxelMat. (ez-tree uses pre-made GLB rock models; this keeps rocks procedural
-// AND destructible — collision stays the piece's box.)
-function makeRockGeo(): THREE.BufferGeometry {
-  const g = new THREE.IcosahedronGeometry(0.5, 2);
-  const pos = g.getAttribute("position");
-  const v = new THREE.Vector3();
-  for (let i = 0; i < pos.count; i++) {
-    v.fromBufferAttribute(pos, i);
-    const bump =
-      0.18 * Math.sin(v.x * 8.1 + v.y * 4.3) * Math.cos(v.z * 6.2) +
-      0.09 * Math.sin(v.x * 19 + v.z * 15) +
-      0.06 * Math.cos(v.y * 23 + v.x * 11);
-    v.setLength(0.5 * (0.86 + bump)); // ~radius 0.5, lumpy
-    pos.setXYZ(i, v.x, v.y, v.z);
-  }
-  g.computeVertexNormals();
-  return g;
-}
-
 // Unit geometries, scaled per instance to each piece's extents: beveled boxes
 // for masonry (the bevel catches light, so every brick reads as a brick) and
-// foliage clumps, faceted cylinders for logs and trunks, faceted boulders for
-// rocks.
+// foliage clumps, faceted cylinders for logs and trunks, soft-cornered lumps
+// for rocks.
 const GEO = {
   box: new THREE.BoxGeometry(1, 1, 1),
   bevel: new RoundedBoxGeometry(1, 1, 1, 1, 0.055),
-  rock: makeRockGeo(),
+  rock: new RoundedBoxGeometry(1, 1, 1, 2, 0.2),
   cyl: new THREE.CylinderGeometry(0.5, 0.5, 1, 7),
   decal: new THREE.PlaneGeometry(1, 1),
 };
@@ -749,57 +728,23 @@ function makeRingVisual(inner: number, outer: number, cell: number, fade: boolea
 // tinted to the terrain. Blades resample the heightfield on crater rebuilds
 // (and skip scorched bowls).
 
-const GRASS_TUFTS_PER_CHUNK = 80; // each tuft = 2 crossed textured cards
-
-// A procedural grass-tuft texture: several tapered blades rising from the
-// bottom (light grey on transparent, so per-vertex color sets the green). Used
-// on alpha-tested cards — the ez-tree demo's textured-clump approach.
-function makeGrassTexture(): THREE.Texture {
-  const N = 128;
-  const cv = document.createElement("canvas");
-  cv.width = N;
-  cv.height = N;
-  const ctx = cv.getContext("2d")!;
-  ctx.clearRect(0, 0, N, N);
-  for (let i = 0; i < 10; i++) {
-    const x0 = N * (0.12 + 0.76 * Math.random());
-    const h = N * (0.5 + 0.48 * Math.random());
-    const w = N * (0.018 + 0.022 * Math.random());
-    const lean = (Math.random() - 0.5) * N * 0.22;
-    const g = 165 + Math.random() * 80;
-    ctx.fillStyle = `rgb(${Math.round(g * 0.88)},${Math.round(g)},${Math.round(g * 0.66)})`;
-    ctx.beginPath();
-    ctx.moveTo(x0 - w, N);
-    ctx.lineTo(x0 + w, N);
-    ctx.lineTo(x0 + lean, N - h);
-    ctx.closePath();
-    ctx.fill();
-  }
-  const tex = new THREE.CanvasTexture(cv);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  return tex;
-}
-const grassTex = makeGrassTexture();
+const GRASS_TUFTS_PER_CHUNK = 80; // each tuft is 2-4 blades -> ~45k blades total
 const grassChunkVisuals = new Map<number, THREE.Mesh>();
 const grassMat = new THREE.ShaderMaterial({
-  uniforms: THREE.UniformsUtils.merge([
-    THREE.UniformsLib.fog,
-    { uTime: { value: 0 }, uMap: { value: grassTex } },
-  ]),
+  uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, { uTime: { value: 0 } }]),
   vertexShader: `
     #include <fog_pars_vertex>
     uniform float uTime;
-    attribute vec3 aColor;
+    attribute float aTip;
     attribute float aSway;
     varying vec3 vColor;
-    varying vec2 vUv;
+    attribute vec3 aColor;
     void main() {
       vec3 p = position;
-      float tip = uv.y; // only the top of the card sways
-      p.x += sin(uTime * 1.8 + aSway * 6.2832 + position.x * 0.4 + position.z * 0.3) * 0.16 * tip;
-      p.z += cos(uTime * 1.3 + aSway * 6.2832) * 0.07 * tip;
+      p.x += sin(uTime * 1.9 + aSway * 6.2832 + position.x * 0.45 + position.z * 0.3)
+        * 0.14 * aTip;
+      p.z += cos(uTime * 1.4 + aSway * 6.2832) * 0.06 * aTip;
       vColor = aColor;
-      vUv = uv;
       vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
       gl_Position = projectionMatrix * mvPosition;
       #include <fog_vertex>
@@ -807,13 +752,9 @@ const grassMat = new THREE.ShaderMaterial({
   `,
   fragmentShader: `
     #include <fog_pars_fragment>
-    uniform sampler2D uMap;
     varying vec3 vColor;
-    varying vec2 vUv;
     void main() {
-      vec4 t = texture2D(uMap, vUv);
-      if (t.a < 0.4) discard;
-      gl_FragColor = vec4(t.rgb * vColor, 1.0);
+      gl_FragColor = vec4(vColor, 1.0);
       #include <fog_fragment>
     }
   `,
@@ -826,7 +767,7 @@ function makeGrassChunkMesh(ci: number, cj: number): THREE.Mesh | null {
   const z0 = -MAP.size / 2 + cj * TERRAIN_CHUNK;
   const positions: number[] = [];
   const colors: number[] = [];
-  const uvs: number[] = [];
+  const tips: number[] = [];
   const sways: number[] = [];
   const cLow = new THREE.Color(0x4f7d36);
   const cHigh = new THREE.Color(0xa6c25f);
@@ -835,30 +776,8 @@ function makeGrassChunkMesh(ci: number, cj: number): THREE.Mesh | null {
   const root = new THREE.Color();
   const tip = new THREE.Color();
   const seedBase = (ci * 31 + cj) * 7919;
-  // One quad card (a tuft of blades) — two crossed cards per tuft for volume.
-  const card = (cx: number, cz: number, y: number, w: number, h: number, yaw: number): void => {
-    const dx = Math.cos(yaw) * w * 0.5;
-    const dz = Math.sin(yaw) * w * 0.5;
-    // bl, br, tr | bl, tr, tl
-    const bl: [number, number, number] = [cx - dx, y, cz - dz];
-    const br: [number, number, number] = [cx + dx, y, cz + dz];
-    const tr: [number, number, number] = [cx + dx, y + h, cz + dz];
-    const tl: [number, number, number] = [cx - dx, y + h, cz - dz];
-    for (const [p, u, vRoot] of [
-      [bl, 0, 1],
-      [br, 1, 1],
-      [tr, 1, 0],
-      [bl, 0, 1],
-      [tr, 1, 0],
-      [tl, 0, 0],
-    ] as Array<[[number, number, number], number, number]>) {
-      positions.push(p[0], p[1], p[2]);
-      uvs.push(u, vRoot === 1 ? 0 : 1);
-      const c = vRoot === 1 ? root : tip;
-      colors.push(c.r, c.g, c.b);
-      sways.push(0); // overwritten below per-tuft
-    }
-  };
+  // Grass grows in tufts (a small clump of leaning blades), not lone spikes,
+  // and stays off roads, pads, water and scorched bowls.
   for (let i = 0; i < GRASS_TUFTS_PER_CHUNK; i++) {
     const tx = x0 + hash01(seedBase + i, 11) * TERRAIN_CHUNK;
     const tz = z0 + hash01(seedBase + i, 12) * TERRAIN_CHUNK;
@@ -869,24 +788,34 @@ function makeGrassChunkMesh(ci: number, cj: number): THREE.Mesh | null {
     if (onRoad(tx, tz) > 0) continue; // bare road/path
     const hue = hash01(seedBase + i, 17);
     const dryTuft = hash01(seedBase + i, 18) > 0.82;
-    const h = 0.45 + hash01(seedBase + i, 13) * 0.45;
-    const w = 0.45 + hash01(seedBase + i, 14) * 0.25;
-    const yaw = hash01(seedBase + i, 15) * Math.PI;
-    const sway = hash01(seedBase + i, 16);
-    blade.copy(cLow).lerp(cHigh, hue * 0.65 + hash01(seedBase + i, 24) * 0.35);
-    if (dryTuft) blade.lerp(cDry, 0.5);
-    root.copy(blade).multiplyScalar(0.55); // shaded base (fake AO)
-    tip.copy(blade).multiplyScalar(1.18); // sun-caught tip
-    const start = sways.length;
-    card(tx, tz, ty, w, h, yaw);
-    card(tx, tz, ty, w, h, yaw + Math.PI / 2);
-    for (let s = start; s < sways.length; s++) sways[s] = sway;
+    const nBlades = 2 + Math.floor(hash01(seedBase + i, 19) * 3); // 2-4
+    for (let b = 0; b < nBlades; b++) {
+      const bs = seedBase + i * 7 + b * 131;
+      const x = tx + (hash01(bs, 21) - 0.5) * 0.34;
+      const z = tz + (hash01(bs, 22) - 0.5) * 0.34;
+      const y = heightAt(x, z);
+      const h = 0.3 + hash01(bs, 13) * 0.45;
+      const w = 0.045 + hash01(bs, 14) * 0.05;
+      const yaw = hash01(bs, 15) * Math.PI;
+      const dx = Math.cos(yaw) * w;
+      const dz = Math.sin(yaw) * w;
+      const lean = (hash01(bs, 23) - 0.5) * 0.2;
+      const sway = hash01(bs, 16);
+      blade.copy(cLow).lerp(cHigh, hue * 0.65 + hash01(bs, 24) * 0.35);
+      if (dryTuft) blade.lerp(cDry, 0.5);
+      root.copy(blade).multiplyScalar(0.52); // shaded base (fake AO)
+      tip.copy(blade).multiplyScalar(1.2); // sun-caught tip
+      positions.push(x - dx, y, z - dz, x + dx, y, z + dz, x + lean, y + h, z + lean);
+      colors.push(root.r, root.g, root.b, root.r, root.g, root.b, tip.r, tip.g, tip.b);
+      tips.push(0, 0, 1);
+      sways.push(sway, sway, sway);
+    }
   }
   if (positions.length === 0) return null;
   const geo = new THREE.BufferGeometry();
   geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
   geo.setAttribute("aColor", new THREE.Float32BufferAttribute(colors, 3));
-  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  geo.setAttribute("aTip", new THREE.Float32BufferAttribute(tips, 1));
   geo.setAttribute("aSway", new THREE.Float32BufferAttribute(sways, 1));
   return new THREE.Mesh(geo, grassMat);
 }
