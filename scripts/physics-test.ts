@@ -338,7 +338,7 @@ async function main(): Promise<void> {
     // Concrete buildings use far fewer (bigger) panels than brick ones.
     for (const b of houses) ok &&= b.wallPanelIds.length >= 90 && b.roofPanelIds.length >= 40;
     for (const b of trees) {
-      ok &&= b.wallPanelIds.length >= 3 && b.wallPanelIds.length <= 6 && b.roofPanelIds.length >= 4;
+      ok &&= b.wallPanelIds.length >= 3 && b.wallPanelIds.length <= 7 && b.roofPanelIds.length >= 4;
       // Two trunk segments always fell a tree, regardless of its height.
       ok &&= Math.ceil(b.wallPanelIds.length * b.collapseFraction) === 2;
     }

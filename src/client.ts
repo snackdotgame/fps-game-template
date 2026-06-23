@@ -232,7 +232,19 @@ function makeFractureGeo(variant: number): THREE.BufferGeometry {
 
 const FRACTURE_GEOS = [makeFractureGeo(0), makeFractureGeo(1), makeFractureGeo(2)];
 
-const CANOPY_GREENS = [0x4e8a3c, 0x5f9c46, 0x3f7a34, 0x6fae52, 0x35703a];
+// Canopy palettes by "band" (species/season). A tree tags every clump with a
+// seed whose low 3 bits pick the band, so a whole tree shares a species/season
+// while each clump still varies — see pieceColor("canopy").
+const CANOPY_BANDS: number[][] = [
+  [0x4e8a3c, 0x5f9c46, 0x3f7a34, 0x6fae52], // 0 summer green (broadleaf)
+  [0x356f30, 0x2f6a2c, 0x428039], // 1 deep lush green
+  [0x7a9a3e, 0x8aa84a, 0x6e8c34], // 2 yellow-green / late summer
+  [0xc8862f, 0xd89a3a, 0xb87328], // 3 autumn gold/orange
+  [0xb04e2a, 0xc25a30, 0x9a3f24], // 4 autumn red/rust
+  [0x2c5733, 0x244c2c, 0x35663b], // 5 dark conifer
+  [0x8a8a4a, 0x9a9656, 0x7c7c40], // 6 dry olive
+  [0x6e5a3a, 0x7a6440, 0x5e4c30], // 7 dead brown
+];
 
 // The palette: deterministic per-piece color so a wall is a thousand subtly
 // different bricks, not a flat sheet.
@@ -256,17 +268,36 @@ function pieceColor(def: PanelDef, out: THREE.Color): THREE.Color {
       return out.setHSL(0.082 + h1 * 0.015, 0.4 + h2 * 0.08, 0.45 + h1 * 0.13);
     case "post":
       return out.setHSL(0.07 + h1 * 0.015, 0.38, 0.27 + h1 * 0.06);
-    case "trunk":
-      return out.setHSL(0.072 + h1 * 0.015, 0.42, 0.25 + h1 * 0.08);
-    case "canopy":
-      out.setHex(CANOPY_GREENS[Math.floor(h1 * CANOPY_GREENS.length)]);
-      return out.multiplyScalar(0.88 + h2 * 0.24);
+    case "trunk": {
+      // Low 2 bits of the seed pick the bark: oak (grey-brown), pine (red-brown), birch (pale).
+      const bark = basis & 3;
+      const t1 = hash01(basis >> 2, 1);
+      if (bark === 2) return out.setHSL(0.1, 0.06, 0.7 + t1 * 0.12); // birch
+      if (bark === 1) return out.setHSL(0.055 + t1 * 0.01, 0.45, 0.3 + t1 * 0.08); // pine
+      return out.setHSL(0.072 + t1 * 0.015, 0.42, 0.24 + t1 * 0.09); // oak
+    }
+    case "canopy": {
+      // Low 3 bits of the seed pick the species/season band; the rest varies per clump.
+      const band = CANOPY_BANDS[basis & 7];
+      const v = hash01(basis >> 3, 2);
+      out.setHex(band[Math.floor(v * band.length) % band.length]);
+      return out.multiplyScalar(0.86 + hash01(basis >> 3, 4) * 0.28);
+    }
     case "crate":
       return out.setHSL(0.088 + h1 * 0.012, 0.46 + h2 * 0.08, 0.5 + h1 * 0.1);
     case "sandbag":
       return out.setHSL(0.112 + h1 * 0.012, 0.2 + h2 * 0.06, 0.5 + h1 * 0.12);
-    case "rock":
-      return out.setHSL(0.085 + h1 * 0.02, 0.04 + h2 * 0.05, 0.4 + h1 * 0.2);
+    case "rock": {
+      // Low 2 bits pick rock type: granite (grey), sandstone (tan), basalt
+      // (dark), mossy (green-grey). The rest drives strata lightness.
+      const kind = basis & 3;
+      const r1 = hash01(basis >> 2, 1);
+      const r2 = hash01(basis >> 2, 2);
+      if (kind === 1) return out.setHSL(0.09, 0.17, 0.44 + r1 * 0.16); // sandstone
+      if (kind === 2) return out.setHSL(0.62, 0.05, 0.26 + r1 * 0.12); // basalt
+      if (kind === 3) return out.setHSL(0.26, 0.16, 0.34 + r1 * 0.14); // mossy
+      return out.setHSL(0.085 + r1 * 0.02, 0.04 + r2 * 0.05, 0.42 + r1 * 0.2); // granite
+    }
     case "concrete":
       return out.setHSL(0.58 + h1 * 0.02, 0.02 + h2 * 0.03, 0.54 + h1 * 0.12);
     case "glass":

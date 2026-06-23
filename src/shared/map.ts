@@ -1133,35 +1133,74 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
   });
 }
 
-// Procedural trees, two species. Oaks: a stout trunk with a clustered cube
-// crown. Pines: a tall thin trunk with stacked, shrinking foliage tiers.
-// Either way the trunk is the structure — break two segments and it falls.
+// Procedural trees: conifers (ragged stacked tiers) and broadleaf (layered,
+// asymmetric, drooping crowns), in size classes with a tapered, sometimes
+// leaning trunk. The trunk is the structure — break two segments and it falls.
+// Each tree tags its canopy/trunk pieces with a seed band so pieceColor gives
+// it one coherent species/season (incl. autumn & dry) while clumps still vary.
 function tree(g: Gen, x: number, z: number, rng: () => number): void {
   const slabFirst = nextPanelId;
   const id = nextBuildingId++;
   const base = baseHeightAt(x, z);
-  const pine = rng() < 0.4;
+  const conifer = rng() < 0.42;
   const SEG = 0.8;
-  const segs = pine ? 4 + Math.floor(rng() * 3) : 3 + Math.floor(rng() * 3); // 4-6 / 3-5
-  const girth = pine ? 0.3 + rng() * 0.1 : 0.42 + rng() * 0.14;
+  const big = rng() < 0.22;
+  const small = !big && rng() < 0.32;
+  const segs = conifer
+    ? small
+      ? 4
+      : big
+        ? 7
+        : 5 + Math.floor(rng() * 2)
+    : small
+      ? 3
+      : big
+        ? 6
+        : 4 + Math.floor(rng() * 2);
+  const girth0 = (conifer ? 0.3 : 0.46) * (big ? 1.4 : small ? 0.78 : 1) + rng() * 0.06;
+  // Canopy band: conifers dark green; broadleaf mostly green, sometimes autumn/dry.
+  const r = rng();
+  const canopyBand = conifer
+    ? 5
+    : r < 0.52
+      ? 0
+      : r < 0.68
+        ? 1
+        : r < 0.8
+          ? 2
+          : r < 0.9
+            ? 3
+            : r < 0.97
+              ? 4
+              : 6;
+  const bark = conifer ? 1 : rng() < 0.12 ? 2 : 0;
+  const leanA = rng() * Math.PI * 2;
+  const leanAmt = conifer ? 0 : (big ? 0.1 : 0.05) * (rng() < 0.5 ? 1 : 0);
+  const span = segs * SEG;
+  let serial = 0;
   const trunkIds: number[] = [];
-  for (let seg = 0; seg < segs; seg++) {
+  const canopyIds: number[] = [];
+  for (let s = 0; s < segs; s++) {
+    const f = s / segs;
+    const gx = girth0 * (1 - 0.28 * f);
     trunkIds.push(nextPanelId);
     g.panels.push({
       id: nextPanelId++,
-      x,
-      y: base + (seg + 0.5) * SEG,
-      z,
-      ex: girth,
+      x: x + Math.sin(leanA) * leanAmt * span * f,
+      y: base + (s + 0.5) * SEG,
+      z: z + Math.cos(leanA) * leanAmt * span * f,
+      ex: gx,
       ey: SEG,
-      ez: girth,
+      ez: gx,
       material: "trunk",
+      seed: bark | (serial++ << 2),
       buildingId: id,
     });
   }
-  const top = base + segs * SEG;
-  const canopyIds: number[] = [];
-  const clump = (cx: number, cy: number, cz: number, ex: number, ey: number, ez: number) => {
+  const topX = x + Math.sin(leanA) * leanAmt * span;
+  const topZ = z + Math.cos(leanA) * leanAmt * span;
+  const top = base + span;
+  const clump = (cx: number, cy: number, cz: number, ex: number, ey: number, ez: number): void => {
     canopyIds.push(nextPanelId);
     g.panels.push({
       id: nextPanelId++,
@@ -1172,27 +1211,54 @@ function tree(g: Gen, x: number, z: number, rng: () => number): void {
       ey,
       ez,
       material: "canopy",
+      seed: canopyBand | (serial++ << 3),
       buildingId: id,
     });
   };
-  if (pine) {
-    // Stacked shrinking tiers starting partway up the trunk.
-    const tiers = 3 + Math.floor(rng() * 2);
+  if (conifer) {
+    const tiers = 3 + (big ? 1 : 0);
+    const baseR = big ? 2.0 : 1.5;
     for (let t = 0; t < tiers; t++) {
       const f = 1 - t / tiers;
-      const s = 0.9 + 1.5 * f;
-      clump(x, top - (tiers - 1 - t) * 0.85 - 0.2, z, s, 0.7, s);
+      const rad = 0.5 + baseR * f;
+      const cy = top - (tiers - 1 - t) * 0.95 - 0.2;
+      const ring = 3 + Math.floor(f * 2);
+      for (let k = 0; k < ring; k++) {
+        const a = (k / ring) * Math.PI * 2 + t * 0.7;
+        clump(
+          topX + Math.cos(a) * rad * 0.7,
+          cy - 0.12,
+          topZ + Math.sin(a) * rad * 0.7,
+          rad * 0.7 + 0.4,
+          0.55,
+          rad * 0.7 + 0.4,
+        );
+      }
     }
-    clump(x, top + 0.55, z, 0.7, 0.8, 0.7); // tip
+    clump(topX, top + 0.7, topZ, 0.7, 1.0, 0.7); // spire
   } else {
-    // A crown cube plus 4-6 satellite cubes packed around it.
-    clump(x, top + 0.55, z, 1.6 + rng() * 0.5, 1.4, 1.6 + rng() * 0.5);
-    const n = 4 + Math.floor(rng() * 3);
-    for (let i = 0; i < n; i++) {
-      const ang = rng() * Math.PI * 2;
-      const r = 0.7 + rng() * 0.5;
-      const s = 0.9 + rng() * 0.7;
-      clump(x + Math.sin(ang) * r, top - 0.3 + rng() * 0.8, z + Math.cos(ang) * r, s, s * 0.85, s);
+    const crownR = (big ? 2.4 : small ? 1.2 : 1.8) + rng() * 0.4;
+    const layers = 3 + (big ? 1 : 0);
+    const ax = Math.cos(leanA + 1) * 0.3 * crownR; // light-seeking asymmetry
+    const az = Math.sin(leanA + 1) * 0.3 * crownR;
+    for (let L = 0; L < layers; L++) {
+      const lf = (L + 0.6) / (layers + 0.6);
+      const layerR = crownR * Math.sin(Math.PI * lf);
+      const cy = top - 0.3 + L * 0.85;
+      const ring = 3 + Math.round(layerR * 1.1);
+      for (let k = 0; k < ring; k++) {
+        const a = (k / ring) * Math.PI * 2 + L;
+        const rr = layerR * (0.55 + 0.45 * rng());
+        const s = 0.7 + layerR * 0.32 * (0.7 + 0.6 * rng());
+        clump(
+          topX + ax + Math.cos(a) * rr,
+          cy - rr * 0.15,
+          topZ + az + Math.sin(a) * rr,
+          s,
+          s * 0.8,
+          s,
+        );
+      }
     }
   }
   g.buildings.push({
@@ -1204,31 +1270,73 @@ function tree(g: Gen, x: number, z: number, rng: () => number): void {
     d: 0.9,
     wallPanelIds: trunkIds,
     roofPanelIds: canopyIds,
-    // ceil(segs * 1.5/segs) = 2 exactly: two trunk segments fell it.
+    // ceil(segs * 1.5/segs) = ceil(1.5) = 2: two trunk segments fell it.
     collapseFraction: 1.5 / segs,
   });
   endSlab(g, slabFirst);
 }
 
-// Boulder clusters: 1-3 destructible rocks, partially sunk into the ground.
+// Rock formations, one of four archetypes (rounded boulder cluster, angular
+// shards/outcrop, flat layered slabs, low scree field), partially buried and
+// tinted by a per-cluster rock-type band (granite/sandstone/basalt/mossy).
 function rocks(g: Gen, x: number, z: number, rng: () => number): void {
   const slabFirst = nextPanelId;
-  const n = 1 + Math.floor(rng() * 3);
-  for (let i = 0; i < n; i++) {
-    const ox = i === 0 ? 0 : (rng() - 0.5) * 2.4;
-    const oz = i === 0 ? 0 : (rng() - 0.5) * 2.4;
-    const s = i === 0 ? 0.9 + rng() * 0.8 : 0.4 + rng() * 0.5;
-    const ey = s * (0.7 + rng() * 0.3);
+  const ra = rng();
+  const arch = ra < 0.42 ? 0 : ra < 0.62 ? 1 : ra < 0.8 ? 2 : 3;
+  const rb = rng();
+  const band = rb < 0.5 ? 0 : rb < 0.7 ? 1 : rb < 0.88 ? 3 : 2; // granite/sandstone/mossy/basalt
+  let serial = 0;
+  const put = (px: number, pz: number, ex: number, ey: number, ez: number, bury = 0.35): void => {
     g.panels.push({
       id: nextPanelId++,
-      x: x + ox,
-      y: baseHeightAt(x + ox, z + oz) + ey * 0.32,
-      z: z + oz,
-      ex: s,
+      x: px,
+      y: baseHeightAt(px, pz) + ey * (0.5 - bury),
+      z: pz,
+      ex,
       ey,
-      ez: s * (0.8 + rng() * 0.4),
+      ez,
       material: "rock",
+      seed: band | (serial++ << 2),
     });
+  };
+  if (arch === 0) {
+    // Rounded boulder: a big lump plus overlapping satellites.
+    const s = 1.0 + rng() * 0.9;
+    put(x, z, s, s * (0.75 + rng() * 0.25), s * (0.85 + rng() * 0.3), 0.3);
+    const n = 2 + Math.floor(rng() * 3);
+    for (let i = 0; i < n; i++) {
+      const a = rng() * Math.PI * 2;
+      const r = s * (0.4 + rng() * 0.4);
+      const ss = s * (0.4 + rng() * 0.35);
+      put(x + Math.cos(a) * r, z + Math.sin(a) * r, ss, ss * (0.7 + rng() * 0.4), ss, 0.4);
+    }
+  } else if (arch === 1) {
+    // Angular shards / outcrop: a few tall thin blocks clustered.
+    const n = 2 + Math.floor(rng() * 3);
+    for (let i = 0; i < n; i++) {
+      const a = rng() * Math.PI * 2;
+      const r = i === 0 ? 0 : 0.5 + rng() * 1.0;
+      const w = 0.4 + rng() * 0.5;
+      const h = 1.2 + rng() * 1.6;
+      put(x + Math.cos(a) * r, z + Math.sin(a) * r, w, h, w * (0.7 + rng() * 0.5), 0.2);
+    }
+  } else if (arch === 2) {
+    // Flat layered slabs.
+    const s = 1.4 + rng() * 1.0;
+    put(x, z, s, 0.3 + rng() * 0.25, s * (0.7 + rng() * 0.3), 0.15);
+    if (rng() < 0.7) {
+      const s2 = s * (0.6 + rng() * 0.3);
+      put(x + (rng() - 0.5) * 0.6, z + (rng() - 0.5) * 0.6, s2, 0.25 + rng() * 0.2, s2, -0.1);
+    }
+  } else {
+    // Scree / pebble field: many small low stones.
+    const n = 7 + Math.floor(rng() * 8);
+    for (let i = 0; i < n; i++) {
+      const a = rng() * Math.PI * 2;
+      const rr = Math.sqrt(rng()) * (1.4 + rng() * 1.2);
+      const s = 0.18 + rng() * 0.34;
+      put(x + Math.cos(a) * rr, z + Math.sin(a) * rr, s, s * (0.6 + rng() * 0.4), s, 0.5);
+    }
   }
   endSlab(g, slabFirst);
 }
