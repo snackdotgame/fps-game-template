@@ -2574,9 +2574,31 @@ async function loadModel(
   throw new Error(`Unsupported model format: ${url}`);
 }
 
+// Quaternius loop clips duplicate frame 0 as their final keyframe. With
+// LoopRepeat the mixer therefore holds that pose for one extra frame at the
+// wrap, which reads as a hitch every cycle. When a clip's first sample equals
+// its last (a genuine seamless loop), shorten its duration to the second-to-last
+// keyframe so the loop wraps one frame early and skips the duplicate. One-shot
+// clips (Death, Jump, HitReact) have first != last and are left untouched.
+function trimDuplicateLoopFrame(clip: THREE.AnimationClip): void {
+  if (clip.tracks.length === 0) return;
+  let secondLast = 0;
+  for (const track of clip.tracks) {
+    const n = track.times.length;
+    if (n < 3) return; // too short to carry a duplicate end frame
+    const stride = track.values.length / n;
+    for (let c = 0; c < stride; c++) {
+      if (Math.abs(track.values[c] - track.values[(n - 1) * stride + c]) > 1e-4) return; // not closed
+    }
+    secondLast = Math.max(secondLast, track.times[n - 2]);
+  }
+  if (secondLast > 0) clip.duration = secondLast;
+}
+
 async function loadCharacterTemplate(url: string): Promise<CharacterTemplate> {
   const { scene, animations } = await loadModel(url);
   prepareExternalCharacterModel(scene);
+  for (const clip of animations) trimDuplicateLoopFrame(clip);
   return { scene, clips: animations };
 }
 
