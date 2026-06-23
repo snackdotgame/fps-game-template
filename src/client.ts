@@ -8,6 +8,7 @@ import {
   HEADSHOT_HEIGHT,
   INPUT_REDUNDANCY,
   MAX_HP,
+  OOB_LIMIT_TICKS,
   RELOAD_TICKS,
   TEAM_NAMES,
   TICK_MS,
@@ -15,15 +16,21 @@ import {
 } from "./shared/constants.js";
 import {
   addCrater,
+  APRON_OUTER,
+  BACKDROP_OUTER,
   baseHeightAt,
   chunksTouching,
   craterList,
   heightAt,
   MAP,
+  onRoad,
   PANEL_HP,
   type PanelDef,
   type PanelMaterial,
+  PLAY_HALF,
   resetCraters,
+  ringMesh,
+  roadSegments,
   slabOfPiece,
   TERRAIN_CHUNK,
   TERRAIN_CHUNKS,
@@ -431,13 +438,101 @@ function stepFlags(now: number): void {
   }
 }
 
-const waterMat = new THREE.MeshStandardMaterial({
-  color: 0x3e6f9d,
-  roughness: 0.12,
-  metalness: 0,
+// A ground-height field baked from the terrain, so the water shader knows how
+// deep it is at every point (shallow->deep color, shoreline foam, edge fade).
+function makeWaterHeightTexture(): THREE.DataTexture {
+  // RGBA8 (universally linear-filterable) with ground height encoded into the
+  // [-2,2]m range; the shader decodes r*4-2. (Float textures aren't reliably
+  // linear-filterable across GPUs.)
+  const N = 192;
+  const span = MAP.size;
+  const data = new Uint8Array(N * N * 4);
+  for (let j = 0; j < N; j++) {
+    for (let i = 0; i < N; i++) {
+      const x = -span / 2 + (i / (N - 1)) * span;
+      const z = -span / 2 + (j / (N - 1)) * span;
+      const v = Math.max(0, Math.min(255, Math.round(((baseHeightAt(x, z) + 2) / 4) * 255)));
+      const o = (j * N + i) * 4;
+      data[o] = v;
+      data[o + 1] = v;
+      data[o + 2] = v;
+      data[o + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, N, N);
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// The river/lakes: one plane at water level, but a custom shader makes it read
+// as flowing water — depth-based color, shoreline foam, a fresnel sky tint, and
+// two scrolling noise layers — instead of a flat blue decal. It discards over
+// dry land, so it only shows where the terrain dips below the surface.
+const waterMat = new THREE.ShaderMaterial({
   transparent: true,
-  opacity: 0.72,
+  depthWrite: false,
+  fog: true,
+  uniforms: THREE.UniformsUtils.merge([
+    THREE.UniformsLib.fog,
+    {
+      uTime: { value: 0 },
+      uSurfaceY: { value: WATER_SURFACE_Y },
+      uHalf: { value: MAP.size / 2 },
+    },
+  ]),
+  vertexShader: `
+    #include <fog_pars_vertex>
+    varying vec3 vWorld;
+    void main() {
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vWorld = wp.xyz;
+      vec4 mvPosition = viewMatrix * wp;
+      gl_Position = projectionMatrix * mvPosition;
+      #include <fog_vertex>
+    }
+  `,
+  fragmentShader: `
+    #include <fog_pars_fragment>
+    uniform float uTime;
+    uniform float uSurfaceY;
+    uniform float uHalf;
+    uniform sampler2D uHeight;
+    varying vec3 vWorld;
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
+    float noise(vec2 p){
+      vec2 i=floor(p), f=fract(p); f=f*f*(3.0-2.0*f);
+      float a=hash(i), b=hash(i+vec2(1.0,0.0)), c=hash(i+vec2(0.0,1.0)), d=hash(i+vec2(1.0,1.0));
+      return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+    }
+    void main() {
+      vec2 uv = (vWorld.xz / (2.0 * uHalf)) + 0.5;
+      float ground = texture2D(uHeight, uv).r * 4.0 - 2.0;
+      float depth = uSurfaceY - ground;
+      if (depth <= 0.002) discard; // dry land
+      depth = clamp(depth, 0.0, 1.3);
+      vec3 shallow = vec3(0.32, 0.55, 0.57);
+      vec3 deep = vec3(0.05, 0.19, 0.34);
+      vec3 col = mix(shallow, deep, smoothstep(0.0, 1.0, depth));
+      float t = uTime;
+      float n = noise(vWorld.xz * 0.6 + vec2(0.0, t * 0.45)) * 0.5
+              + noise(vWorld.xz * 1.7 - vec2(t * 0.6, 0.0)) * 0.5;
+      col += (n - 0.5) * 0.10;
+      vec3 V = normalize(cameraPosition - vWorld);
+      float fres = pow(1.0 - max(V.y, 0.0), 3.0);
+      col = mix(col, vec3(0.62, 0.72, 0.82), fres * 0.5);
+      float foam = smoothstep(0.24, 0.0, depth) * (0.5 + 0.5 * noise(vWorld.xz * 2.6 + t * 1.2));
+      col = mix(col, vec3(0.90, 0.95, 0.97), foam * 0.6);
+      float alpha = smoothstep(0.0, 0.14, depth) * 0.86 + foam * 0.3;
+      gl_FragColor = vec4(col, clamp(alpha, 0.0, 0.95));
+      #include <fog_fragment>
+    }
+  `,
 });
+(waterMat.uniforms as { uHeight?: { value: THREE.Texture } }).uHeight = {
+  value: makeWaterHeightTexture(),
+};
 
 function makeTerrainChunkMesh(ci: number, cj: number): THREE.Mesh {
   const data = terrainChunkMesh(ci, cj);
@@ -482,11 +577,94 @@ function rebuildTerrainChunk(ci: number, cj: number): void {
   mapGroup.add(mesh);
 }
 
+// Apron + backdrop: coarse terrain rings continuing the world past the core, so
+// the arena reads as boundless (no perimeter walls). The apron is collidable
+// and faceted like the core; the far backdrop fades toward the fog so its outer
+// edge is never visible.
+function makeRingVisual(inner: number, outer: number, cell: number, fade: boolean): THREE.Mesh {
+  const data = ringMesh(inner, outer, cell);
+  let geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(data.vertices, 3));
+  geo.setIndex(data.indices);
+  geo = geo.toNonIndexed();
+  geo.computeVertexNormals();
+  const pos = geo.getAttribute("position");
+  const colors: number[] = [];
+  const c = new THREE.Color();
+  const fogCol = new THREE.Color(0xb8cfe0);
+  for (let f = 0; f < pos.count; f += 3) {
+    const cx = (pos.getX(f) + pos.getX(f + 1) + pos.getX(f + 2)) / 3;
+    const cy = (pos.getY(f) + pos.getY(f + 1) + pos.getY(f + 2)) / 3;
+    const cz = (pos.getZ(f) + pos.getZ(f + 1) + pos.getZ(f + 2)) / 3;
+    c.copy(TERRAIN_LOW).lerp(TERRAIN_HIGH, Math.max(0, Math.min(1, cy / 1.5)));
+    if (fade) {
+      const dist = Math.max(Math.abs(cx), Math.abs(cz));
+      const k = Math.max(0, Math.min(1, (dist - APRON_OUTER) / (BACKDROP_OUTER - APRON_OUTER)));
+      c.lerp(fogCol, k * 0.85);
+    }
+    const j = 0.93 + hash01(Math.round(cx * 7 + cz * 131), 5) * 0.14;
+    for (let v = 0; v < 3; v++) colors.push(c.r * j, c.g * j, c.b * j);
+  }
+  geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+  const mesh = new THREE.Mesh(geo, terrainMat);
+  mesh.receiveShadow = !fade;
+  return mesh;
+}
+
+// Roads/paths: flat ribbons laid on the (already flattened) terrain, dirt for
+// lanes and cobble-grey for the main road, with per-vertex tonal jitter.
+const roadMat = new THREE.MeshStandardMaterial({
+  vertexColors: true,
+  roughness: 0.97,
+  metalness: 0,
+  polygonOffset: true,
+  polygonOffsetFactor: -4,
+  polygonOffsetUnits: -4,
+});
+const ROAD_DIRT = new THREE.Color(0x796344);
+const ROAD_COBBLE = new THREE.Color(0x86817b);
+
+function buildRoadVisual(): THREE.Mesh {
+  const positions: number[] = [];
+  const colors: number[] = [];
+  const c = new THREE.Color();
+  for (const s of roadSegments()) {
+    const dx = s.bx - s.ax;
+    const dz = s.bz - s.az;
+    const len = Math.hypot(dx, dz) || 1;
+    const nx = -dz / len;
+    const nz = dx / len;
+    const hw = s.half;
+    const base = hw > 3 ? ROAD_COBBLE : ROAD_DIRT;
+    const corners: Array<[number, number]> = [
+      [s.ax + nx * hw, s.az + nz * hw],
+      [s.ax - nx * hw, s.az - nz * hw],
+      [s.bx + nx * hw, s.bz + nz * hw],
+      [s.bx - nx * hw, s.bz - nz * hw],
+    ];
+    const ys = corners.map(([x, z]) => heightAt(x, z) + 0.05);
+    const emit = (i: number): void => {
+      positions.push(corners[i][0], ys[i], corners[i][1]);
+      const jit = 0.82 + hash01(Math.round(corners[i][0] * 5 + corners[i][1] * 9), 7) * 0.34;
+      c.copy(base).multiplyScalar(jit);
+      colors.push(c.r, c.g, c.b);
+    };
+    for (const i of [0, 2, 1, 1, 2, 3]) emit(i);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, roadMat);
+  mesh.receiveShadow = true;
+  return mesh;
+}
+
 // --- Grass: per-chunk blade triangles with a wind-sway vertex shader,
 // tinted to the terrain. Blades resample the heightfield on crater rebuilds
 // (and skip scorched bowls).
 
-const GRASS_PER_CHUNK = 110; // 256 chunks now — ~28k blades total
+const GRASS_TUFTS_PER_CHUNK = 80; // each tuft is 2-4 blades -> ~45k blades total
 const grassChunkVisuals = new Map<number, THREE.Mesh>();
 const grassMat = new THREE.ShaderMaterial({
   uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, { uTime: { value: 0 } }]),
@@ -527,30 +705,47 @@ function makeGrassChunkMesh(ci: number, cj: number): THREE.Mesh | null {
   const colors: number[] = [];
   const tips: number[] = [];
   const sways: number[] = [];
-  const cLow = new THREE.Color(0x57843f);
-  const cHigh = new THREE.Color(0x9dba59);
+  const cLow = new THREE.Color(0x4f7d36);
+  const cHigh = new THREE.Color(0xa6c25f);
+  const cDry = new THREE.Color(0xbcb463);
   const blade = new THREE.Color();
+  const root = new THREE.Color();
+  const tip = new THREE.Color();
   const seedBase = (ci * 31 + cj) * 7919;
-  for (let i = 0; i < GRASS_PER_CHUNK; i++) {
-    const x = x0 + hash01(seedBase + i, 11) * TERRAIN_CHUNK;
-    const z = z0 + hash01(seedBase + i, 12) * TERRAIN_CHUNK;
-    const baseH = baseHeightAt(x, z);
-    if (baseH < 0.04) continue; // pads, spawns, perimeter skirt, water
-    const y = heightAt(x, z);
-    if (baseH - y > 0.12) continue; // scorched crater bowl
-    const h = 0.22 + hash01(seedBase + i, 13) * 0.3;
-    const w = 0.05 + hash01(seedBase + i, 14) * 0.05;
-    const yaw = hash01(seedBase + i, 15) * Math.PI;
-    const dx = Math.cos(yaw) * w;
-    const dz = Math.sin(yaw) * w;
-    const sway = hash01(seedBase + i, 16);
-    blade.copy(cLow).lerp(cHigh, hash01(seedBase + i, 17));
-    // One triangle per blade: two roots, one tip.
-    positions.push(x - dx, y, z - dz, x + dx, y, z + dz, x, y + h, z);
-    const r = blade.clone().multiplyScalar(0.74);
-    colors.push(r.r, r.g, r.b, r.r, r.g, r.b, blade.r, blade.g, blade.b);
-    tips.push(0, 0, 1);
-    sways.push(sway, sway, sway);
+  // Grass grows in tufts (a small clump of leaning blades), not lone spikes,
+  // and stays off roads, pads, water and scorched bowls.
+  for (let i = 0; i < GRASS_TUFTS_PER_CHUNK; i++) {
+    const tx = x0 + hash01(seedBase + i, 11) * TERRAIN_CHUNK;
+    const tz = z0 + hash01(seedBase + i, 12) * TERRAIN_CHUNK;
+    const baseH = baseHeightAt(tx, tz);
+    if (baseH < 0.04) continue; // pads, spawns, water
+    const ty = heightAt(tx, tz);
+    if (baseH - ty > 0.12) continue; // scorched crater bowl
+    if (onRoad(tx, tz) > 0) continue; // bare road/path
+    const hue = hash01(seedBase + i, 17);
+    const dryTuft = hash01(seedBase + i, 18) > 0.82;
+    const nBlades = 2 + Math.floor(hash01(seedBase + i, 19) * 3); // 2-4
+    for (let b = 0; b < nBlades; b++) {
+      const bs = seedBase + i * 7 + b * 131;
+      const x = tx + (hash01(bs, 21) - 0.5) * 0.34;
+      const z = tz + (hash01(bs, 22) - 0.5) * 0.34;
+      const y = heightAt(x, z);
+      const h = 0.3 + hash01(bs, 13) * 0.45;
+      const w = 0.045 + hash01(bs, 14) * 0.05;
+      const yaw = hash01(bs, 15) * Math.PI;
+      const dx = Math.cos(yaw) * w;
+      const dz = Math.sin(yaw) * w;
+      const lean = (hash01(bs, 23) - 0.5) * 0.2;
+      const sway = hash01(bs, 16);
+      blade.copy(cLow).lerp(cHigh, hue * 0.65 + hash01(bs, 24) * 0.35);
+      if (dryTuft) blade.lerp(cDry, 0.5);
+      root.copy(blade).multiplyScalar(0.52); // shaded base (fake AO)
+      tip.copy(blade).multiplyScalar(1.2); // sun-caught tip
+      positions.push(x - dx, y, z - dz, x + dx, y, z + dz, x + lean, y + h, z + lean);
+      colors.push(root.r, root.g, root.b, root.r, root.g, root.b, tip.r, tip.g, tip.b);
+      tips.push(0, 0, 1);
+      sways.push(sway, sway, sway);
+    }
   }
   if (positions.length === 0) return null;
   const geo = new THREE.BufferGeometry();
@@ -728,6 +923,11 @@ function buildMapVisuals(): void {
       rebuildGrassChunk(ci, cj);
     }
   }
+  // The world beyond the core: a collidable apron then a fog-bound backdrop.
+  mapGroup.add(makeRingVisual(MAP.size / 2 - 4, APRON_OUTER, 8, false));
+  mapGroup.add(makeRingVisual(APRON_OUTER, BACKDROP_OUTER, 18, true));
+  // Roads/paths laid on the terrain.
+  mapGroup.add(buildRoadVisual());
 
   // Conquest flags: a pole at each zone center, cloth raising toward the
   // capturing team's color.
@@ -977,10 +1177,15 @@ hud.innerHTML = `
   #netinfo { position:absolute; bottom:4px; right:8px; font-size:11px; opacity:.65; }
   #vignette { position:absolute; inset:0; box-shadow: inset 0 0 140px rgba(255,30,30,.85); opacity:0; transition:opacity .12s; }
   #flash { position:absolute; inset:0; background:#fff; opacity:0; }
+  #oob { position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center; text-align:center; pointer-events:none; box-shadow: inset 0 0 220px rgba(150,0,0,.65); }
+  #oob .b { font-size:30px; font-weight:900; color:#ffe2e2; text-shadow:0 2px 8px #000; letter-spacing:2px; }
+  #oob .s { font-size:15px; font-weight:700; color:#ffd0d0; opacity:.9; margin-top:4px; }
+  #oob .c { font-size:72px; font-weight:900; color:#fff; text-shadow:0 3px 12px #000; margin-top:6px; }
 </style>
 <div id="hud">
   <div id="vignette"></div>
   <div id="flash"></div>
+  <div id="oob"><div class="b">⚠ RETURN TO THE BATTLEFIELD</div><div class="s">leaving the combat area</div><div class="c" id="oobtimer"></div></div>
   <div id="cross" class="sh">+</div>
   <div id="crossname" class="sh"></div>
   <div id="hitmark">+</div>
@@ -1013,6 +1218,8 @@ const el = {
   netinfo: document.getElementById("netinfo")!,
   vignette: document.getElementById("vignette")!,
   flash: document.getElementById("flash")!,
+  oob: document.getElementById("oob")!,
+  oobtimer: document.getElementById("oobtimer")!,
 };
 
 function feed(text: string): void {
@@ -1491,6 +1698,10 @@ for (const def of ZONES) {
   zoneFills.push(fill);
 }
 let respawnTicks = 0;
+// Out-of-bounds feedback: when this client first strayed past the boundary
+// (performance.now ms), or -1 in bounds. Server enforces the actual kill.
+let oobStartMs = -1;
+const OOB_LIMIT_SECONDS = OOB_LIMIT_TICKS / TICK_RATE;
 
 let gw: GameWorld | null = null;
 let selfBody: Body | null = null;
@@ -1691,6 +1902,16 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       break;
     }
     case "kill": {
+      if (msg.weapon === "oob") {
+        feed(`${teamSpan(msg.victim)} ⚠ left the battlefield`);
+        bumpKd(msg.victim, "d");
+        if (msg.victim === selfIdx) sounds.death();
+        else {
+          const at = eyeOf(msg.victim);
+          if (at) sounds.deathAt(at);
+        }
+        break;
+      }
       const icon = msg.weapon === "grenade" ? "💥" : msg.weapon === "melee" ? "🔨" : "•";
       feed(`${teamSpan(msg.killer)} ${icon} ${teamSpan(msg.victim)}`);
       bumpKd(msg.killer, "k");
@@ -3264,6 +3485,7 @@ function frame(): void {
   stepCorpses(dt);
   stepFlags(now);
   (grassMat.uniforms.uTime as { value: number }).value = now / 1000;
+  (waterMat.uniforms.uTime as { value: number }).value = now / 1000;
 
   // Camera at the predicted eye, interpolated between the last two ticks so
   // 30 Hz simulation renders smoothly at any frame rate.
@@ -3283,6 +3505,28 @@ function frame(): void {
     camera.rotation.x = pitch + recoil * 0.045 + flinch * flinchPitch * 0.06;
     camera.rotation.z = 0;
     updateAudioListener();
+  }
+
+  // Out of bounds: no walls, so leaving the play area shows a warning + a
+  // return countdown and desaturates the view; the server enforces the kill.
+  {
+    const dead = (selfStatus & SS_DEAD) !== 0;
+    const oob =
+      !dead &&
+      predState != null &&
+      (Math.abs(predState.x) > PLAY_HALF || Math.abs(predState.z) > PLAY_HALF);
+    if (oob) {
+      if (oobStartMs < 0) oobStartMs = now;
+      const left = Math.max(0, OOB_LIMIT_SECONDS - (now - oobStartMs) / 1000);
+      (el.oob as HTMLElement).style.display = "flex";
+      el.oobtimer.textContent = Math.ceil(left).toString();
+      const k = 1 - left / OOB_LIMIT_SECONDS; // ramps 0->1 as the timer runs out
+      renderer.domElement.style.filter = `grayscale(${(0.35 + 0.65 * k).toFixed(2)}) contrast(${(1 + 0.25 * k).toFixed(2)}) brightness(${(1 - 0.15 * k).toFixed(2)})`;
+    } else if (oobStartMs >= 0) {
+      oobStartMs = -1;
+      (el.oob as HTMLElement).style.display = "none";
+      renderer.domElement.style.filter = "";
+    }
   }
 
   // First-person weapon feel: a rest pose plus recoil, melee, a walk/sprint

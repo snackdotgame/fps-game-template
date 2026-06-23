@@ -29,11 +29,13 @@ import {
   TICK_RATE,
 } from "./constants.js";
 import {
+  APRON_OUTER,
   type BuildingDef,
   type Crater,
   chunksTouching,
   MAP,
   type PanelDef,
+  ringMesh,
   TERRAIN_CHUNKS,
   terrainChunkMesh,
 } from "./map.js";
@@ -295,10 +297,26 @@ export async function createGameWorld(destroyed?: ReadonlySet<number>): Promise<
   for (let ci = 0; ci < TERRAIN_CHUNKS; ci++) {
     for (let cj = 0; cj < TERRAIN_CHUNKS; cj++) addTerrainChunkBody(gw, ci, cj);
   }
+  // Collidable apron: a coarse terrain ring around the core so a player who
+  // strays past the boundary during the out-of-bounds countdown still stands
+  // on real ground (no perimeter walls anymore).
+  {
+    const apron = ringMesh(MAP.size / 2 - 4, APRON_OUTER, 8);
+    world.createBody({
+      type: "static",
+      shape: { kind: "mesh", vertices: apron.vertices, indices: apron.indices },
+      position: [0, 0, 0],
+      layer: "static",
+      friction: 0.7,
+      userData: { static: true } satisfies BodyTag,
+    });
+  }
+  // Safety floor far under the whole extended world so nothing falls forever.
+  // Deep enough never to interfere with the wadeable river or crater bowls.
   world.createBody({
     type: "static",
-    shape: Shape.box({ halfExtents: [MAP.size / 2 + 2, 0.5, MAP.size / 2 + 2] }),
-    position: [0, -0.55, 0],
+    shape: Shape.box({ halfExtents: [APRON_OUTER + 60, 0.5, APRON_OUTER + 60] }),
+    position: [0, -6, 0],
     layer: "static",
     friction: 0.7,
     userData: { static: true } satisfies BodyTag,

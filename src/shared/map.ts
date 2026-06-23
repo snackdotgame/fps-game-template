@@ -178,7 +178,7 @@ let FLAT_PADS: Array<[number, number, number, number]> = [];
 // A straight piece of a road/path centerline, with its surface height baked at
 // each end (sampled from the pre-road terrain) so the road lies flat instead of
 // rippling over the noise.
-interface RoadSeg {
+export interface RoadSeg {
   ax: number;
   az: number;
   bx: number;
@@ -188,6 +188,11 @@ interface RoadSeg {
   half: number; // half width
 }
 let ROAD_SEGS: RoadSeg[] = [];
+
+// The baked road network, for the client to lay ribbon meshes on.
+export function roadSegments(): readonly RoadSeg[] {
+  return ROAD_SEGS;
+}
 
 // 1 in the open field, fading to 0 inside any flat pad. The noise relief and
 // crater digging are scaled by this, so buildings never get undermined.
@@ -413,6 +418,57 @@ export function terrainChunkMesh(
       const c = a + stride;
       const d = c + 1;
       indices.push(a, c, b, b, c, d);
+    }
+  }
+  return { vertices, indices };
+}
+
+// ---------------------------------------------------------------------------
+// World extent. The core (±SIZE/2) is the detailed, collidable, cratereable
+// arena. Beyond it the world continues as an apron (still collidable, so a
+// player who strays out during the out-of-bounds countdown stands on real
+// ground) and then a visual-only backdrop that melts into the fog. There are
+// no perimeter walls; PLAY_HALF is the soft boundary the OOB timer enforces.
+export const PLAY_HALF = 108; // |x| or |z| beyond this = out of bounds
+export const APRON_OUTER = 184; // collidable apron extends to here
+export const BACKDROP_OUTER = 320; // visual-only backdrop to here (fog hides the edge)
+
+// A ring of coarse terrain tiles between `inner` and `outer` half-extents
+// (square hole = the core), sampled from the pristine terrain. Used for both
+// the collidable apron and the visual backdrop.
+export function ringMesh(
+  inner: number,
+  outer: number,
+  cell: number,
+): { vertices: number[]; indices: number[] } {
+  const vertices: number[] = [];
+  const indices: number[] = [];
+  const n = Math.ceil((outer * 2) / cell);
+  let vi = 0;
+  for (let iz = 0; iz < n; iz++) {
+    for (let ix = 0; ix < n; ix++) {
+      const x0 = -outer + ix * cell;
+      const z0 = -outer + iz * cell;
+      const x1 = x0 + cell;
+      const z1 = z0 + cell;
+      // Skip cells fully inside the core hole.
+      if (Math.abs(x0 + cell / 2) < inner && Math.abs(z0 + cell / 2) < inner) continue;
+      vertices.push(
+        x0,
+        baseHeightAt(x0, z0),
+        z0,
+        x1,
+        baseHeightAt(x1, z0),
+        z0,
+        x0,
+        baseHeightAt(x0, z1),
+        z1,
+        x1,
+        baseHeightAt(x1, z1),
+        z1,
+      );
+      indices.push(vi, vi + 2, vi + 1, vi + 1, vi + 2, vi + 3);
+      vi += 4;
     }
   }
   return { vertices, indices };
@@ -1325,15 +1381,20 @@ function planLayout(rng: () => number): Layout {
   // road, the rest left as lanes, plus each multi-building cluster's local
   // street. Heights are baked per segment from the pre-road terrain.
   const N = nodes.length;
-  const inTree = new Array<boolean>(N).fill(false);
-  const parent = new Array<number>(N).fill(-1);
-  const bestW = new Array<number>(N).fill(Infinity);
+  const inTree = Array.from({ length: N }, () => false);
+  const parent = Array.from({ length: N }, () => -1);
+  const bestW = Array.from({ length: N }, () => Infinity);
   bestW[0] = 0;
   const edgeW = (i: number, j: number): number => {
     let w = Math.hypot(nodes[i][0] - nodes[j][0], nodes[i][1] - nodes[j][1]);
     for (let k = 1; k < 5; k++) {
       const t = k / 5;
-      if (waterCarveAt(nodes[i][0] + (nodes[j][0] - nodes[i][0]) * t, nodes[i][1] + (nodes[j][1] - nodes[i][1]) * t) > 0.1) {
+      if (
+        waterCarveAt(
+          nodes[i][0] + (nodes[j][0] - nodes[i][0]) * t,
+          nodes[i][1] + (nodes[j][1] - nodes[i][1]) * t,
+        ) > 0.1
+      ) {
         w += 35;
       }
     }
@@ -1361,7 +1422,7 @@ function planLayout(rng: () => number): Layout {
     }
   }
   // Main road = the tree path from spawn 0 (node 0) to spawn 1 (node 1).
-  const prev = new Array<number>(N).fill(-2);
+  const prev = Array.from({ length: N }, () => -2);
   prev[0] = -1;
   const queue = [0];
   for (let h = 0; h < queue.length; h++) {

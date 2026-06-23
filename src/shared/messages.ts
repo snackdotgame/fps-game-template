@@ -29,7 +29,7 @@ export type ServerMsg =
     }
   | { type: "join"; player: PlayerInfo }
   | { type: "leave"; idx: number }
-  | { type: "kill"; killer: number; victim: number; weapon: "rifle" | "grenade" | "melee" }
+  | { type: "kill"; killer: number; victim: number; weapon: "rifle" | "grenade" | "melee" | "oob" }
   | { type: "destroy"; panelIds: number[] }
   | { type: "panelhp"; updates: Array<[number, number]> } // [panelId, hp]
   | { type: "collapse"; buildingId: number }
