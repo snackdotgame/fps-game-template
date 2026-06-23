@@ -2182,6 +2182,8 @@ function stepSelfFootsteps(dead: boolean): void {
 interface ToonShooterManifest {
   characters?: string[];
   weapons?: string[];
+  environment?: string[];
+  vehicles?: string[];
 }
 
 interface CharacterTemplate {

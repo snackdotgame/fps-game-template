@@ -11,6 +11,16 @@
       "/assets/sounds/snakef8-second-authentic-gun-sounds/reload_ak_mag.wav"
     ],
     "melee": [
+      "/assets/sounds/impactMetal_medium_000.ogg",
+      "/assets/sounds/impactMetal_medium_001.ogg",
+      "/assets/sounds/impactMetal_medium_002.ogg",
+      "/assets/sounds/impactMetal_medium_003.ogg",
+      "/assets/sounds/impactMetal_medium_004.ogg",
+      "/assets/sounds/impactPunch_heavy_000.ogg",
+      "/assets/sounds/impactPunch_heavy_001.ogg",
+      "/assets/sounds/impactPunch_heavy_002.ogg",
+      "/assets/sounds/impactPunch_heavy_003.ogg",
+      "/assets/sounds/impactPunch_heavy_004.ogg",
       "/assets/sounds/impactPunch_medium_000.ogg",
       "/assets/sounds/impactPunch_medium_001.ogg",
       "/assets/sounds/impactPunch_medium_002.ogg",

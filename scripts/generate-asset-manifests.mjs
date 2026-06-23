@@ -101,9 +101,22 @@ const weapons = rankedAssetUrls(weaponFiles, (file) => {
   if (lower.includes("/guns/")) return 2;
   return 3;
 });
+const environmentFiles = modelFiles.filter((file) =>
+  includesAny(modelPath(file), ["/environment/"]),
+);
+const environment = rankedAssetUrls(environmentFiles, () => 0);
+// Drivable vehicles live in Environment; pick the military tank out by name
+// (excluding the GasTank/WaterTank props, which also contain "tank").
+const vehicleFiles = environmentFiles.filter((file) => {
+  const base = file.toLowerCase().split(path.sep).pop() ?? "";
+  return /\b(tank|apc|jeep|truck|humvee)\b/.test(base) && !/(gas|water)tank/.test(base);
+});
+const vehicles = rankedAssetUrls(vehicleFiles, (file) =>
+  modelPath(file).endsWith("/tank.gltf") ? 0 : 1,
+);
 await writeFile(
   path.join(modelRoot, "manifest.json"),
-  `${JSON.stringify({ characters, weapons }, null, 2)}\n`,
+  `${JSON.stringify({ characters, weapons, environment, vehicles }, null, 2)}\n`,
 );
 
 const soundFiles = (await walk(path.join(assetRoot, "sounds"))).filter((file) =>
