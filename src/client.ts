@@ -183,6 +183,8 @@ const GEO = {
   bevel: new RoundedBoxGeometry(1, 1, 1, 1, 0.055),
   rock: new RoundedBoxGeometry(1, 1, 1, 2, 0.2),
   cyl: new THREE.CylinderGeometry(0.5, 0.5, 1, 7),
+  // Low-poly faceted blob for foliage: rounded, cartoonish, not blocky.
+  blob: new THREE.IcosahedronGeometry(0.5, 1),
   decal: new THREE.PlaneGeometry(1, 1),
 };
 
@@ -196,7 +198,7 @@ const PIECE_STYLE: Record<
   plank: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a7a52 },
   post: { geo: GEO.bevel, mat: voxelMat, debris: 0x6e5439 },
   trunk: { geo: GEO.cyl, mat: voxelMat, debris: 0x6e5439 },
-  canopy: { geo: GEO.bevel, mat: voxelMat, debris: 0x4d7a3a },
+  canopy: { geo: GEO.blob, mat: voxelMat, debris: 0x4d7a3a },
   crate: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a7a52 },
   sandbag: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a8f72 },
   rock: { geo: GEO.rock, mat: voxelMat, debris: 0x8d8a84 },
