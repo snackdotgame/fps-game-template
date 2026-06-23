@@ -197,6 +197,8 @@ const PIECE_STYLE: Record<
   glass: { geo: GEO.box, mat: glassMat, debris: 0xd8eef7 },
   rubble: { geo: GEO.bevel, mat: voxelMat, debris: 0x847d72 },
   metal: { geo: GEO.bevel, mat: voxelMat, debris: 0x8a949e },
+  stone: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a958c },
+  stair: { geo: GEO.bevel, mat: voxelMat, debris: 0x6e5d49 },
 };
 
 // Pre-fractured unit boxes: one half survives, the break face is a jagged
@@ -266,6 +268,13 @@ function pieceColor(def: PanelDef, out: THREE.Color): THREE.Color {
       return out.setHSL(0.07 + h1 * 0.03, 0.1 + h2 * 0.1, 0.36 + h1 * 0.14);
     case "metal":
       return out.setHSL(0.57 + h1 * 0.02, 0.07, 0.5 + h1 * 0.1);
+    case "stone":
+      // Warm grey flagstone, piece-to-piece tonal drift so a floor reads as
+      // laid slabs rather than one slab.
+      return out.setHSL(0.09 + h1 * 0.03, 0.05 + h2 * 0.04, 0.46 + h1 * 0.14);
+    case "stair":
+      // Heavy dark timber treads.
+      return out.setHSL(0.075 + h1 * 0.012, 0.34, 0.24 + h1 * 0.06);
   }
 }
 
@@ -1232,6 +1241,7 @@ function footstepFamilyAt(x: number, y: number, z: number): string {
     material === "log" ||
     material === "post" ||
     material === "trunk" ||
+    material === "stair" ||
     material === "crate"
   ) {
     return "footstep_wood";
@@ -1242,6 +1252,7 @@ function footstepFamilyAt(x: number, y: number, z: number): string {
     material === "metal" ||
     material === "rock" ||
     material === "rubble" ||
+    material === "stone" ||
     material === "sandbag"
   ) {
     return "footstep_concrete";

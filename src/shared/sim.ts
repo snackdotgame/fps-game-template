@@ -920,7 +920,9 @@ export class GameSim {
     }
 
     // Panels: deleted outright up close, chipped in an outer falloff ring.
+    // Staircases are blast-exempt so floors stay reachable through bombardment.
     const blastPanel = (id: number, px: number, py: number, pz: number) => {
+      if ((panelById.get(id) ?? this.builtPanels.get(id))?.material === "stair") return;
       const dist = Math.hypot(px - at[0], py - at[1], pz - at[2]);
       if (dist <= EXPLOSION_PANEL_RADIUS) this.destroyPanel(id);
       else if (dist <= EXPLOSION_PANEL_OUTER_RADIUS) {
