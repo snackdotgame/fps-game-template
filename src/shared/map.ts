@@ -788,14 +788,22 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
   const pane = (axis: "x" | "z", mid: number, fixed: number, baseY: number): void => {
     const slabFirst = nextPanelId;
     glassIds.push(nextPanelId);
+    // The masonry hole snaps to whole courses, so it's a bit taller (and a hair
+    // wider) than the nominal opening — biggest for concrete's tall courses.
+    // Oversize the pane to cover it; the excess sits behind the surrounding
+    // wall pieces (which occlude it), so the glass always fills the window.
+    const yMargin = unit.h + 0.02;
+    const y0 = baseY + 1.3 - yMargin;
+    const y1 = baseY + 2.05 + yMargin;
+    const w = 2.1 + 0.24;
     g.panels.push({
       id: nextPanelId++,
       x: axis === "x" ? mid : fixed,
-      y: baseY + (1.3 + 2.05) / 2,
+      y: (y0 + y1) / 2,
       z: axis === "x" ? fixed : mid,
-      ex: axis === "x" ? 2.1 : 0.06,
-      ey: 2.05 - 1.3,
-      ez: axis === "x" ? 0.06 : 2.1,
+      ex: axis === "x" ? w : 0.06,
+      ey: y1 - y0,
+      ez: axis === "x" ? 0.06 : w,
       material: "glass",
       buildingId: id,
     });
