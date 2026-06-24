@@ -23,7 +23,6 @@ import {
   craterList,
   heightAt,
   MAP,
-  onRoad,
   PANEL_HP,
   type PanelDef,
   type PanelMaterial,
@@ -32,7 +31,6 @@ import {
   ringMesh,
   roadAt,
   slabOfPiece,
-  TERRAIN_CHUNK,
   TERRAIN_CHUNKS,
   terrainChunkMesh,
   WATER_SURFACE_Y,
@@ -724,117 +722,6 @@ function makeRingVisual(inner: number, outer: number, cell: number, fade: boolea
   return mesh;
 }
 
-// --- Grass: per-chunk blade triangles with a wind-sway vertex shader,
-// tinted to the terrain. Blades resample the heightfield on crater rebuilds
-// (and skip scorched bowls).
-
-const GRASS_TUFTS_PER_CHUNK = 80; // each tuft is 2-4 blades -> ~45k blades total
-const grassChunkVisuals = new Map<number, THREE.Mesh>();
-const grassMat = new THREE.ShaderMaterial({
-  uniforms: THREE.UniformsUtils.merge([THREE.UniformsLib.fog, { uTime: { value: 0 } }]),
-  vertexShader: `
-    #include <fog_pars_vertex>
-    uniform float uTime;
-    attribute float aTip;
-    attribute float aSway;
-    varying vec3 vColor;
-    attribute vec3 aColor;
-    void main() {
-      vec3 p = position;
-      p.x += sin(uTime * 1.9 + aSway * 6.2832 + position.x * 0.45 + position.z * 0.3)
-        * 0.14 * aTip;
-      p.z += cos(uTime * 1.4 + aSway * 6.2832) * 0.06 * aTip;
-      vColor = aColor;
-      vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
-      gl_Position = projectionMatrix * mvPosition;
-      #include <fog_vertex>
-    }
-  `,
-  fragmentShader: `
-    #include <fog_pars_fragment>
-    varying vec3 vColor;
-    void main() {
-      gl_FragColor = vec4(vColor, 1.0);
-      #include <fog_fragment>
-    }
-  `,
-  side: THREE.DoubleSide,
-  fog: true,
-});
-
-function makeGrassChunkMesh(ci: number, cj: number): THREE.Mesh | null {
-  const x0 = -MAP.size / 2 + ci * TERRAIN_CHUNK;
-  const z0 = -MAP.size / 2 + cj * TERRAIN_CHUNK;
-  const positions: number[] = [];
-  const colors: number[] = [];
-  const tips: number[] = [];
-  const sways: number[] = [];
-  const cLow = new THREE.Color(0x4f7d36);
-  const cHigh = new THREE.Color(0xa6c25f);
-  const cDry = new THREE.Color(0xbcb463);
-  const blade = new THREE.Color();
-  const root = new THREE.Color();
-  const tip = new THREE.Color();
-  const seedBase = (ci * 31 + cj) * 7919;
-  // Grass grows in tufts (a small clump of leaning blades), not lone spikes,
-  // and stays off roads, pads, water and scorched bowls.
-  for (let i = 0; i < GRASS_TUFTS_PER_CHUNK; i++) {
-    const tx = x0 + hash01(seedBase + i, 11) * TERRAIN_CHUNK;
-    const tz = z0 + hash01(seedBase + i, 12) * TERRAIN_CHUNK;
-    const baseH = baseHeightAt(tx, tz);
-    if (baseH < 0.04) continue; // pads, spawns, water
-    const ty = heightAt(tx, tz);
-    if (baseH - ty > 0.12) continue; // scorched crater bowl
-    if (onRoad(tx, tz) > 0) continue; // bare road/path
-    const hue = hash01(seedBase + i, 17);
-    const dryTuft = hash01(seedBase + i, 18) > 0.82;
-    const nBlades = 2 + Math.floor(hash01(seedBase + i, 19) * 3); // 2-4
-    for (let b = 0; b < nBlades; b++) {
-      const bs = seedBase + i * 7 + b * 131;
-      const x = tx + (hash01(bs, 21) - 0.5) * 0.34;
-      const z = tz + (hash01(bs, 22) - 0.5) * 0.34;
-      const y = heightAt(x, z);
-      const h = 0.3 + hash01(bs, 13) * 0.45;
-      const w = 0.045 + hash01(bs, 14) * 0.05;
-      const yaw = hash01(bs, 15) * Math.PI;
-      const dx = Math.cos(yaw) * w;
-      const dz = Math.sin(yaw) * w;
-      const lean = (hash01(bs, 23) - 0.5) * 0.2;
-      const sway = hash01(bs, 16);
-      blade.copy(cLow).lerp(cHigh, hue * 0.65 + hash01(bs, 24) * 0.35);
-      if (dryTuft) blade.lerp(cDry, 0.5);
-      root.copy(blade).multiplyScalar(0.52); // shaded base (fake AO)
-      tip.copy(blade).multiplyScalar(1.2); // sun-caught tip
-      positions.push(x - dx, y, z - dz, x + dx, y, z + dz, x + lean, y + h, z + lean);
-      colors.push(root.r, root.g, root.b, root.r, root.g, root.b, tip.r, tip.g, tip.b);
-      tips.push(0, 0, 1);
-      sways.push(sway, sway, sway);
-    }
-  }
-  if (positions.length === 0) return null;
-  const geo = new THREE.BufferGeometry();
-  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geo.setAttribute("aColor", new THREE.Float32BufferAttribute(colors, 3));
-  geo.setAttribute("aTip", new THREE.Float32BufferAttribute(tips, 1));
-  geo.setAttribute("aSway", new THREE.Float32BufferAttribute(sways, 1));
-  return new THREE.Mesh(geo, grassMat);
-}
-
-function rebuildGrassChunk(ci: number, cj: number): void {
-  const key = ci * TERRAIN_CHUNKS + cj;
-  const old = grassChunkVisuals.get(key);
-  if (old) {
-    mapGroup.remove(old);
-    old.geometry.dispose();
-    grassChunkVisuals.delete(key);
-  }
-  const mesh = makeGrassChunkMesh(ci, cj);
-  if (mesh) {
-    grassChunkVisuals.set(key, mesh);
-    mapGroup.add(mesh);
-  }
-}
-
 // --- Voxel clouds: chunky white box clusters drifting over the arena. ---
 
 const cloudGroup = new THREE.Group();
@@ -976,7 +863,6 @@ function buildMapVisuals(): void {
   builtMeshes.clear();
   panelDefs.clear();
   terrainChunkVisuals.clear();
-  grassChunkVisuals.clear();
   decals.length = 0;
   corpses.length = 0; // their groups died with the old mapGroup
   fallingChunks.clear(); // ditto
@@ -984,7 +870,6 @@ function buildMapVisuals(): void {
   for (let ci = 0; ci < TERRAIN_CHUNKS; ci++) {
     for (let cj = 0; cj < TERRAIN_CHUNKS; cj++) {
       rebuildTerrainChunk(ci, cj);
-      rebuildGrassChunk(ci, cj);
     }
   }
   // The world beyond the core: a collidable apron then a fog-bound backdrop.
@@ -2042,7 +1927,6 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       if (gw) applyCraterBodies(gw, msg.crater);
       for (const [ci, cj] of chunksTouching(msg.crater)) {
         rebuildTerrainChunk(ci, cj);
-        rebuildGrassChunk(ci, cj);
       }
       removeDecalsInCrater(msg.crater);
       break;
@@ -2105,7 +1989,17 @@ async function readDatagrams(): Promise<void> {
     while (true) {
       const event = await client.datagrams.recv();
       const snap = decodeSnapshot(event.bytes);
-      if (snap) handleSnapshot(snap, event.receivedAt);
+      // A throw inside the snapshot handler must NOT kill the receive loop —
+      // otherwise one bad snapshot stops all further updates (remotes freeze,
+      // tracers/shot sounds vanish, and you die to fire you never saw). Log and
+      // keep draining; only a closed connection (recv rejecting) ends the loop.
+      if (snap) {
+        try {
+          handleSnapshot(snap, event.receivedAt);
+        } catch (err) {
+          console.error("[fps] snapshot handler error:", err);
+        }
+      }
     }
   } catch {
     await client.closed;
@@ -2498,6 +2392,8 @@ interface CharacterAnim {
   shootUntil: number; // ms timestamp; play the *_Shoot variant until then
   jumpUntil: number; // ms timestamp; play the airborne clip until then
   hitUntil: number; // ms timestamp; play the HitReact flinch until then
+  animSpeed: number; // smoothed locomotion speed (kills per-snapshot jitter)
+  sprintAnim: boolean; // hysteresis latch for the sprint clip
 }
 
 // Team 0 renders as the Soldier, team 1 as the Enemy — distinct silhouettes so
@@ -2782,9 +2678,20 @@ function updateCharacterAnim(
   const airborne = now < anim.jumpUntil;
   const hit = now < anim.hitUntil;
   const shooting = now < anim.shootUntil;
-  const running = speed > ANIM_RUN_SPEED;
-  const sprinting = speed > ANIM_SPRINT_SPEED;
-  const moving = speed > ANIM_MOVE_SPEED;
+  // Smooth the per-snapshot speed estimate and gate the sprint clip with
+  // hysteresis, so a body whose speed hovers near a threshold (notably the
+  // ~6.4 line between a normal run at 5.2 and a sprint at 7.6) doesn't flicker
+  // between the jog and sprint clips every snapshot.
+  anim.animSpeed += (speed - anim.animSpeed) * Math.min(1, dt * 8);
+  const sp = anim.animSpeed;
+  if (anim.sprintAnim) {
+    if (sp < ANIM_SPRINT_SPEED - 0.8) anim.sprintAnim = false; // exit at ~5.6
+  } else if (sp > ANIM_SPRINT_SPEED + 0.4) {
+    anim.sprintAnim = true; // enter at ~6.8
+  }
+  const running = sp > ANIM_RUN_SPEED;
+  const sprinting = anim.sprintAnim;
+  const moving = sp > ANIM_MOVE_SPEED;
   let clip: string;
   let timeScale = 1;
   if (hit)
@@ -2798,7 +2705,7 @@ function updateCharacterAnim(
     // Jog carrying the weapon in both hands at the ready (Run_Gun), time-scaled
     // to ground speed so the feet don't slide.
     clip = "Run_Gun";
-    timeScale = Math.max(0.8, Math.min(1.2, speed / 5.2));
+    timeScale = Math.max(0.8, Math.min(1.2, sp / 5.2));
   } else clip = "Idle";
   playClip(anim, clip, 0.18, timeScale);
   if (moving && !airborne) {
@@ -2829,6 +2736,8 @@ function attachExternalSoldier(rp: RemotePlayer): void {
     shootUntil: 0,
     jumpUntil: 0,
     hitUntil: 0,
+    animSpeed: 0,
+    sprintAnim: false,
   };
   playClip(rp.anim, "Idle", 0);
 }
@@ -3060,7 +2969,11 @@ interface Corpse {
   mixer: THREE.AnimationMixer | null;
   until: number;
   materials: THREE.Material[]; // captured once for the fade-out
+  vy: number; // fall velocity — a body that died airborne drops to the ground
+  groundY: number; // surface (terrain/floor/rubble) the body settles on
 }
+
+const CORPSE_GRAVITY = 18; // m/s^2 for the corpse drop
 
 const corpses: Corpse[] = [];
 const CORPSE_CAP = 18;
@@ -3093,7 +3006,29 @@ function spawnCorpse(at: THREE.Vector3, yaw: number, team: number): void {
     }),
   );
   mapGroup.add(group);
-  corpses.push({ group, mixer, until: performance.now() + CORPSE_TTL_MS, materials });
+  // Where the body comes to rest: ray straight down for the first surface
+  // (terrain, a building floor, rubble) so a soldier killed mid-air or on a
+  // ledge drops to the ground instead of hanging where they died. Never above
+  // the death height (a grounded body shouldn't pop up).
+  let groundY = heightAt(at.x, at.z);
+  // Guard the raycast: gw can be mid-rebuild on a round reset, and a throw here
+  // would otherwise propagate out of handleSnapshot. Terrain height is the safe
+  // fallback.
+  try {
+    const below = castLocal([at.x, at.y + 0.4, at.z], [0, -1, 0], 100);
+    if (below) groundY = below.point[1];
+  } catch {
+    /* keep terrain height */
+  }
+  groundY = Math.min(groundY, at.y);
+  corpses.push({
+    group,
+    mixer,
+    until: performance.now() + CORPSE_TTL_MS,
+    materials,
+    vy: 0,
+    groundY,
+  });
   if (corpses.length > CORPSE_CAP) {
     const old = corpses.shift()!;
     old.mixer?.stopAllAction();
@@ -3120,6 +3055,14 @@ function stepCorpses(dt: number): void {
   }
   for (const c of corpses) {
     c.mixer?.update(dt); // advance the Death clip (clamps on its last frame)
+    if (c.group.position.y > c.groundY) {
+      c.vy -= CORPSE_GRAVITY * dt;
+      c.group.position.y += c.vy * dt;
+      if (c.group.position.y <= c.groundY) {
+        c.group.position.y = c.groundY;
+        c.vy = 0;
+      }
+    }
     const remaining = c.until - now;
     if (remaining < CORPSE_FADE_MS) {
       const k = Math.max(0, remaining / CORPSE_FADE_MS);
@@ -3569,7 +3512,6 @@ function frame(): void {
   stepClouds(dt);
   stepCorpses(dt);
   stepFlags(now);
-  (grassMat.uniforms.uTime as { value: number }).value = now / 1000;
   (waterMat.uniforms.uTime as { value: number }).value = now / 1000;
 
   // Camera at the predicted eye, interpolated between the last two ticks so
