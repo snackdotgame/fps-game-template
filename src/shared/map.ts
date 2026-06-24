@@ -1029,9 +1029,11 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
     const ix1 = x1 - inset;
     const rx0 = (stories > 1 ? x0 + 3.4 : x0) + inset;
     const roomWalls = partitionInterior(rx0, iz0, ix1, iz1, cx, cz, o.rng);
+    // 1.4m clear — a 0.7m-wide character needs real shoulder room to pass
+    // without catching a jamb (1.1m was too tight, especially upstairs).
     const doorGap = (mid: number, baseY: number): GapRect => ({
-      lo: mid - 0.55,
-      hi: mid + 0.55,
+      lo: mid - 0.7,
+      hi: mid + 0.7,
       y0: baseY,
       y1: baseY + 2.05,
     });
@@ -1039,10 +1041,12 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
       const baseY = story * WALL_HEIGHT;
       for (const wseg of roomWalls) {
         const span = wseg.hi - wseg.lo;
-        if (span < 1.8) continue;
-        const gaps: GapRect[] = [doorGap(wseg.lo + 0.8 + o.rng() * (span - 1.6), baseY)];
+        if (span < 2.0) continue; // too short to seat a 1.4m door with jambs
+        // Keep the 0.7m half-door at least 0.2m off each end (mid in [lo+0.9,
+        // hi-0.9]) so jambs survive instead of collapsing to slivers.
+        const gaps: GapRect[] = [doorGap(wseg.lo + 0.9 + o.rng() * (span - 1.8), baseY)];
         if (span > 6.5 && o.rng() < 0.35) {
-          gaps.push(doorGap(wseg.lo + 0.8 + o.rng() * (span - 1.6), baseY));
+          gaps.push(doorGap(wseg.lo + 0.9 + o.rng() * (span - 1.8), baseY));
         }
         masonryRun(
           g,
