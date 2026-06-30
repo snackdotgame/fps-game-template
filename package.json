@@ -23,13 +23,13 @@
   "dependencies": {
     "@recast-navigation/core": "^0.43.1",
     "@recast-navigation/generators": "^0.43.1",
-    "jolt-ts": "file:../../jolt-ts",
-    "jolt-ts-character-controller": "file:../../jolt-ts-character-controller",
+    "jolt-ts": "^0.1.0",
+    "jolt-ts-character-controller": "0.0.0",
     "simplex-noise": "^4.0.3",
     "three": "^0.184.0"
   },
   "devDependencies": {
-    "@snack-game/cli": "^0.1.5",
+    "@snack-game/cli": "^0.1.9",
     "@types/three": "^0.184.1",
     "@typescript/native-preview": "7.0.0-dev.20260513.1",
     "esbuild": "0.27.3",
