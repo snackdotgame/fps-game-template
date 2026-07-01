@@ -3045,7 +3045,7 @@ function predictionTick(): void {
   const reloadBefore = predState.reloadTicks;
   stepPlayerController(gw, selfBody, predState, cmd, {
     locked: dead,
-    onFire: (_eye, dir) => {
+    onFire: (eye, dir) => {
       const w = predState ? activeWeapon(predState) : WEAPON_LIST[0];
       sounds.shot(w.name);
       // Visual camera kick scales with the weapon's real recoil — heavy guns
@@ -3059,19 +3059,40 @@ function predictionTick(): void {
       }
       // Predicted tracers from local raycasts — instant feedback; the
       // server's events remain authoritative for hits and damage. Rays start
-      // at the barrel like the server's (dir already carries recoil), and
-      // pellet weapons show the whole spray (the server rolls its own spread,
-      // so these pellets are purely visual).
+      // at the barrel like the server's and CONVERGE on the eye ray's target
+      // like the server's (dir already carries recoil); pellet weapons show
+      // the whole spray (the server rolls its own spread, so these pellets
+      // are purely visual).
       if (gw && selfBody && predState) {
         const mo = muzzleOrigin(predState, cmd.yaw, cmd.pitch);
+        const eyeHit = castLocal(eye, dir, w.range);
+        const aimDist = Math.max(
+          2,
+          eyeHit
+            ? Math.hypot(
+                eyeHit.point[0] - eye[0],
+                eyeHit.point[1] - eye[1],
+                eyeHit.point[2] - eye[2],
+              )
+            : w.range,
+        );
+        const cx = eye[0] + dir[0] * aimDist - mo[0];
+        const cy = eye[1] + dir[1] * aimDist - mo[1];
+        const cz = eye[2] + dir[2] * aimDist - mo[2];
+        const cl = Math.hypot(cx, cy, cz) || 1;
+        const baseDir: [number, number, number] = [cx / cl, cy / cl, cz / cl];
         const from = muzzleWorld().clone();
         const pellets = w.pellets ?? 1;
         const spread = pellets > 1 ? spreadFor(predState) : 0;
         for (let i = 0; i < pellets; i++) {
           const d =
             pellets > 1
-              ? perturb(dir, (Math.random() - 0.5) * 2 * spread, (Math.random() - 0.5) * 2 * spread)
-              : dir;
+              ? perturb(
+                  baseDir,
+                  (Math.random() - 0.5) * 2 * spread,
+                  (Math.random() - 0.5) * 2 * spread,
+                )
+              : baseDir;
           const hit = castLocal(mo, d, w.range);
           const end = hit
             ? new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])
