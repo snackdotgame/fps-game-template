@@ -82,6 +82,7 @@ import {
   type GameWorld,
   type InputCmd,
   makeChar,
+  perturb,
   pieceIdFromHit,
   PLAYER_HALF_HEIGHT,
   rayVsCapsule,
@@ -1251,22 +1252,4 @@ function mulberry32(seed: number): () => number {
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
-}
-
-function perturb(dir: [number, number, number], dx: number, dy: number): [number, number, number] {
-  // Small-angle perturbation in the plane perpendicular to dir.
-  let rx = dir[2];
-  let ry = 0;
-  let rz = -dir[0];
-  const rl = Math.hypot(rx, ry, rz) || 1;
-  rx /= rl;
-  rz /= rl;
-  const ux = ry * dir[2] - rz * dir[1];
-  const uy = rz * dir[0] - rx * dir[2];
-  const uz = rx * dir[1] - ry * dir[0];
-  const ox = dir[0] + rx * dx + ux * dy;
-  const oy = dir[1] + ry * dx + uy * dy;
-  const oz = dir[2] + rz * dx + uz * dy;
-  const l = Math.hypot(ox, oy, oz) || 1;
-  return [ox / l, oy / l, oz / l];
 }

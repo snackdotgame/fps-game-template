@@ -115,22 +115,20 @@ export function weaponByIdx(idx: number): WeaponDef {
   return WEAPON_LIST[idx] ?? WEAPONS.rifle;
 }
 
-// --- Classes: a primary weapon + a Quaternius character model. Everyone
+// --- Classes: a primary weapon pick. Appearance stays team-only (red vs
+// blue soldiers) — the class reads from the weapon in their hands. Everyone
 // carries the pistol secondary, the sledgehammer, grenades, and build supply.
 export interface ClassDef {
   name: string;
   primary: WeaponId;
-  // Which character model renders this class (index into the client's
-  // template list: 0 Soldier, 1 Enemy, 2 Hazmat). Team is shown by tint.
-  model: number;
   blurb: string; // one-liner for the class picker
 }
 
 export const CLASSES: readonly ClassDef[] = [
-  { name: "Assault", primary: "rifle", model: 0, blurb: "all-round rifle" },
-  { name: "Raider", primary: "smg", model: 0, blurb: "run & gun up close" },
-  { name: "Breacher", primary: "shotgun", model: 2, blurb: "door-kicking shredder" },
-  { name: "Marksman", primary: "sniper", model: 1, blurb: "one shot, one kill" },
+  { name: "Assault", primary: "rifle", blurb: "all-round rifle" },
+  { name: "Raider", primary: "smg", blurb: "run & gun up close" },
+  { name: "Breacher", primary: "shotgun", blurb: "door-kicking shredder" },
+  { name: "Marksman", primary: "sniper", blurb: "one shot, one kill" },
 ];
 
 export function classPrimaryIdx(classId: number): number {

@@ -1053,6 +1053,30 @@ export function rayVsCapsule(
   return distSq <= r * r ? t : null;
 }
 
+// Small-angle perturbation of a unit direction in its perpendicular plane —
+// bullet spread. Shared by the server's authoritative rolls and the client's
+// visual-only pellet sprays.
+export function perturb(
+  dir: [number, number, number],
+  dx: number,
+  dy: number,
+): [number, number, number] {
+  let rx = dir[2];
+  const ry = 0;
+  let rz = -dir[0];
+  const rl = Math.hypot(rx, ry, rz) || 1;
+  rx /= rl;
+  rz /= rl;
+  const ux = ry * dir[2] - rz * dir[1];
+  const uy = rz * dir[0] - rx * dir[2];
+  const uz = rx * dir[1] - ry * dir[0];
+  const ox = dir[0] + rx * dx + ux * dy;
+  const oy = dir[1] + ry * dx + uy * dy;
+  const oz = dir[2] + rz * dx + uz * dy;
+  const l = Math.hypot(ox, oy, oz) || 1;
+  return [ox / l, oy / l, oz / l];
+}
+
 // Current spread of the ACTIVE weapon (radians) — worse moving or airborne.
 export function spreadFor(s: CharState): number {
   const w = activeWeapon(s);
