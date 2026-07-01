@@ -1282,9 +1282,11 @@ hud.innerHTML = `
     font-family:"Trebuchet MS",system-ui,sans-serif; transition:background 100ms ease,border-color 100ms ease; }
   .classbtn:hover { background:rgba(255,255,255,.11); }
   .classbtn.sel { border-color:#fff; background:rgba(255,255,255,.14); }
+  .classbtn .ci { height:32px; display:flex; align-items:center; justify-content:center; margin-bottom:3px; }
+  .classbtn .ci img { max-height:32px; max-width:92%; filter:drop-shadow(0 2px 3px rgba(0,0,0,.55)); }
   .classbtn .cn { font-size:13px; font-weight:900; letter-spacing:.5px; }
   .classbtn .cw { font-size:11px; opacity:.75; margin-top:1px; }
-  #introMap { width:min(232px, 56vw); margin:0 auto; }
+  #introMap { width:min(204px, 52vw); margin:0 auto; }
   #respawn { position:fixed; inset:0; z-index:120; display:none; align-items:center; justify-content:center;
     pointer-events:auto; background:rgba(6,9,15,.55); }
   #respawn .rp { width:min(440px, 94vw); max-height:calc(100vh - 24px); overflow-y:auto; box-sizing:border-box;
@@ -4859,6 +4861,56 @@ makeMinimap(el.respawnMap);
 let classChoice = loadStoredClass();
 const classPickers: Array<() => void> = [];
 
+// Weapon thumbnails for the class cards, rendered once from the real GLTF
+// weapon models into data URLs. A tiny offscreen renderer does each shot and
+// is disposed as soon as every card's weapon has one.
+const weaponThumbs = new Map<number, string>();
+let thumbRenderer: THREE.WebGLRenderer | null = null;
+
+function weaponThumb(weaponIdx: number): string | null {
+  const cached = weaponThumbs.get(weaponIdx);
+  if (cached) return cached;
+  const tpl = viewWeaponTemplates[weaponIdx];
+  if (!tpl) return null; // model still loading; retry on the next refresh
+  const W = 168;
+  const H = 72;
+  thumbRenderer ??= new THREE.WebGLRenderer({ alpha: true, antialias: true });
+  thumbRenderer.setSize(W, H);
+  const stage = new THREE.Scene();
+  stage.add(new THREE.AmbientLight(0xffffff, 1.15));
+  const key = new THREE.DirectionalLight(0xffffff, 1.7);
+  key.position.set(1.5, 2, 3);
+  stage.add(key);
+  const model = cloneExternalModel(tpl, 0, false);
+  model.rotation.y = Math.PI; // barrel to screen-right
+  stage.add(model);
+  // Frame the profile with an orthographic camera fitted to the model's
+  // bounds (small margin), matched to the card's aspect.
+  const box = new THREE.Box3().setFromObject(model);
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  let halfW = (size.x / 2) * 1.15;
+  let halfH = (size.y / 2) * 1.15;
+  if (halfW / halfH < W / H) halfW = halfH * (W / H);
+  else halfH = halfW / (W / H);
+  const cam = new THREE.OrthographicCamera(-halfW, halfW, halfH, -halfH, 0.01, 10);
+  cam.position.set(center.x, center.y, center.z + 2);
+  cam.lookAt(center);
+  thumbRenderer.render(stage, cam);
+  const url = thumbRenderer.domElement.toDataURL();
+  weaponThumbs.set(weaponIdx, url);
+  const needed = CLASSES.map((_, i) => classPrimaryIdx(i));
+  if (needed.every((idx) => weaponThumbs.has(idx)) && thumbRenderer) {
+    thumbRenderer.dispose(); // every card has its shot: free the GL context
+    thumbRenderer = null;
+  }
+  return url;
+}
+
+function refreshClassPickers(): void {
+  for (const refresh of classPickers) refresh();
+}
+
 function sendClassChoice(): void {
   void client.streams.send({ type: "class", cls: classChoice }).catch(() => {});
 }
@@ -4883,7 +4935,7 @@ function makeClassPicker(container: HTMLElement): void {
     b.type = "button";
     b.className = "classbtn";
     b.title = cls.blurb;
-    b.innerHTML = `<div class="cn">${cls.name.toUpperCase()}</div><div class="cw">${
+    b.innerHTML = `<div class="ci"></div><div class="cn">${cls.name.toUpperCase()}</div><div class="cw">${
       WEAPON_LIST[classPrimaryIdx(i)].name
     } + ${WEAPON_LIST[secondaryIdxFor(classPrimaryIdx(i))].name}</div>`;
     b.addEventListener("click", (e) => {
@@ -4895,7 +4947,20 @@ function makeClassPicker(container: HTMLElement): void {
   });
   container.appendChild(row);
   const refresh = (): void => {
-    for (let i = 0; i < btns.length; i++) btns[i].classList.toggle("sel", classChoice === i);
+    for (let i = 0; i < btns.length; i++) {
+      btns[i].classList.toggle("sel", classChoice === i);
+      // Drop the primary weapon's render in once its model has loaded.
+      const slot = btns[i].querySelector(".ci")!;
+      if (slot.childElementCount === 0) {
+        const thumb = weaponThumb(classPrimaryIdx(i));
+        if (thumb) {
+          const img = document.createElement("img");
+          img.src = thumb;
+          img.alt = WEAPON_LIST[classPrimaryIdx(i)].name;
+          slot.appendChild(img);
+        }
+      }
+    }
   };
   refresh();
   classPickers.push(refresh);
@@ -4952,6 +5017,7 @@ function updateRespawnOverlay(dead: boolean, now: number): void {
   if (now - lastMinimapRefresh > 250) {
     lastMinimapRefresh = now;
     refreshMinimaps();
+    refreshClassPickers();
   }
 }
 
@@ -5041,6 +5107,7 @@ const introTimer = setInterval(() => {
   }
   updateIntroPanel();
   refreshMinimaps(); // live zone ownership on the deploy map
+  refreshClassPickers(); // fills weapon thumbnails in as models load
 }, 150);
 
 function dismissIntro(): void {
