@@ -103,7 +103,8 @@ renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.15;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-document.body.style.cssText = "margin:0;overflow:hidden;background:#0c0f14;";
+document.body.style.cssText =
+  "margin:0;overflow:hidden;background:#0c0f14;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;";
 document.body.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -1512,6 +1513,11 @@ let yaw = 0;
 let pitch = 0;
 let pointerLocked = false;
 let fireHeld = false;
+// Touch (mobile): the floating joystick writes these, blended into the keyboard
+// move in sampleInput(); look + buttons drive yaw/pitch/keys/fireHeld directly,
+// exactly like mouse + keyboard — so no server or netcode changes are needed.
+let touchFwd = 0;
+let touchSide = 0;
 
 renderer.domElement.addEventListener("mousedown", (e) => {
   ensureAudio();
@@ -1577,6 +1583,8 @@ function sampleInput(seq: number): InputCmd {
   if (keys.has("KeyS")) fwd -= 1;
   if (keys.has("KeyA")) side += 1;
   if (keys.has("KeyD")) side -= 1;
+  fwd = Math.max(-1, Math.min(1, fwd + touchFwd));
+  side = Math.max(-1, Math.min(1, side + touchSide));
   const sin = Math.sin(yaw);
   const cos = Math.cos(yaw);
   return {
@@ -1595,6 +1603,216 @@ function sampleInput(seq: number): InputCmd {
     viewTick,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Touch controls (mobile). Pure client-side: a floating left joystick writes
+// touchFwd/touchSide, a right-side drag surface drives yaw/pitch, and on-screen
+// buttons toggle the same `keys`/`fireHeld` the keyboard + mouse use. Shown only
+// on coarse-pointer/touch devices so desktop mouse + keyboard is untouched.
+
+const wantsTouch =
+  matchMedia("(hover: none) and (pointer: coarse)").matches || navigator.maxTouchPoints > 0;
+
+function setupTouchControls(): void {
+  const LOOK_SENS = 0.013; // radians per CSS px of drag (tune in playtest)
+  const JOY_RADIUS = 55; // px of knob travel
+  const JOY_DEAD = 0.18; // fraction of radius ignored, anti-drift
+
+  // Inline SVG glyphs (Lucide-style) so buttons need no image assets.
+  const ICONS: Record<string, string> = {
+    fire: '<circle cx="12" cy="12" r="8"/><line x1="12" y1="2" x2="12" y2="5.5"/><line x1="12" y1="18.5" x2="12" y2="22"/><line x1="2" y1="12" x2="5.5" y2="12"/><line x1="18.5" y1="12" x2="22" y2="12"/><circle cx="12" cy="12" r="1.7" fill="currentColor" stroke="none"/>',
+    jump: '<path d="M6 13l6-6 6 6"/><path d="M6 18l6-6 6 6"/>',
+    sprint: '<path d="M13 2 L5 13 h5 l-1 9 L19 10 h-5 z"/>',
+    cover: '<path d="M12 2.5l7.5 2.8v5.7c0 4.6-3.2 7.4-7.5 9-4.3-1.6-7.5-4.4-7.5-9V5.3z"/>',
+    reload: '<path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.5v5h-5"/>',
+    nade: '<circle cx="11.5" cy="14" r="6.3"/><rect x="8.5" y="3.8" width="6" height="3.7" rx="1"/><circle cx="6.5" cy="5.2" r="2"/>',
+    melee: '<path d="M2 22l8.5-8.5"/><path d="M17 2l5 5-4 4-5-5z"/><path d="M9 11l4 4"/>',
+  };
+  const icon = (n: string): string =>
+    `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n]}</svg>`;
+
+  const root = document.createElement("div");
+  root.innerHTML = `
+<style>
+  #touch { position:fixed; inset:0; z-index:50; pointer-events:none;
+    font-family:"Trebuchet MS",system-ui,sans-serif; -webkit-user-select:none; user-select:none; }
+  #touchsurface { position:absolute; inset:0; pointer-events:auto; touch-action:none; }
+  #joybase { position:absolute; width:${JOY_RADIUS * 2}px; height:${JOY_RADIUS * 2}px;
+    margin:${-JOY_RADIUS}px 0 0 ${-JOY_RADIUS}px; border-radius:50%; display:none; pointer-events:none;
+    background:rgba(255,255,255,.07); border:2px solid rgba(255,255,255,.25); }
+  #joyknob { position:absolute; left:50%; top:50%; width:54px; height:54px; margin:-27px 0 0 -27px;
+    border-radius:50%; pointer-events:none;
+    background:rgba(255,255,255,.30); border:2px solid rgba(255,255,255,.55); }
+  .tbtn { position:absolute; pointer-events:auto; touch-action:none; border-radius:50%;
+    display:flex; align-items:center; justify-content:center; color:#fff;
+    background:rgba(18,22,32,.42); border:2px solid rgba(255,255,255,.26); }
+  .tbtn svg { width:46%; height:46%; display:block; }
+  .tbtn.pressed { background:rgba(120,160,255,.55); }
+  /* Compact thumb cluster: big FIRE in the corner, 2x3 grid of actions to its left. */
+  #b-fire { right:22px; bottom:36px; width:88px; height:88px;
+    background:rgba(150,40,32,.42); border-color:rgba(255,130,110,.5); }
+  #b-fire svg { width:52%; height:52%; }
+  #b-jump { right:122px; bottom:44px; width:52px; height:52px; }
+  #b-build { right:180px; bottom:44px; width:52px; height:52px; }
+  #b-sprint { right:122px; bottom:102px; width:52px; height:52px; }
+  #b-reload { right:180px; bottom:102px; width:52px; height:52px; }
+  #b-grenade { right:122px; bottom:160px; width:52px; height:52px; }
+  #b-melee { right:180px; bottom:160px; width:52px; height:52px; }
+  /* Lift the ammo readout above the button cluster on touch. */
+  #ammo { right:16px; bottom:226px; }
+  #rotate { position:fixed; inset:0; z-index:200; display:none; background:#0c0f14; color:#fff;
+    flex-direction:column; align-items:center; justify-content:center; text-align:center;
+    font-family:"Trebuchet MS",system-ui,sans-serif; }
+  @media (hover:none) and (pointer:coarse) and (orientation:portrait) { #rotate { display:flex; } }
+</style>
+<div id="touch">
+  <div id="touchsurface"></div>
+  <div id="joybase"><div id="joyknob"></div></div>
+  <div id="b-fire" class="tbtn">${icon("fire")}</div>
+  <div id="b-jump" class="tbtn">${icon("jump")}</div>
+  <div id="b-sprint" class="tbtn">${icon("sprint")}</div>
+  <div id="b-build" class="tbtn">${icon("cover")}</div>
+  <div id="b-reload" class="tbtn">${icon("reload")}</div>
+  <div id="b-grenade" class="tbtn">${icon("nade")}</div>
+  <div id="b-melee" class="tbtn">${icon("melee")}</div>
+</div>
+<div id="rotate">
+  <div style="font-size:34px">\u{1F504}</div>
+  <div style="font-size:18px;font-weight:800;margin-top:10px">Rotate your device</div>
+  <div style="opacity:.7;margin-top:4px">landscape works best</div>
+</div>`;
+  document.body.appendChild(root);
+  document.getElementById("hint")?.style.setProperty("display", "none");
+
+  const surface = document.getElementById("touchsurface")!;
+  const joybase = document.getElementById("joybase")!;
+  const joyknob = document.getElementById("joyknob")!;
+
+  let moveId = -1;
+  const joyCenter = { x: 0, y: 0 };
+  let lookId = -1;
+  let lookX = 0;
+  let lookY = 0;
+
+  function setJoy(dx: number, dy: number): void {
+    const dist = Math.hypot(dx, dy);
+    const cl = dist > JOY_RADIUS ? JOY_RADIUS / dist : 1;
+    const kx = dx * cl;
+    const ky = dy * cl;
+    joyknob.style.transform = `translate3d(${kx}px, ${ky}px, 0)`;
+    const nx = kx / JOY_RADIUS;
+    const ny = ky / JOY_RADIUS;
+    const mag = Math.hypot(nx, ny);
+    if (mag < JOY_DEAD) {
+      touchFwd = 0;
+      touchSide = 0;
+      return;
+    }
+    // Remap [dead..1] -> [0..1] so there is no jump leaving the dead zone.
+    const s = (mag - JOY_DEAD) / (1 - JOY_DEAD) / mag;
+    touchSide = -nx * s;
+    touchFwd = -ny * s;
+  }
+
+  surface.addEventListener("pointerdown", (e: PointerEvent) => {
+    ensureAudio();
+    if (e.pointerType !== "touch") {
+      // Hybrid device on a mouse: hand off to the existing pointer-lock look.
+      renderer.domElement.requestPointerLock();
+      return;
+    }
+    e.preventDefault();
+    surface.setPointerCapture(e.pointerId);
+    if (e.clientX < window.innerWidth * 0.45 && moveId === -1) {
+      moveId = e.pointerId;
+      joyCenter.x = e.clientX;
+      joyCenter.y = e.clientY;
+      joybase.style.left = `${e.clientX}px`;
+      joybase.style.top = `${e.clientY}px`;
+      joybase.style.display = "block";
+      joyknob.style.transform = "translate3d(0,0,0)";
+    } else if (lookId === -1) {
+      lookId = e.pointerId;
+      lookX = e.clientX;
+      lookY = e.clientY;
+    }
+  });
+
+  surface.addEventListener("pointermove", (e: PointerEvent) => {
+    if (e.pointerId === moveId) {
+      setJoy(e.clientX - joyCenter.x, e.clientY - joyCenter.y);
+      return;
+    }
+    if (e.pointerId !== lookId) return;
+    const coalesced = e.getCoalescedEvents?.() ?? [];
+    const list = coalesced.length > 0 ? coalesced : [e];
+    let dx = 0;
+    let dy = 0;
+    for (const ev of list) {
+      dx += ev.clientX - lookX;
+      dy += ev.clientY - lookY;
+      lookX = ev.clientX;
+      lookY = ev.clientY;
+    }
+    yaw -= dx * LOOK_SENS;
+    pitch = Math.max(-1.45, Math.min(1.45, pitch - dy * LOOK_SENS));
+    while (yaw > Math.PI) yaw -= Math.PI * 2;
+    while (yaw < -Math.PI) yaw += Math.PI * 2;
+  });
+
+  function endPointer(e: PointerEvent): void {
+    if (e.pointerId === moveId) {
+      moveId = -1;
+      touchFwd = 0;
+      touchSide = 0;
+      joybase.style.display = "none";
+    } else if (e.pointerId === lookId) {
+      lookId = -1;
+    }
+  }
+  surface.addEventListener("pointerup", endPointer);
+  surface.addEventListener("pointercancel", endPointer);
+
+  // Hold-to-press buttons: each maps to a key (or fireHeld), released on lift.
+  function press(id: string, on: () => void, off: () => void): void {
+    const b = document.getElementById(id)!;
+    b.addEventListener("pointerdown", (e: PointerEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      b.setPointerCapture(e.pointerId);
+      b.classList.add("pressed");
+      ensureAudio();
+      on();
+    });
+    function release(e: Event): void {
+      e.preventDefault();
+      b.classList.remove("pressed");
+      off();
+    }
+    b.addEventListener("pointerup", release);
+    b.addEventListener("pointercancel", release);
+  }
+  function key(code: string): [() => void, () => void] {
+    return [() => keys.add(code), () => keys.delete(code)];
+  }
+  press(
+    "b-fire",
+    () => {
+      fireHeld = true;
+    },
+    () => {
+      fireHeld = false;
+    },
+  );
+  press("b-jump", ...key("Space"));
+  press("b-sprint", ...key("ShiftLeft"));
+  press("b-build", ...key("KeyQ"));
+  press("b-reload", ...key("KeyR"));
+  press("b-grenade", ...key("KeyG"));
+  press("b-melee", ...key("KeyF"));
+}
+
+if (wantsTouch) setupTouchControls();
 
 // ---------------------------------------------------------------------------
 // Game state + prediction.
