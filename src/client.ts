@@ -1098,6 +1098,24 @@ hud.innerHTML = `
 <style>
   #hud { position:fixed; inset:0; pointer-events:none; font-family:"Trebuchet MS",system-ui,sans-serif; color:#fff; user-select:none; }
   .sh { text-shadow: 0 1px 2px rgba(0,0,0,.7); }
+  #audioMenu { position:absolute; top:max(8px, env(safe-area-inset-top)); left:max(52px, calc(env(safe-area-inset-left) + 52px)); z-index:30; pointer-events:auto; font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; color:rgb(245,245,245); }
+  #audioTrigger { width:36px; height:36px; display:grid; align-items:center; justify-items:center; padding:0; cursor:pointer; color:rgba(255,255,255,.7); background:rgba(0,0,0,.2); border:1px solid rgba(255,255,255,.2); border-radius:8px; box-shadow:0 12px 32px -18px rgba(0,0,0,1); backdrop-filter:blur(12px); transition:background 120ms ease,border-color 120ms ease,color 120ms ease; }
+  #audioTrigger:hover, #audioTrigger:focus-visible, #audioMenu[data-open="true"] #audioTrigger { background:rgba(0,0,0,.6); border-color:rgba(255,255,255,.35); color:#fff; outline:2px solid rgba(255,255,255,.6); outline-offset:2px; }
+  #audioTrigger svg { width:17px; height:17px; pointer-events:none; }
+  #audioPanel { position:absolute; top:44px; left:0; width:260px; box-sizing:border-box; display:none; padding:16px; background:rgba(18,18,20,.92); border:1px solid rgba(255,255,255,.1); border-radius:12px; box-shadow:0 30px 110px -35px rgba(0,0,0,.95); backdrop-filter:blur(12px); }
+  #audioMenu[data-open="true"] #audioPanel { display:block; }
+  #audioPanel header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin:0 0 14px; }
+  #audioPanel h2 { margin:0; font-size:16px; line-height:1.25; font-weight:650; letter-spacing:0; }
+  #audioClose { width:32px; height:32px; display:grid; align-items:center; justify-items:center; flex:0 0 auto; padding:0; cursor:pointer; color:rgba(255,255,255,.62); background:rgba(255,255,255,.035); border:1px solid rgba(255,255,255,.1); border-radius:8px; transition:background 120ms ease,color 120ms ease; }
+  #audioClose:hover, #audioClose:focus-visible { background:rgba(255,255,255,.08); color:#fff; outline:2px solid rgb(0,145,255); outline-offset:2px; }
+  #audioClose svg { width:16px; height:16px; pointer-events:none; }
+  .audio-separator { height:1px; width:100%; background:rgba(255,255,255,.1); margin:14px 0; }
+  .audio-row { display:grid; gap:8px; }
+  .audio-label { display:flex; align-items:center; justify-content:space-between; gap:12px; color:rgba(255,255,255,.82); font-size:13px; font-weight:650; line-height:1.3; }
+  #audioVolumeValue { color:rgba(255,255,255,.62); font-size:12px; font-weight:650; font-variant-numeric:tabular-nums; }
+  #audioVolume { width:100%; accent-color:rgb(0,145,255); cursor:pointer; }
+  .audio-toggle { display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:42px; box-sizing:border-box; padding:9px 10px; color:rgb(245,245,245); font-size:13px; font-weight:650; background:rgba(255,255,255,.035); border:1px solid rgba(255,255,255,.1); border-radius:8px; }
+  .audio-toggle input { width:18px; height:18px; margin:0; accent-color:rgb(0,145,255); cursor:pointer; }
   #cross { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); font-size:22px; opacity:.9; }
   #crossname { position:absolute; left:50%; top:54%; transform:translateX(-50%); font-size:14px; font-weight:800; opacity:0; }
   #hitmark { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%) rotate(45deg); font-size:26px; color:#ff5a4a; opacity:0; font-weight:900; }
@@ -1132,6 +1150,29 @@ hud.innerHTML = `
   #oob .c { font-size:72px; font-weight:900; color:#fff; text-shadow:0 3px 12px #000; margin-top:6px; }
 </style>
 <div id="hud">
+  <div id="audioMenu" data-open="false">
+    <button id="audioTrigger" type="button" aria-label="Open audio settings" aria-expanded="false" aria-controls="audioPanel">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/>
+        <path d="M19.4 15a1.8 1.8 0 0 0 .36 1.98l.05.05a2.1 2.1 0 1 1-2.97 2.97l-.05-.05a1.8 1.8 0 0 0-1.98-.36 1.8 1.8 0 0 0-1.09 1.65V21.4a2.1 2.1 0 1 1-4.2 0v-.07a1.8 1.8 0 0 0-1.13-1.66 1.8 1.8 0 0 0-1.98.36l-.05.05a2.1 2.1 0 1 1-2.97-2.97l.05-.05a1.8 1.8 0 0 0 .36-1.98 1.8 1.8 0 0 0-1.65-1.09H2.6a2.1 2.1 0 1 1 0-4.2h.07a1.8 1.8 0 0 0 1.66-1.13 1.8 1.8 0 0 0-.36-1.98l-.05-.05A2.1 2.1 0 1 1 6.89 3.66l.05.05a1.8 1.8 0 0 0 1.98.36H9a1.8 1.8 0 0 0 1.09-1.65V2.6a2.1 2.1 0 1 1 4.2 0v.07a1.8 1.8 0 0 0 1.09 1.65h.08a1.8 1.8 0 0 0 1.98-.36l.05-.05a2.1 2.1 0 1 1 2.97 2.97l-.05.05a1.8 1.8 0 0 0-.36 1.98V9a1.8 1.8 0 0 0 1.65 1.09h.1a2.1 2.1 0 1 1 0 4.2h-.07A1.8 1.8 0 0 0 19.4 15Z"/>
+      </svg>
+    </button>
+    <section id="audioPanel" role="dialog" aria-modal="false" aria-labelledby="audioTitle">
+      <header>
+        <h2 id="audioTitle">Audio</h2>
+        <button id="audioClose" type="button" aria-label="Close audio settings">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+        </button>
+      </header>
+      <div class="audio-separator"></div>
+      <div class="audio-row">
+        <label class="audio-label" for="audioVolume"><span>Master volume</span><span id="audioVolumeValue">70%</span></label>
+        <input id="audioVolume" type="range" min="0" max="100" step="1" value="70" />
+      </div>
+      <div class="audio-separator"></div>
+      <label class="audio-toggle" for="audioMute"><span>Mute</span><input id="audioMute" type="checkbox" /></label>
+    </section>
+  </div>
   <div id="vignette"></div>
   <div id="flash"></div>
   <div id="oob"><div class="b">⚠ RETURN TO THE BATTLEFIELD</div><div class="s">leaving the combat area</div><div class="c" id="oobtimer"></div></div>
@@ -1152,6 +1193,13 @@ hud.innerHTML = `
 document.body.appendChild(hud);
 const el = {
   cross: document.getElementById("cross")!,
+  audioMenu: document.getElementById("audioMenu")!,
+  audioTrigger: document.getElementById("audioTrigger") as HTMLButtonElement,
+  audioClose: document.getElementById("audioClose") as HTMLButtonElement,
+  audioPanel: document.getElementById("audioPanel")!,
+  audioVolume: document.getElementById("audioVolume") as HTMLInputElement,
+  audioVolumeValue: document.getElementById("audioVolumeValue")!,
+  audioMute: document.getElementById("audioMute") as HTMLInputElement,
   crossname: document.getElementById("crossname")!,
   hitmark: document.getElementById("hitmark")!,
   scores: document.getElementById("scores")!,
@@ -1170,6 +1218,63 @@ const el = {
   oob: document.getElementById("oob")!,
   oobtimer: document.getElementById("oobtimer")!,
 };
+
+function updateAudioMenu(): void {
+  const pct = Math.round(masterVolume * 100);
+  el.audioVolume.value = pct.toString();
+  el.audioVolumeValue.textContent = `${pct}%`;
+  el.audioMute.checked = masterVolume <= 0;
+}
+
+function audioMenuOpen(): boolean {
+  return el.audioMenu.dataset.open === "true";
+}
+
+function setAudioMenuOpen(open: boolean): void {
+  el.audioMenu.dataset.open = open ? "true" : "false";
+  el.audioTrigger.setAttribute("aria-expanded", open ? "true" : "false");
+  if (open) updateAudioMenu();
+}
+
+el.audioTrigger.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  setAudioMenuOpen(!audioMenuOpen());
+});
+el.audioClose.addEventListener("click", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  setAudioMenuOpen(false);
+  el.audioTrigger.focus();
+});
+el.audioVolume.addEventListener("input", () => {
+  ensureAudio();
+  setMasterVolume(Number(el.audioVolume.value) / 100);
+});
+el.audioMute.addEventListener("change", () => {
+  ensureAudio();
+  if (el.audioMute.checked) {
+    if (masterVolume > 0) lastAudibleVolume = masterVolume;
+    setMasterVolume(0);
+  } else {
+    setMasterVolume(lastAudibleVolume || DEFAULT_MASTER_VOLUME);
+  }
+});
+el.audioMenu.addEventListener("pointerdown", (event) => event.stopPropagation());
+el.audioMenu.addEventListener("keydown", (event) => {
+  event.stopPropagation();
+  if (event.code === "Escape") {
+    event.preventDefault();
+    setAudioMenuOpen(false);
+    el.audioTrigger.focus();
+  }
+});
+document.addEventListener("pointerdown", (event) => {
+  const target = event.target;
+  if (audioMenuOpen() && target instanceof Node && !el.audioMenu.contains(target)) {
+    setAudioMenuOpen(false);
+  }
+});
 
 function feed(text: string): void {
   const d = document.createElement("div");
@@ -1204,6 +1309,10 @@ interface SoundManifest {
 
 let audioCtx: AudioContext | null = null;
 let masterGain: GainNode | null = null;
+const MASTER_VOLUME_KEY = "breachpoint.masterVolume";
+const DEFAULT_MASTER_VOLUME = 0.7;
+let masterVolume = loadMasterVolume();
+let lastAudibleVolume = masterVolume > 0 ? masterVolume : DEFAULT_MASTER_VOLUME;
 const soundBuffers = new Map<string, AudioBuffer[]>();
 // One decode per URL, shared across every family that lists it (e.g. melee
 // reuses the Kenney impacts) so the same file isn't fetched or decoded twice.
@@ -1211,11 +1320,46 @@ const bufferPromises = new Map<string, Promise<AudioBuffer | null>>();
 const soundLog: string[] = [];
 let soundManifestRequested = false;
 
+function clampVolume(value: number): number {
+  return Math.max(0, Math.min(1, Number.isFinite(value) ? value : DEFAULT_MASTER_VOLUME));
+}
+
+function loadMasterVolume(): number {
+  try {
+    const raw = localStorage.getItem(MASTER_VOLUME_KEY);
+    if (raw === null) return DEFAULT_MASTER_VOLUME;
+    return clampVolume(Number(raw));
+  } catch {
+    return DEFAULT_MASTER_VOLUME;
+  }
+}
+
+function saveMasterVolume(): void {
+  try {
+    localStorage.setItem(MASTER_VOLUME_KEY, masterVolume.toFixed(2));
+  } catch {
+    // Storage can be unavailable in private or embedded contexts.
+  }
+}
+
+function applyMasterVolume(): void {
+  if (masterGain) masterGain.gain.value = masterVolume;
+}
+
+function setMasterVolume(value: number): void {
+  masterVolume = clampVolume(value);
+  if (masterVolume > 0) lastAudibleVolume = masterVolume;
+  applyMasterVolume();
+  saveMasterVolume();
+  updateAudioMenu();
+}
+updateAudioMenu();
+
 function ensureAudio(): void {
   if (!audioCtx) {
     audioCtx = new AudioContext();
     masterGain = audioCtx.createGain();
-    masterGain.gain.value = 0.7;
+    masterGain.gain.value = masterVolume;
     masterGain.connect(audioCtx.destination);
     for (const [family, urls] of Object.entries(BUILT_IN_SOUND_FILES)) {
       loadSoundFamily(family, urls);
@@ -4123,6 +4267,8 @@ declare global {
         viewWeaponLoaded: boolean;
       };
       forceAudio(): void;
+      audioVolume(): number;
+      setAudioVolume(value: number): void;
       perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
       drive(over: Partial<Omit<InputCmd, "seq">> & { trackIdx?: number }, ticks: number): void;
@@ -4186,6 +4332,11 @@ window.__fps = {
     viewWeaponLoaded: viewModel.userData.externalAttached === true,
   }),
   forceAudio: () => ensureAudio(),
+  audioVolume: () => masterVolume,
+  setAudioVolume: (value) => {
+    ensureAudio();
+    setMasterVolume(value);
+  },
   perf: () => ({
     fps: perf.fps,
     avgFrameMs: perf.avgFrameMs,
