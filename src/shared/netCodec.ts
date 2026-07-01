@@ -35,6 +35,7 @@ const BTN_RELOAD = 8;
 const BTN_GRENADE = 16;
 const BTN_MELEE = 32;
 const BTN_BUILD = 64;
+const BTN_SLOT2 = 128; // desired weapon slot: set = sidearm
 
 export function encodeInputs(cmds: readonly InputCmd[]): Uint8Array {
   const buf = new ArrayBuffer(2 + cmds.length * 13);
@@ -56,7 +57,8 @@ export function encodeInputs(cmds: readonly InputCmd[]): Uint8Array {
         (c.reload ? BTN_RELOAD : 0) |
         (c.grenade ? BTN_GRENADE : 0) |
         (c.melee ? BTN_MELEE : 0) |
-        (c.build ? BTN_BUILD : 0),
+        (c.build ? BTN_BUILD : 0) |
+        (c.slot2 ? BTN_SLOT2 : 0),
     );
     dv.setUint16(o + 11, c.viewTick & 0xffff);
     o += 13;
@@ -86,6 +88,7 @@ export function decodeInputs(bytes: Uint8Array): InputCmd[] | null {
       grenade: (b & BTN_GRENADE) !== 0,
       melee: (b & BTN_MELEE) !== 0,
       build: (b & BTN_BUILD) !== 0,
+      slot2: (b & BTN_SLOT2) !== 0,
       viewTick: dv.getUint16(o + 11),
     });
     o += 13;
@@ -145,11 +148,26 @@ export interface SelfSnap {
 export interface RemoteSnap {
   idx: number;
   flags: number; // RF_* bits
+  // Weapon byte: active weapon index (low nibble, drives the held model) and
+  // class primary index (high nibble, drives the character model).
+  weapon: number;
   x: number; // feet
   y: number;
   z: number;
   yaw: number;
   pitch: number;
+}
+
+export function packWeaponByte(active: number, primary: number): number {
+  return (active & 0xf) | ((primary & 0xf) << 4);
+}
+
+export function weaponByteActive(w: number): number {
+  return w & 0xf;
+}
+
+export function weaponBytePrimary(w: number): number {
+  return (w >> 4) & 0xf;
 }
 
 export interface EntitySnap {
@@ -198,8 +216,10 @@ export interface Snapshot {
 }
 
 const SELF_FIXED = 4 + 4 + 1 + 1 + 1 + 2; // ack, tick, status, depth, hp, respawn
-const SELF_STATE = 6 * 8 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 4; // pos/vel f64, flags+counters, jumpElapsed f32
-const REMOTE_BYTES = 1 + 1 + 3 * 4 + 4 + 2;
+// pos/vel f64, flags, counters (coyote/cooldown/reload/ammo/ammo2/slotPrimary/
+// recoil/grenades/supply), jumpElapsed f32
+const SELF_STATE = 6 * 8 + 1 + 9 + 4;
+const REMOTE_BYTES = 1 + 1 + 1 + 3 * 4 + 4 + 2;
 const ENTITY_BYTES = 1 + 6 * 4 + 1;
 const CHUNK_BYTES = 2 + 7 * 4;
 const ZONE_BYTES = 2;
@@ -261,9 +281,12 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
   dv.setUint8(o + 2, st.cooldownTicks);
   dv.setUint8(o + 3, st.reloadTicks);
   dv.setUint8(o + 4, st.ammo);
-  dv.setUint8(o + 5, st.grenades);
-  dv.setUint8(o + 6, st.supply);
-  o += 7;
+  dv.setUint8(o + 5, st.ammo2);
+  dv.setUint8(o + 6, packWeaponByte(st.slot, st.primary));
+  dv.setUint8(o + 7, st.recoilTicks);
+  dv.setUint8(o + 8, st.grenades);
+  dv.setUint8(o + 9, st.supply);
+  o += 10;
   dv.setFloat32(o, st.jumpElapsed, true);
   o += 4;
 
@@ -271,11 +294,12 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
   for (const r of snap.remotes) {
     dv.setUint8(o, r.idx);
     dv.setUint8(o + 1, r.flags);
-    dv.setFloat32(o + 2, r.x);
-    dv.setFloat32(o + 6, r.y);
-    dv.setFloat32(o + 10, r.z);
-    dv.setFloat32(o + 14, r.yaw);
-    dv.setInt16(o + 18, Math.round(r.pitch * ANGLE_SCALE) | 0);
+    dv.setUint8(o + 2, r.weapon);
+    dv.setFloat32(o + 3, r.x);
+    dv.setFloat32(o + 7, r.y);
+    dv.setFloat32(o + 11, r.z);
+    dv.setFloat32(o + 15, r.yaw);
+    dv.setInt16(o + 19, Math.round(r.pitch * ANGLE_SCALE) | 0);
     o += REMOTE_BYTES;
   }
 
@@ -368,11 +392,15 @@ export function decodeSnapshot(bytes: Uint8Array): Snapshot | null {
     cooldownTicks: dv.getUint8(o + 2),
     reloadTicks: dv.getUint8(o + 3),
     ammo: dv.getUint8(o + 4),
-    grenades: dv.getUint8(o + 5),
-    supply: dv.getUint8(o + 6),
-    jumpElapsed: dv.getFloat32(o + 7, true),
+    ammo2: dv.getUint8(o + 5),
+    slot: weaponByteActive(dv.getUint8(o + 6)),
+    primary: weaponBytePrimary(dv.getUint8(o + 6)),
+    recoilTicks: dv.getUint8(o + 7),
+    grenades: dv.getUint8(o + 8),
+    supply: dv.getUint8(o + 9),
+    jumpElapsed: dv.getFloat32(o + 10, true),
   };
-  o += 11;
+  o += 14;
 
   const remotes: RemoteSnap[] = [];
   const remoteCount = dv.getUint8(o++);
@@ -381,11 +409,12 @@ export function decodeSnapshot(bytes: Uint8Array): Snapshot | null {
     remotes.push({
       idx: dv.getUint8(o),
       flags: dv.getUint8(o + 1),
-      x: dv.getFloat32(o + 2),
-      y: dv.getFloat32(o + 6),
-      z: dv.getFloat32(o + 10),
-      yaw: dv.getFloat32(o + 14),
-      pitch: dv.getInt16(o + 18) / ANGLE_SCALE,
+      weapon: dv.getUint8(o + 2),
+      x: dv.getFloat32(o + 3),
+      y: dv.getFloat32(o + 7),
+      z: dv.getFloat32(o + 11),
+      yaw: dv.getFloat32(o + 15),
+      pitch: dv.getInt16(o + 19) / ANGLE_SCALE,
     });
     o += REMOTE_BYTES;
   }
