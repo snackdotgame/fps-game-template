@@ -2989,9 +2989,10 @@ function predictionTick(): void {
     onFire: (_eye, dir) => {
       const w = predState ? activeWeapon(predState) : WEAPON_LIST[0];
       sounds.shot(w.name);
-      // Visual camera kick scales with the weapon's real recoil — the
-      // revolver (0.13) slams the view, the rifle nudges it.
-      recoil = Math.min(1, recoil + (w.kick > 0.1 ? 1 : w.kick > 0.06 ? 0.7 : 0.4));
+      // Visual camera kick scales with the weapon's real recoil — heavy guns
+      // (sniper, revolver) blow past the light-weapon cap and slam the view,
+      // the rifle nudges it.
+      recoil = Math.min(1.6, recoil + (w.kick > 0.1 ? 1.5 : w.kick > 0.06 ? 0.7 : 0.4));
       // Predicted tracers from local raycasts — instant feedback; the
       // server's events remain authoritative for hits and damage. Rays start
       // at the barrel like the server's (dir already carries recoil), and
@@ -4345,8 +4346,9 @@ function frame(): void {
       (selfStatus & SS_DEAD) === 0 &&
       predState !== null &&
       predState.slot === 0 &&
-      predState.primary === WEAPON_IDX.sniper;
-    if (!canScope) scopeActive = false; // swapping/dying/unlocking unscopes
+      predState.primary === WEAPON_IDX.sniper &&
+      predState.reloadTicks === 0; // reloading forces you out of the scope
+    if (!canScope) scopeActive = false; // swap/death/unlock/reload unscopes
     const scoped = scopeActive;
     scopeBlend += ((scoped ? 1 : 0) - scopeBlend) * Math.min(1, dt * 14);
     if (scopeBlend < 0.005) scopeBlend = 0;
