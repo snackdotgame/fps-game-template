@@ -45,6 +45,7 @@ import {
   buildContactIndex,
   type Crater,
   heightAt,
+  inEnemyBase,
   MAP,
   PANEL_HP,
   type PanelDef,
@@ -212,11 +213,16 @@ interface AttackHit {
   headshot: boolean;
 }
 
-const panelById = new Map(MAP.panels.map((p) => [p.id, p]));
+// Per-map indexes over the static piece list. The map REGENERATES from a new
+// seed every round, so these rebuild in init()/reset() (after initMap has
+// swapped MAP's contents), not once at module load.
+let panelById = new Map(MAP.panels.map((p) => [p.id, p]));
+let CONTACTS = buildContactIndex();
 
-// Static structural contact graph (who touches whom) — computed once; the
-// map regenerates identically every round.
-const CONTACTS = buildContactIndex();
+function rebuildMapIndexes(): void {
+  panelById = new Map(MAP.panels.map((p) => [p.id, p]));
+  CONTACTS = buildContactIndex();
+}
 
 const RELEASE_PIECES_PER_TICK = 80;
 
@@ -296,6 +302,7 @@ export class GameSim {
   }
 
   async init(): Promise<void> {
+    rebuildMapIndexes();
     this.gw = await createGameWorld();
   }
 
@@ -1052,7 +1059,12 @@ export class GameSim {
       if (p.dead || this.phase !== "playing") {
         p.oobSinceTick = -1;
       } else {
-        const oob = Math.abs(p.state.x) > PLAY_HALF || Math.abs(p.state.z) > PLAY_HALF;
+        // Past the play boundary OR camping inside the enemy's home bowl —
+        // both start the return-or-die countdown.
+        const oob =
+          Math.abs(p.state.x) > PLAY_HALF ||
+          Math.abs(p.state.z) > PLAY_HALF ||
+          inEnemyBase(p.team, p.state.x, p.state.z);
         if (!oob) {
           p.oobSinceTick = -1;
         } else if (p.oobSinceTick < 0) {
@@ -1218,6 +1230,7 @@ export class GameSim {
     this.releaseQueue.length = 0;
     this.dirtySlabs.clear();
     resetCraters();
+    rebuildMapIndexes(); // the server re-seeds the map (initMap) before reset
     this.gw = await createGameWorld();
     this.panelHp.clear();
     this.destroyedPanels.clear();

@@ -20,7 +20,8 @@ export type ServerMsg =
       phase: "playing" | "results";
       phaseEndTick: number;
       scores: [number, number];
-      mapEpoch: number; // bumps every round restart (map fully restored)
+      mapEpoch: number; // bumps every round restart (a fresh map each round)
+      mapSeed: number; // generate THIS world before applying anything below
       destroyed: number[]; // panel ids gone this round
       built: PanelDef[]; // deployed cover + rubble chunks alive this round
       collapsed: number[]; // building ids that crumbled this round
@@ -55,6 +56,7 @@ export type ServerMsg =
       phaseEndTick: number;
       scores: [number, number];
       mapEpoch: number;
+      mapSeed: number; // a new epoch means a new world: rebuild from this
     };
 
 export function parseServerMsg(data: unknown): ServerMsg | null {
