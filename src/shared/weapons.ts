@@ -66,9 +66,9 @@ export const WEAPONS = {
   },
   sniper: {
     name: "Sniper",
-    damage: 80,
-    headshotMult: 2.5,
-    cooldownTicks: 30,
+    damage: 55, // two body shots to kill...
+    headshotMult: 2, // ...but a headshot (110) drops in one
+    cooldownTicks: 42, // 1.4s bolt cycle between shots
     mag: 5,
     reloadTicks: 84,
     range: 220,
@@ -76,7 +76,7 @@ export const WEAPONS = {
     spreadBase: 0.0005,
     spreadMove: 0.03,
     spreadAir: 0.13,
-    kick: 0.09,
+    kick: 0.15, // hardest-bucking gun in the game
   },
   pistol: {
     name: "Pistol",
