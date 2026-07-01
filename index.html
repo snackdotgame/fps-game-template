@@ -6,7 +6,7 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
     />
-    <title>Snack Game</title>
+    <title>Flag Conquest</title>
     <style>
       html,
       body {
@@ -15,10 +15,55 @@
         overscroll-behavior: none;
         background: #0c0f14;
       }
+      /* Static boot splash: pure HTML/CSS so it paints before any script runs
+         (the map generates synchronously at module load, which would otherwise
+         leave a black screen). client.ts removes it once the intro UI mounts. */
+      #boot {
+        position: fixed;
+        inset: 0;
+        z-index: 90;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 16px;
+        background: radial-gradient(1100px 620px at 50% 30%, #1a2434 0%, #0d1220 55%, #070a12 100%);
+        color: #fff;
+        font-family: "Trebuchet MS", system-ui, sans-serif;
+      }
+      #boot .bt {
+        font-size: 34px;
+        font-weight: 900;
+        letter-spacing: 5px;
+      }
+      #boot .bs {
+        width: 34px;
+        height: 34px;
+        border-radius: 50%;
+        border: 3px solid rgba(255, 255, 255, 0.15);
+        border-top-color: #3f7ff0;
+        animation: bootspin 0.9s linear infinite;
+      }
+      #boot .bl {
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 3px;
+        opacity: 0.6;
+      }
+      @keyframes bootspin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
     </style>
   </head>
   <body>
     <div id="app"></div>
+    <div id="boot">
+      <div class="bt">FLAG CONQUEST</div>
+      <div class="bs"></div>
+      <div class="bl">LOADING&hellip;</div>
+    </div>
     <script type="module" src="/src/client.ts"></script>
   </body>
 </html>

@@ -1148,6 +1148,30 @@ hud.innerHTML = `
   #oob .b { font-size:30px; font-weight:900; color:#ffe2e2; text-shadow:0 2px 8px #000; letter-spacing:2px; }
   #oob .s { font-size:15px; font-weight:700; color:#ffd0d0; opacity:.9; margin-top:4px; }
   #oob .c { font-size:72px; font-weight:900; color:#fff; text-shadow:0 3px 12px #000; margin-top:6px; }
+  /* Intro / deploy screen. Opaque on purpose: it doubles as the loading screen,
+     so the world (and any placeholder assets) never shows before deploy. */
+  #intro { position:fixed; inset:0; z-index:100; display:flex; align-items:center; justify-content:center; pointer-events:auto;
+    background:radial-gradient(1100px 620px at 50% 30%, #1a2434 0%, #0d1220 55%, #070a12 100%); }
+  #intro .ip { width:min(520px, calc(100vw - 40px)); max-height:calc(100vh - 30px); overflow-y:auto; box-sizing:border-box; text-align:center;
+    padding:26px 34px 24px; background:rgba(12,16,26,.78); border:1px solid rgba(255,255,255,.09); border-radius:18px;
+    box-shadow:0 40px 120px -30px rgba(0,0,0,.9); }
+  #intro h1 { margin:0; font-size:34px; letter-spacing:5px; }
+  #intro .isub { font-size:12px; font-weight:700; letter-spacing:4px; opacity:.6; margin-top:2px; }
+  #introTeam { display:inline-block; margin:14px 0 0; padding:8px 26px; border-radius:10px; font-weight:900; font-size:15px;
+    letter-spacing:1.5px; background:rgba(255,255,255,.1); box-shadow:0 6px 24px -8px rgba(0,0,0,.8); }
+  #intro .igoal { margin:14px auto 0; font-size:14px; line-height:1.5; opacity:.92; max-width:400px; }
+  #intro .igoal b { color:#ffd76a; }
+  #introKeys { display:grid; grid-template-columns:1fr 1fr; gap:7px 20px; margin:16px auto 0; max-width:410px; text-align:left; font-size:13px; }
+  #introKeys .krow { display:flex; align-items:center; gap:9px; }
+  #introKeys kbd { flex:0 0 auto; min-width:32px; text-align:center; padding:3px 7px; border-radius:6px; background:rgba(255,255,255,.12);
+    border:1px solid rgba(255,255,255,.18); border-bottom-width:2px; font:700 12px/1.2 ui-monospace,monospace; }
+  #introKeys span { opacity:.85; }
+  #deploy { margin-top:20px; width:100%; padding:13px 0; font:900 16px/1 "Trebuchet MS",system-ui,sans-serif; letter-spacing:2px;
+    color:#fff; background:#2f6fe0; border:0; border-radius:12px; cursor:pointer; transition:background 120ms ease, transform 80ms ease; }
+  #deploy:hover:not(:disabled) { background:#3f7ff0; }
+  #deploy:active:not(:disabled) { transform:scale(.98); }
+  #deploy:disabled { background:rgba(255,255,255,.12); color:rgba(255,255,255,.55); cursor:default; }
+  #introStatus { margin-top:9px; font-size:12px; opacity:.6; min-height:14px; }
 </style>
 <div id="hud">
   <div id="audioMenu" data-open="false">
@@ -1189,6 +1213,17 @@ hud.innerHTML = `
   <div id="board"></div>
   <div id="hint" class="sh">click to play — WASD move · shift sprint · space jump · LMB fire · R reload · G grenade · F sledge · Q build cover · Tab scores</div>
   <div id="netinfo" class="sh"></div>
+  <div id="intro">
+    <div class="ip">
+      <h1>FLAG CONQUEST</h1>
+      <div class="isub">CAPTURE · CONTROL · CONQUER</div>
+      <div id="introTeam">ASSIGNING TEAM…</div>
+      <div class="igoal"><b>Capture and control the flags.</b> Hold more zones (A · B · C) than the enemy to bleed their tickets — every death costs one too. First team to run the other down to zero wins.</div>
+      <div id="introKeys"></div>
+      <button id="deploy" type="button" disabled>LOADING…</button>
+      <div id="introStatus"></div>
+    </div>
+  </div>
 </div>`;
 document.body.appendChild(hud);
 const el = {
@@ -1217,6 +1252,11 @@ const el = {
   flash: document.getElementById("flash")!,
   oob: document.getElementById("oob")!,
   oobtimer: document.getElementById("oobtimer")!,
+  intro: document.getElementById("intro")!,
+  introTeam: document.getElementById("introTeam")!,
+  introKeys: document.getElementById("introKeys")!,
+  introStatus: document.getElementById("introStatus")!,
+  deploy: document.getElementById("deploy") as HTMLButtonElement,
 };
 
 function updateAudioMenu(): void {
@@ -2171,6 +2211,10 @@ function nameOf(idx: number): string {
   return roster.get(idx)?.name ?? `player ${idx}`;
 }
 
+function myTeam(): number {
+  return roster.get(selfIdx)?.team ?? -1;
+}
+
 function teamSpan(idx: number): string {
   const team = roster.get(idx)?.team ?? 0;
   return `<span style="color:${TEAM_COLORS_CSS[team]}">${escapeHtml(nameOf(idx))}</span>`;
@@ -2193,11 +2237,17 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       resetCraters();
       for (const c of msg.craters) addCrater(c);
       lastAckTick = msg.serverTick;
+      refreshAllNameTags();
       void buildWorlds();
       break;
     }
     case "join": {
       roster.set(msg.player.idx, msg.player);
+      const joinedRp = remotes.get(msg.player.idx);
+      if (joinedRp) {
+        joinedRp.info = msg.player;
+        refreshNameTag(joinedRp);
+      }
       if (msg.player.idx !== selfIdx) {
         feed(`${teamSpan(msg.player.idx)} joined`);
       }
@@ -2421,6 +2471,7 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
       };
       remotes.set(r.idx, rp);
       attachExternalSoldier(rp); // swaps in the animated model when ready
+      refreshNameTag(rp);
     }
     const prevFlags = rp.lastFlags;
     const wasNew = rp.buffer.length === 0;
@@ -3204,28 +3255,55 @@ function makeSoldier(team: number, name: string): THREE.Group {
   // model load) so the old procedural soldier never flashes at round start.
   bodyRoot.visible = false;
 
-  // Name tag.
+  // Name tag: hidden until refreshNameTag decides it belongs to a teammate
+  // (enemies never show tags), and redrawn when the roster's real username
+  // lands (the first snapshot can beat the join/welcome message).
   const canvas = document.createElement("canvas");
   canvas.width = 256;
   canvas.height = 56;
+  const sprite = new THREE.Sprite(
+    new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), depthTest: false }),
+  );
+  sprite.scale.set(1.7, 0.37, 1);
+  sprite.position.y = 1.95;
+  sprite.visible = false;
+  drawNameTag(sprite, name, TEAM_COLORS_CSS[team]);
+  g.userData.nameSprite = sprite;
+  g.add(sprite);
+
+  scene.add(g);
+  return g;
+}
+
+function drawNameTag(sprite: THREE.Sprite, name: string, colorCss: string): void {
+  const map = (sprite.material as THREE.SpriteMaterial).map as THREE.CanvasTexture;
+  const canvas = map.image as HTMLCanvasElement;
   const ctx = canvas.getContext("2d")!;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   ctx.font = "bold 30px Trebuchet MS, sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.lineWidth = 6;
   ctx.strokeStyle = "rgba(0,0,0,.6)";
   ctx.strokeText(name, 128, 28);
-  ctx.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
+  ctx.fillStyle = colorCss;
   ctx.fillText(name, 128, 28);
-  const sprite = new THREE.Sprite(
-    new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), depthTest: false }),
-  );
-  sprite.scale.set(1.7, 0.37, 1);
-  sprite.position.y = 1.95;
-  g.add(sprite);
+  map.needsUpdate = true;
+}
 
-  scene.add(g);
-  return g;
+function refreshNameTag(rp: RemotePlayer): void {
+  const sprite = rp.group.userData.nameSprite as THREE.Sprite | undefined;
+  if (!sprite) return;
+  drawNameTag(sprite, rp.info.name, TEAM_COLORS_CSS[rp.info.team] ?? "#fff");
+  sprite.visible = rp.info.team === myTeam();
+}
+
+function refreshAllNameTags(): void {
+  for (const rp of remotes.values()) {
+    const info = roster.get(rp.info.idx);
+    if (info) rp.info = info;
+    refreshNameTag(rp);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4110,9 +4188,11 @@ function shortestArc(a: number, b: number): number {
   return d;
 }
 
-// Friend-or-foe under the crosshair: orange/blue crosshair + name, so
-// shooting a teammate never reads as broken hit detection.
+// Friend-or-foe under the crosshair: green crosshair + name for teammates,
+// red for enemies, so shooting a teammate never reads as broken hit detection.
 let crossTargetIdx = -1;
+const CROSS_FRIENDLY = "#3ddc78";
+const CROSS_ENEMY = "#ff5a4a";
 
 function updateCrosshairTarget(): void {
   if (!predState || !gw || !selfBody) return;
@@ -4125,10 +4205,10 @@ function updateCrosshairTarget(): void {
   crossTargetIdx = idx;
   const info = idx >= 0 ? roster.get(idx) : undefined;
   if (info) {
-    const friendly = info.team === (roster.get(selfIdx)?.team ?? -1);
-    const color = friendly ? TEAM_COLORS_CSS[info.team] : "#ff5a4a";
+    const friendly = info.team === myTeam();
+    const color = friendly ? CROSS_FRIENDLY : CROSS_ENEMY;
     el.cross.style.color = color;
-    el.crossname.style.color = TEAM_COLORS_CSS[info.team];
+    el.crossname.style.color = color;
     el.crossname.textContent = `${info.name}${friendly ? " (friendly)" : ""}`;
     el.crossname.style.opacity = "1";
   } else {
@@ -4165,7 +4245,11 @@ function updateHud(): void {
   }
 
   const dead = (selfStatus & SS_DEAD) !== 0;
-  if (phase === "results") {
+  if (introVisible) {
+    // The intro/deploy screen owns the viewport; the state overlay would just
+    // bleed through behind it.
+    el.overlay.style.display = "none";
+  } else if (phase === "results") {
     const winner =
       scores[0] === scores[1] ? "Draw" : `${TEAM_NAMES[scores[0] > scores[1] ? 0 : 1]} wins`;
     el.overlaypanel.innerHTML = `<h1>${winner}</h1><p>${scores[0]} — ${scores[1]}</p><p>next round starting…</p>`;
@@ -4174,7 +4258,7 @@ function updateHud(): void {
     el.overlaypanel.innerHTML = `<h1>You're down</h1><p>respawn in ${Math.ceil(respawnTicks / TICK_RATE)}s</p>`;
     el.overlay.style.display = "flex";
   } else if (!connected) {
-    el.overlaypanel.innerHTML = `<h1>Breachpoint</h1><p>connecting…</p>`;
+    el.overlaypanel.innerHTML = `<h1>Flag Conquest</h1><p>connecting…</p>`;
     el.overlay.style.display = "flex";
   } else {
     el.overlay.style.display = "none";
@@ -4200,6 +4284,96 @@ function updateHud(): void {
     0,
   )}fps · ${perf.avgFrameMs.toFixed(1)}ms`;
 }
+
+// ---------------------------------------------------------------------------
+// Intro / deploy screen: the opaque first-connect UI. It tells the player
+// their team, the goal, and the controls, and doubles as the loading gate —
+// DEPLOY only unlocks once the visual assets and the welcome message are in,
+// so neither the world nor placeholder models are ever seen early.
+
+let introVisible = true;
+let introAssetsTimedOut = false;
+const INTRO_BORN_AT = performance.now();
+// Past this, stop holding the door for missing/failed assets — deploy with
+// the procedural fallbacks rather than blocking play forever.
+const INTRO_ASSET_TIMEOUT_MS = 12_000;
+
+const keyRow = (k: string, label: string): string =>
+  `<div class="krow"><kbd>${k}</kbd><span>${label}</span></div>`;
+el.introKeys.innerHTML = wantsTouch
+  ? keyRow("◐", "left half — drag to move") +
+    keyRow("◑", "right half — drag to aim") +
+    keyRow("◎", "big button — fire") +
+    keyRow("▲", "side buttons — jump · sprint · build") +
+    keyRow("♻", "more — reload · grenade · sledge") +
+    keyRow("⚑", "stand in a zone to capture it")
+  : keyRow("WASD", "move") +
+    keyRow("LMB", "fire") +
+    keyRow("Shift", "sprint") +
+    keyRow("Space", "jump") +
+    keyRow("R", "reload") +
+    keyRow("G", "grenade") +
+    keyRow("F", "sledgehammer") +
+    keyRow("Q", "build cover") +
+    keyRow("Tab", "scoreboard");
+
+function introAssetsLoaded(): { loaded: number; total: number } {
+  const parts = [
+    characterTemplates[0] !== null,
+    viewModel.userData.externalAttached === true,
+    grenadeTemplate !== null,
+  ];
+  return { loaded: parts.filter(Boolean).length, total: parts.length };
+}
+
+function introReady(): boolean {
+  const { loaded, total } = introAssetsLoaded();
+  return (introAssetsTimedOut || loaded >= total) && connected && selfIdx >= 0;
+}
+
+function updateIntroPanel(): void {
+  const info = roster.get(selfIdx);
+  if (info) {
+    el.introTeam.textContent = `YOU'RE ON TEAM ${TEAM_NAMES[info.team].toUpperCase()}`;
+    el.introTeam.style.background = TEAM_COLORS_CSS[info.team];
+  }
+  const { loaded, total } = introAssetsLoaded();
+  const assetsReady = introAssetsTimedOut || loaded >= total;
+  if (introReady()) {
+    el.deploy.disabled = false;
+    el.deploy.textContent = "DEPLOY";
+    el.introStatus.textContent = wantsTouch ? "tap to enter the battlefield" : "good hunting";
+  } else {
+    el.deploy.disabled = true;
+    el.deploy.textContent = assetsReady ? "CONNECTING…" : `LOADING ASSETS ${loaded}/${total}…`;
+    el.introStatus.textContent = assetsReady ? "waiting for the server…" : "fetching models…";
+  }
+}
+
+const introTimer = setInterval(() => {
+  if (!introVisible) return;
+  if (performance.now() - INTRO_BORN_AT > INTRO_ASSET_TIMEOUT_MS) introAssetsTimedOut = true;
+  updateIntroPanel();
+}, 150);
+
+function dismissIntro(): void {
+  if (!introVisible) return;
+  introVisible = false;
+  clearInterval(introTimer);
+  el.intro.style.display = "none";
+  ensureAudio();
+  if (!wantsTouch) renderer.domElement.requestPointerLock();
+}
+
+function tryDeploy(): void {
+  if (introReady()) dismissIntro();
+}
+
+// Clicks on the DEPLOY button bubble here too; tryDeploy gates on readiness.
+el.intro.addEventListener("click", tryDeploy);
+updateIntroPanel();
+// The intro has taken over the viewport — retire index.html's boot splash.
+document.getElementById("boot")?.remove();
 
 // ---------------------------------------------------------------------------
 // Boot.
@@ -4269,6 +4443,9 @@ declare global {
       forceAudio(): void;
       audioVolume(): number;
       setAudioVolume(value: number): void;
+      introVisible(): boolean;
+      deploy(): void;
+      nameTags(): Array<{ idx: number; name: string; visible: boolean }>;
       perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
       drive(over: Partial<Omit<InputCmd, "seq">> & { trackIdx?: number }, ticks: number): void;
@@ -4337,6 +4514,13 @@ window.__fps = {
     ensureAudio();
     setMasterVolume(value);
   },
+  introVisible: () => introVisible,
+  deploy: () => dismissIntro(), // force-dismiss for scripted playtests
+  nameTags: () =>
+    [...remotes.entries()].map(([idx, rp]) => {
+      const sprite = rp.group.userData.nameSprite as THREE.Sprite | undefined;
+      return { idx, name: rp.info.name, visible: sprite?.visible === true };
+    }),
   perf: () => ({
     fps: perf.fps,
     avgFrameMs: perf.avgFrameMs,

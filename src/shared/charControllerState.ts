@@ -18,11 +18,7 @@ const FLAG_CAN_JUMP = 1 << 1;
 const FLAG_JUMP_ACTIVE = 1 << 2;
 
 // Write one controller state at `offset`; returns the next free byte offset.
-export function writeCharControllerState(
-  state: SyncState,
-  view: DataView,
-  offset = 0,
-): number {
+export function writeCharControllerState(state: SyncState, view: DataView, offset = 0): number {
   let o = offset;
   const f = (n: number): void => {
     view.setFloat32(o, n, true);

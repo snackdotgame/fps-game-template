@@ -1,4 +1,4 @@
-# Breachpoint
+# Flag Conquest
 
 A BattleBit-inspired multiplayer FPS built with [three.js](https://threejs.org) on the
 [Snack](https://snack.game) platform, with [Jolt Physics](https://github.com/jrouwe/JoltPhysics)
