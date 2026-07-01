@@ -473,6 +473,24 @@ export class GameSim {
       if (castWallDistance(this.gw, eye, toMuzzle, mDist).dist >= mDist - 1e-3) origin = mo;
     }
 
+    // The barrel sits off the eye line, and parallel rays never meet it — a
+    // shot fired straight along the view direction from the muzzle lands a
+    // constant ~0.25m off the crosshair at EVERY range, which a scoped
+    // sniper reads as "the bullet didn't go where I aimed". Converge
+    // instead: aim the barrel at whatever the EYE ray sees.
+    let baseDir = dir;
+    if (origin === mo) {
+      const aimDist = Math.max(
+        2,
+        Math.min(w.range, castWallDistance(this.gw, eye, dir, w.range).dist),
+      );
+      const cx = eye[0] + dir[0] * aimDist - mo[0];
+      const cy = eye[1] + dir[1] * aimDist - mo[1];
+      const cz = eye[2] + dir[2] * aimDist - mo[2];
+      const cl = Math.hypot(cx, cy, cz) || 1;
+      baseDir = [cx / cl, cy / cl, cz / cl];
+    }
+
     const rewind = this.rewindFor(p, opts);
     const pellets = w.pellets ?? 1;
     // Caps keep a shotgun blast from flooding the event ring: a few tracers
@@ -487,7 +505,7 @@ export class GameSim {
     >();
     for (let i = 0; i < pellets; i++) {
       const spread = spreadFor(p.state);
-      const d = perturb(dir, (this.rng() - 0.5) * 2 * spread, (this.rng() - 0.5) * 2 * spread);
+      const d = perturb(baseDir, (this.rng() - 0.5) * 2 * spread, (this.rng() - 0.5) * 2 * spread);
       const hit = this.resolveAttack(p, origin, d, w.range, rewind);
       if (tracersLeft-- > 0) this.pushEvent(EV_TRACER, p.idx, hit.point);
       if (hit.victim) {
