@@ -472,20 +472,29 @@ export class GameSim {
     // and one hit event per victim still read clearly on every client.
     let tracersLeft = Math.min(pellets, 3);
     let panelHitsLeft = 2;
-    const victimsHit = new Set<number>();
+    // Damage is tallied per victim across the whole blast (one damagePlayer
+    // call each) so pellet-count rules like the point-blank kill can apply.
+    const victims = new Map<
+      SimPlayer,
+      { dmg: number; hits: number; point: [number, number, number]; minDistSq: number }
+    >();
     for (let i = 0; i < pellets; i++) {
       const spread = spreadFor(p.state);
       const d = perturb(dir, (this.rng() - 0.5) * 2 * spread, (this.rng() - 0.5) * 2 * spread);
       const hit = this.resolveAttack(p, origin, d, w.range, rewind);
       if (tracersLeft-- > 0) this.pushEvent(EV_TRACER, p.idx, hit.point);
       if (hit.victim) {
-        const dmg = hit.headshot ? Math.round(w.damage * w.headshotMult) : w.damage;
-        this.damagePlayer(hit.victim, dmg, p, "rifle");
-        if (!victimsHit.has(hit.victim.idx)) {
-          victimsHit.add(hit.victim.idx);
-          // a packs victim (low nibble) and shooter (high nibble): idx < 16.
-          this.pushEvent(EV_HIT_PLAYER, (hit.victim.idx & 0xf) | ((p.idx & 0xf) << 4), hit.point);
+        let tally = victims.get(hit.victim);
+        if (!tally) {
+          tally = { dmg: 0, hits: 0, point: hit.point, minDistSq: Infinity };
+          victims.set(hit.victim, tally);
         }
+        tally.dmg += hit.headshot ? Math.round(w.damage * w.headshotMult) : w.damage;
+        tally.hits++;
+        const dx = hit.point[0] - origin[0];
+        const dy = hit.point[1] - origin[1];
+        const dz = hit.point[2] - origin[2];
+        tally.minDistSq = Math.min(tally.minDistSq, dx * dx + dy * dy + dz * dz);
       } else if (hit.panelBody) {
         const pieceId = pieceIdFromHit(hit.panelBody, hit.point, this.pieceAlive);
         if (pieceId !== null) {
@@ -493,6 +502,20 @@ export class GameSim {
           if (panelHitsLeft-- > 0) this.pushEvent(EV_PANEL_HIT, 0, hit.point);
         }
       }
+    }
+    for (const [victim, tally] of victims) {
+      // Point-blank devastation: in your face with ~90% of the pellets on
+      // target, a body-shot blast is lethal outright.
+      if (
+        w.pointBlankRange !== undefined &&
+        tally.hits >= Math.round(pellets * 0.9) &&
+        tally.minDistSq <= w.pointBlankRange * w.pointBlankRange
+      ) {
+        tally.dmg = Math.max(tally.dmg, MAX_HP);
+      }
+      this.damagePlayer(victim, tally.dmg, p, "rifle");
+      // a packs victim (low nibble) and shooter (high nibble): idx < 16.
+      this.pushEvent(EV_HIT_PLAYER, (victim.idx & 0xf) | ((p.idx & 0xf) << 4), tally.point);
     }
   }
 
