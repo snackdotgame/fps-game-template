@@ -24,7 +24,7 @@
         "description": "Target player count filled by bots. Set to 0 to run without bots."
       }
     },
-    "name": "Breachpoint",
+    "name": "Flag Conquest",
     "titleImage": "assets/breachpoint-cover.webp",
     "genre": "shooter",
     "visibility": "public",
