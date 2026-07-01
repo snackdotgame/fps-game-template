@@ -18,6 +18,9 @@ export interface WeaponDef {
   kick: number; // recoil: upward path deviation (radians) at full climb
   semiAuto?: boolean; // one shot per trigger pull (no hold-to-fire)
   pellets?: number; // pellet weapons fire this many rays per shot
+  // Within this range, a blast that lands ~90% of its pellets on one target
+  // is lethal outright (pellet weapons only).
+  pointBlankRange?: number;
 }
 
 export const WEAPONS = {
@@ -63,6 +66,7 @@ export const WEAPONS = {
     spreadAir: 0.09,
     kick: 0.07,
     pellets: 7,
+    pointBlankRange: 7, // in your face + ~90% of pellets = one body shot
   },
   sniper: {
     name: "Sniper",
