@@ -57,7 +57,6 @@ import {
   type Snapshot,
   SS_DEAD,
   weaponByteActive,
-  weaponBytePrimary,
   type ZoneSnap,
 } from "./shared/netCodec.js";
 import {
@@ -69,6 +68,8 @@ import {
   buildPlacement,
   type CharState,
   muzzleOrigin,
+  perturb,
+  spreadFor,
   createGameWorld,
   createGrenadeBody,
   createPlayerBody,
@@ -1186,6 +1187,12 @@ hud.innerHTML = `
   .audio-toggle { display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:42px; box-sizing:border-box; padding:9px 10px; color:rgb(245,245,245); font-size:13px; font-weight:650; background:rgba(255,255,255,.035); border:1px solid rgba(255,255,255,.1); border-radius:8px; }
   .audio-toggle input { width:18px; height:18px; margin:0; accent-color:rgb(0,145,255); cursor:pointer; }
   #cross { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); font-size:22px; opacity:.9; }
+  /* Sniper scope mask (RMB while holding the sniper): a clear circle inside
+     black, with thin reticle lines through the center. */
+  #scope { position:absolute; inset:0; display:none; pointer-events:none;
+    background:radial-gradient(circle at 50% 50%, rgba(0,0,0,0) 30vmin, rgba(3,5,9,.985) 33vmin); }
+  #scope .sv { position:absolute; left:50%; top:0; width:2px; height:100%; transform:translateX(-1px); background:rgba(8,10,14,.75); }
+  #scope .shz { position:absolute; top:50%; left:0; height:2px; width:100%; transform:translateY(-1px); background:rgba(8,10,14,.75); }
   #crossname { position:absolute; left:50%; top:54%; transform:translateX(-50%); font-size:14px; font-weight:800; opacity:0; }
   #hitmark { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%) rotate(45deg); font-size:26px; color:#ff5a4a; opacity:0; font-weight:900; }
   #scores { position:absolute; top:12px; left:50%; transform:translateX(-50%); font-size:22px; font-weight:900; background:rgba(10,14,22,.55); padding:6px 18px; border-radius:10px; }
@@ -1221,29 +1228,29 @@ hud.innerHTML = `
      so the world (and any placeholder assets) never shows before deploy. */
   #intro { position:fixed; inset:0; z-index:100; display:flex; align-items:center; justify-content:center; pointer-events:auto;
     background:radial-gradient(1100px 620px at 50% 30%, #1a2434 0%, #0d1220 55%, #070a12 100%); }
-  #intro .ip { width:min(520px, calc(100vw - 40px)); max-height:calc(100vh - 30px); overflow-y:auto; box-sizing:border-box; text-align:center;
-    padding:26px 34px 24px; background:rgba(12,16,26,.78); border:1px solid rgba(255,255,255,.09); border-radius:18px;
+  #intro .ip { width:min(520px, calc(100vw - 40px)); max-height:calc(100vh - 24px); overflow-y:auto; box-sizing:border-box; text-align:center;
+    padding:18px 32px 16px; background:rgba(12,16,26,.78); border:1px solid rgba(255,255,255,.09); border-radius:18px;
     box-shadow:0 40px 120px -30px rgba(0,0,0,.9); }
-  #intro h1 { margin:0; font-size:34px; letter-spacing:5px; }
+  #intro h1 { margin:0; font-size:30px; letter-spacing:5px; }
   #intro .isub { font-size:12px; font-weight:700; letter-spacing:4px; opacity:.6; margin-top:2px; }
-  #introTeam { display:inline-block; margin:14px 0 0; padding:8px 26px; border-radius:10px; font-weight:900; font-size:15px;
+  #introTeam { display:inline-block; margin:10px 0 0; padding:7px 24px; border-radius:10px; font-weight:900; font-size:14px;
     letter-spacing:1.5px; background:rgba(255,255,255,.1); box-shadow:0 6px 24px -8px rgba(0,0,0,.8); }
-  #intro .igoal { margin:14px auto 0; font-size:14px; line-height:1.5; opacity:.92; max-width:400px; }
+  #intro .igoal { margin:10px auto 0; font-size:14px; line-height:1.5; opacity:.92; max-width:400px; }
   #intro .igoal b { color:#ffd76a; }
-  #introKeys { display:grid; grid-template-columns:1fr 1fr; gap:7px 20px; margin:16px auto 0; max-width:410px; text-align:left; font-size:13px; }
+  #introKeys { display:grid; grid-template-columns:1fr 1fr; gap:5px 18px; margin:10px auto 0; max-width:410px; text-align:left; font-size:12px; }
   #introKeys .krow { display:flex; align-items:center; gap:9px; }
   #introKeys kbd { flex:0 0 auto; min-width:32px; text-align:center; padding:3px 7px; border-radius:6px; background:rgba(255,255,255,.12);
     border:1px solid rgba(255,255,255,.18); border-bottom-width:2px; font:700 12px/1.2 ui-monospace,monospace; }
   #introKeys span { opacity:.85; }
-  #deploy, #respawnDeploy { margin-top:20px; width:100%; padding:13px 0; font:900 16px/1 "Trebuchet MS",system-ui,sans-serif; letter-spacing:2px;
+  #deploy, #respawnDeploy { margin-top:12px; width:100%; padding:13px 0; font:900 16px/1 "Trebuchet MS",system-ui,sans-serif; letter-spacing:2px;
     color:#fff; background:#2f6fe0; border:0; border-radius:12px; cursor:pointer; transition:background 120ms ease, transform 80ms ease; }
   #deploy:hover:not(:disabled), #respawnDeploy:hover:not(:disabled) { background:#3f7ff0; }
   #deploy:active:not(:disabled), #respawnDeploy:active:not(:disabled) { transform:scale(.98); }
   #deploy:disabled, #respawnDeploy:disabled { background:rgba(255,255,255,.12); color:rgba(255,255,255,.55); cursor:default; }
   #respawnDeploy { margin-top:14px; }
-  #introStatus { margin-top:9px; font-size:12px; opacity:.6; min-height:14px; }
+  #introStatus { margin-top:7px; font-size:12px; opacity:.6; min-height:14px; }
   /* Spawn-selection minimap (intro + respawn overlay). */
-  .mapcap { font-size:12px; opacity:.72; margin:10px 0 6px; }
+  .mapcap { font-size:12px; opacity:.72; margin:8px 0 5px; }
   .minimap { position:relative; width:100%; aspect-ratio:1/1; border-radius:10px; overflow:hidden;
     border:1px solid rgba(255,255,255,.16); background:#22303c; }
   .minimap canvas { position:absolute; inset:0; width:100%; height:100%; }
@@ -1260,10 +1267,10 @@ hud.innerHTML = `
   .mm-flag.sel { outline:3px solid #fff; outline-offset:1px; transform:translate(-50%,-50%) scale(1.12); }
   .mm-hq { width:42px; height:26px; border-radius:7px; font-size:12px; letter-spacing:1px; }
   .mm-hq.foe { opacity:.6; pointer-events:none; }
-  .mm-status { margin-top:8px; font-size:13px; font-weight:800; letter-spacing:.5px; opacity:.95; }
+  .mm-status { margin-top:6px; font-size:13px; font-weight:800; letter-spacing:.5px; opacity:.95; }
   .mm-status b { letter-spacing:1px; }
   /* Class picker: one card per kit, shared by intro + respawn overlay. */
-  .classrow { display:flex; gap:7px; margin:10px auto 0; max-width:430px; }
+  .classrow { display:flex; gap:7px; margin:8px auto 0; max-width:430px; }
   .classbtn { flex:1; padding:8px 2px 7px; border-radius:10px; cursor:pointer; text-align:center;
     color:#fff; background:rgba(255,255,255,.05); border:2px solid rgba(255,255,255,.14);
     font-family:"Trebuchet MS",system-ui,sans-serif; transition:background 100ms ease,border-color 100ms ease; }
@@ -1271,7 +1278,7 @@ hud.innerHTML = `
   .classbtn.sel { border-color:#fff; background:rgba(255,255,255,.14); }
   .classbtn .cn { font-size:13px; font-weight:900; letter-spacing:.5px; }
   .classbtn .cw { font-size:11px; opacity:.75; margin-top:1px; }
-  #introMap { width:min(280px, 64vw); margin:0 auto; }
+  #introMap { width:min(232px, 56vw); margin:0 auto; }
   #respawn { position:fixed; inset:0; z-index:120; display:none; align-items:center; justify-content:center;
     pointer-events:auto; background:rgba(6,9,15,.55); }
   #respawn .rp { width:min(440px, 94vw); max-height:calc(100vh - 24px); overflow-y:auto; box-sizing:border-box;
@@ -1309,6 +1316,7 @@ hud.innerHTML = `
   <div id="oob"><div class="b">⚠ RETURN TO THE BATTLEFIELD</div><div class="s">leaving the combat area</div><div class="c" id="oobtimer"></div></div>
   <div id="cross" class="sh">+</div>
   <div id="crossname" class="sh"></div>
+  <div id="scope"><div class="sv"></div><div class="shz"></div></div>
   <div id="hitmark">+</div>
   <div id="scores" class="sh"></div>
   <div id="timer" class="sh"></div>
@@ -1356,6 +1364,7 @@ const el = {
   audioVolumeValue: document.getElementById("audioVolumeValue")!,
   audioMute: document.getElementById("audioMute") as HTMLInputElement,
   crossname: document.getElementById("crossname")!,
+  scope: document.getElementById("scope")!,
   hitmark: document.getElementById("hitmark")!,
   scores: document.getElementById("scores")!,
   timer: document.getElementById("timer")!,
@@ -1838,6 +1847,8 @@ let pointerLocked = false;
 let fireHeld = false;
 // Desired weapon slot (0 primary, 1 pistol) — rides every input as slot2.
 let desiredSlot = 0;
+// Right mouse held: aims down the sniper scope (client-side view zoom only).
+let aimHeld = false;
 // Touch (mobile): the floating joystick writes these, blended into the keyboard
 // move in sampleInput(); look + buttons drive yaw/pitch/keys/fireHeld directly,
 // exactly like mouse + keyboard — so no server or netcode changes are needed.
@@ -1851,18 +1862,27 @@ renderer.domElement.addEventListener("mousedown", (e) => {
     return;
   }
   if (e.button === 0) fireHeld = true;
+  if (e.button === 2) aimHeld = true;
 });
 window.addEventListener("mouseup", (e) => {
   if (e.button === 0) fireHeld = false;
+  if (e.button === 2) aimHeld = false;
 });
+renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault());
 document.addEventListener("pointerlockchange", () => {
   pointerLocked = document.pointerLockElement === renderer.domElement;
-  if (!pointerLocked) fireHeld = false;
+  if (!pointerLocked) {
+    fireHeld = false;
+    aimHeld = false;
+  }
 });
 document.addEventListener("mousemove", (e) => {
   if (!pointerLocked) return;
-  yaw -= e.movementX * 0.0023;
-  pitch = Math.max(-1.45, Math.min(1.45, pitch - e.movementY * 0.0021));
+  // Scoped-in zoom scales look sensitivity down with it, so a scoped flick
+  // covers the same on-screen distance as an unscoped one.
+  const sens = 1 / camera.zoom;
+  yaw -= e.movementX * 0.0023 * sens;
+  pitch = Math.max(-1.45, Math.min(1.45, pitch - e.movementY * 0.0021 * sens));
   while (yaw > Math.PI) yaw -= Math.PI * 2;
   while (yaw < -Math.PI) yaw += Math.PI * 2;
 });
@@ -1878,6 +1898,7 @@ window.addEventListener("keyup", (e) => keys.delete(e.code));
 window.addEventListener("blur", () => {
   keys.clear();
   fireHeld = false;
+  aimHeld = false;
 });
 
 // Test hook: scripted input overrides everything for N ticks. trackIdx
@@ -2179,7 +2200,6 @@ interface RemotePlayer {
   // Latest weapon byte from the snapshot: active weapon (held model) low
   // nibble, class primary (character model) high nibble.
   weaponByte: number;
-  modelIdx: number; // character template the current rig was built from
   heldWeapon: number; // weapon node currently shown on the rig
   // Set once the Quaternius model + AnimationMixer replace the blocky fallback.
   anim?: CharacterAnim;
@@ -2610,12 +2630,7 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
   selfStatus = snap.self.status;
   if ((prevSelfStatus & SS_DEAD) === 0 && (selfStatus & SS_DEAD) !== 0 && predState) {
     const team = roster.get(selfIdx)?.team ?? 0;
-    spawnCorpse(
-      new THREE.Vector3(predState.x, predState.y, predState.z),
-      yaw,
-      team,
-      modelForPrimary(predState.primary),
-    );
+    spawnCorpse(new THREE.Vector3(predState.x, predState.y, predState.z), yaw, team);
   }
   // Back alive: the server just respawned us — face the action from the new
   // spawn position before the first rendered frame, primary in hand.
@@ -2658,7 +2673,6 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
         stepPhase: 0,
         createdAt: performance.now(),
         weaponByte: r.weapon,
-        modelIdx: -1,
         heldWeapon: -1,
       };
       remotes.set(r.idx, rp);
@@ -2685,12 +2699,7 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
     // Death transition: drop a ragdoll where viewers last saw them standing
     // (the server has already parked the body at spawn).
     if (!wasNew && (prevFlags & RF_DEAD) === 0 && (r.flags & RF_DEAD) !== 0) {
-      spawnCorpse(
-        rp.group.position,
-        rp.group.rotation.y,
-        rp.info.team,
-        modelForPrimary(weaponBytePrimary(rp.weaponByte)),
-      );
+      spawnCorpse(rp.group.position, rp.group.rotation.y, rp.info.team);
     }
   }
   for (const idx of remotes.keys()) {
@@ -2924,25 +2933,35 @@ function predictionTick(): void {
       const w = predState ? activeWeapon(predState) : WEAPON_LIST[0];
       sounds.shot(w.name);
       recoil = Math.min(1, recoil + (w.kick > 0.06 ? 0.7 : 0.4));
-      // Predicted tracer from a local raycast — instant feedback; the
-      // server's events remain authoritative for hits and damage. The ray
-      // starts at the barrel like the server's (dir already carries recoil).
+      // Predicted tracers from local raycasts — instant feedback; the
+      // server's events remain authoritative for hits and damage. Rays start
+      // at the barrel like the server's (dir already carries recoil), and
+      // pellet weapons show the whole spray (the server rolls its own spread,
+      // so these pellets are purely visual).
       if (gw && selfBody && predState) {
         const mo = muzzleOrigin(predState, cmd.yaw, cmd.pitch);
         const from = muzzleWorld().clone();
-        const hit = castLocal(mo, dir, w.range);
-        const end = hit
-          ? new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])
-          : new THREE.Vector3(
-              mo[0] + dir[0] * w.range,
-              mo[1] + dir[1] * w.range,
-              mo[2] + dir[2] * w.range,
-            );
-        spawnTracer(from, end);
-        const tag = (hit?.body.userData ?? {}) as { playerIdx?: number; grenadeId?: number };
-        if (hit && tag.playerIdx === undefined && tag.grenadeId === undefined) {
-          const pieceId = hitPieceId(hit.body, hit.point) ?? undefined;
-          spawnBulletDecal(end, surfaceNormalAt(hit.body, end), pieceId);
+        const pellets = w.pellets ?? 1;
+        const spread = pellets > 1 ? spreadFor(predState) : 0;
+        for (let i = 0; i < pellets; i++) {
+          const d =
+            pellets > 1
+              ? perturb(dir, (Math.random() - 0.5) * 2 * spread, (Math.random() - 0.5) * 2 * spread)
+              : dir;
+          const hit = castLocal(mo, d, w.range);
+          const end = hit
+            ? new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])
+            : new THREE.Vector3(
+                mo[0] + d[0] * w.range,
+                mo[1] + d[1] * w.range,
+                mo[2] + d[2] * w.range,
+              );
+          spawnTracer(from, end);
+          const tag = (hit?.body.userData ?? {}) as { playerIdx?: number; grenadeId?: number };
+          if (hit && i < 3 && tag.playerIdx === undefined && tag.grenadeId === undefined) {
+            const pieceId = hitPieceId(hit.body, hit.point) ?? undefined;
+            spawnBulletDecal(end, surfaceNormalAt(hit.body, end), pieceId);
+          }
         }
       }
     },
@@ -3019,11 +3038,10 @@ interface CharacterAnim {
   sprintAnim: boolean; // hysteresis latch for the sprint clip
 }
 
-// Character templates by MODEL index (0 Soldier, 1 Enemy, 2 Hazmat) — each
-// class maps to one (CLASSES[].model); team reads from the tint + badge. All
-// three share the kit's identical 17-clip rig and weapon nodes.
-const characterTemplates: Array<CharacterTemplate | null> = [null, null, null];
-const CHARACTER_FILES: RegExp[] = [/soldier/i, /enemy/i, /hazmat/i];
+// One Soldier model for every player — the game reads red vs blue from the
+// tint + badge, and a player's class from the weapon in their hands. The rig
+// carries all the kit's weapon nodes; setHeldWeapon reveals the right one.
+const characterTemplates: Array<CharacterTemplate | null> = [null];
 // First-person weapon templates by WEAPON_LIST index (rifle..pistol).
 const viewWeaponTemplates: Array<THREE.Group | null> = WEAPON_LIST.map(() => null);
 const VIEW_WEAPON_FILES: RegExp[] = [
@@ -3058,14 +3076,6 @@ const CHARACTER_WEAPON_NODES = new Set([
   "Sniper_2",
 ]);
 
-// Which character model a primary-weapon index renders as.
-function modelForPrimary(primaryIdx: number): number {
-  for (const cls of CLASSES) {
-    if (WEAPON_IDX[cls.primary] === primaryIdx) return cls.model;
-  }
-  return 0;
-}
-
 function loadExternalVisualAssets(): void {
   if (externalAssetsRequested) return;
   externalAssetsRequested = true;
@@ -3073,13 +3083,11 @@ function loadExternalVisualAssets(): void {
     .then((response) => (response.ok ? response.json() : null))
     .then((manifest: ToonShooterManifest | null) => {
       const charUrls = manifest?.characters ?? [];
-      for (let m = 0; m < CHARACTER_FILES.length; m++) {
-        const url = charUrls.find((u) => CHARACTER_FILES[m].test(u));
-        if (!url) continue;
-        const idx = m;
-        void loadCharacterTemplate(url)
+      const soldierUrl = charUrls.find((u) => /soldier/i.test(u)) ?? charUrls[0];
+      if (soldierUrl) {
+        void loadCharacterTemplate(soldierUrl)
           .then((t) => {
-            characterTemplates[idx] = t;
+            characterTemplates[0] = t;
           })
           .catch(() => {});
       }
@@ -3276,10 +3284,10 @@ const FOOTSTEP_CADENCE = 1.7; // step-phase radians per metre (~2.8 steps/s at r
 
 // Clone a character template into a fresh animated instance: its own skeleton,
 // per-instance materials (so flash/fade/spawn-ghost don't bleed across bodies),
-// and an AnimationMixer bound to the cloned rig. `model` picks the class
-// silhouette (Soldier/Enemy/Hazmat); team reads from the tint.
-function instantiateCharacter(team: number, model = 0): CharacterInstance | null {
-  const tpl = characterTemplates[model] ?? characterTemplates[0];
+// and an AnimationMixer bound to the cloned rig. Everyone is the same Soldier;
+// team reads from the tint.
+function instantiateCharacter(team: number): CharacterInstance | null {
+  const tpl = characterTemplates[0];
   if (!tpl) return null;
   const root = cloneSkeleton(tpl.scene) as THREE.Group;
   const teamTint = TEAM_COLORS[team] ?? TEAM_COLORS[0];
@@ -3377,15 +3385,13 @@ function updateCharacterAnim(
 
 function attachExternalSoldier(rp: RemotePlayer): void {
   if (rp.anim) return;
-  const model = modelForPrimary(weaponBytePrimary(rp.weaponByte));
-  const inst = instantiateCharacter(rp.info.team === 1 ? 1 : 0, model);
+  const inst = instantiateCharacter(rp.info.team === 1 ? 1 : 0);
   if (!inst) return;
   const fallback = rp.group.userData.visualRoot as THREE.Object3D | undefined;
   if (fallback) fallback.visible = false; // retire the blocky placeholder rig
   inst.root.name = "externalCharacter";
   inst.root.rotation.y = EXTERNAL_CHARACTER_YAW;
   rp.group.add(inst.root);
-  rp.modelIdx = model;
   rp.heldWeapon = weaponByteActive(rp.weaponByte);
   setHeldWeapon(inst.root, rp.heldWeapon);
   rp.anim = {
@@ -3401,20 +3407,10 @@ function attachExternalSoldier(rp: RemotePlayer): void {
   playClip(rp.anim, "Idle", 0);
 }
 
-// The snapshot says this remote holds a different weapon (swap) or a
-// different class (respawn): flip the held node, or rebuild the whole rig
-// when the class model changed.
+// The snapshot says this remote now holds a different weapon (swap, or a new
+// class after a respawn): flip the visible weapon node on their rig.
 function applyRemoteWeapon(rp: RemotePlayer): void {
   if (!rp.anim) return; // attach picks the byte up when the model lands
-  const model = modelForPrimary(weaponBytePrimary(rp.weaponByte));
-  if (model !== rp.modelIdx) {
-    const old = rp.group.getObjectByName("externalCharacter");
-    if (old) rp.group.remove(old);
-    rp.anim.mixer.stopAllAction();
-    rp.anim = undefined;
-    attachExternalSoldier(rp);
-    return;
-  }
   const active = weaponByteActive(rp.weaponByte);
   if (active !== rp.heldWeapon) {
     rp.heldWeapon = active;
@@ -3701,12 +3697,12 @@ const CORPSE_CAP = 18;
 const CORPSE_TTL_MS = 50_000; // bodies linger, then fade away
 const CORPSE_FADE_MS = 1500;
 
-function spawnCorpse(at: THREE.Vector3, yaw: number, team: number, model = 0): void {
+function spawnCorpse(at: THREE.Vector3, yaw: number, team: number): void {
   const group = new THREE.Group();
   group.position.set(at.x, at.y, at.z);
   group.rotation.y = yaw;
   let mixer: THREE.AnimationMixer | null = null;
-  const inst = instantiateCharacter(team, model);
+  const inst = instantiateCharacter(team);
   if (inst) {
     inst.root.rotation.y = EXTERNAL_CHARACTER_YAW;
     group.add(inst.root);
@@ -3997,6 +3993,9 @@ function spawnSpark(at: THREE.Vector3, color = 0xffd27a): void {
 }
 
 let shake = 0;
+// Sniper scope zoom state (eased 0..1) and magnification.
+let scopeBlend = 0;
+const SCOPE_ZOOM = 4.5;
 
 function stepEffects(dt: number): void {
   const now = performance.now();
@@ -4276,6 +4275,30 @@ function frame(): void {
     }
   }
 
+  // Sniper scope (RMB with the sniper out): ease camera.zoom toward the scope
+  // magnification (zoom + updateProjectionMatrix is the three.js way to zoom
+  // without touching the base fov), fade in the scope mask, and hide the
+  // rifle. Purely a client-side view — ballistics are unchanged.
+  {
+    const scoped =
+      aimHeld &&
+      pointerLocked &&
+      (selfStatus & SS_DEAD) === 0 &&
+      predState !== null &&
+      predState.slot === 0 &&
+      predState.primary === WEAPON_IDX.sniper;
+    scopeBlend += ((scoped ? 1 : 0) - scopeBlend) * Math.min(1, dt * 14);
+    if (scopeBlend < 0.005) scopeBlend = 0;
+    const zoomTarget = 1 + (SCOPE_ZOOM - 1) * scopeBlend;
+    if (Math.abs(camera.zoom - zoomTarget) > 1e-3) {
+      camera.zoom = zoomTarget;
+      camera.updateProjectionMatrix();
+    }
+    const maskOn = scopeBlend > 0.6;
+    (el.scope as HTMLElement).style.display = maskOn ? "block" : "none";
+    el.cross.style.visibility = maskOn ? "hidden" : "visible";
+  }
+
   // First-person weapon feel: a rest pose plus recoil, melee, a walk/sprint
   // bob, a reload dip, and a distinct sprint sway (gun lowered and canted).
   updateViewWeapon();
@@ -4316,7 +4339,7 @@ function frame(): void {
       sway * 0.3; // sprint: lower the muzzle, not raise it
     viewModel.rotation.z = sway * 0.35;
   }
-  viewModel.visible = (selfStatus & SS_DEAD) === 0;
+  viewModel.visible = (selfStatus & SS_DEAD) === 0 && scopeBlend < 0.5;
   // Grace fallback: only show the blocky placeholder gun if the AK model never
   // arrived after a few seconds (so it doesn't flash during connect).
   if (viewModel.userData.externalAttached !== true && now - VIEW_WEAPON_BORN > 3000) {
@@ -4525,7 +4548,8 @@ function updateHud(): void {
   if (predState) {
     const w = activeWeapon(predState);
     const ammo = predState.slot === 1 ? predState.ammo2 : predState.ammo;
-    el.wpnname.textContent = `${w.name.toUpperCase()} · 1/2 to swap`;
+    const scopeHint = w.name === "Sniper" ? " · RMB scope" : "";
+    el.wpnname.textContent = `${w.name.toUpperCase()} · 1/2 swap${scopeHint}`;
     el.ammotext.textContent = predState.reloadTicks > 0 ? "…" : `${ammo}`;
     el.gear.textContent = `🧨 ${predState.grenades}  🧱 ${predState.supply}`;
   }
@@ -5039,7 +5063,6 @@ declare global {
       externalAssets(): {
         soldierLoaded: boolean;
         enemyLoaded: boolean;
-        hazmatLoaded: boolean;
         clipCount: number;
         weaponLoaded: boolean;
         remoteAnimatedCount: number;
@@ -5115,8 +5138,7 @@ window.__fps = {
   soundLog: () => [...soundLog],
   externalAssets: () => ({
     soldierLoaded: characterTemplates[0] !== null,
-    enemyLoaded: characterTemplates[1] !== null,
-    hazmatLoaded: characterTemplates[2] !== null,
+    enemyLoaded: false, // single Soldier model for both teams
     clipCount: characterTemplates[0]?.clips.length ?? 0,
     weaponLoaded: viewWeaponTemplates.every((t) => t !== null),
     remoteAnimatedCount: [...remotes.values()].filter((rp) => rp.anim !== undefined).length,
