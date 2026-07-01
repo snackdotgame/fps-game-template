@@ -63,3 +63,24 @@ export function parseServerMsg(data: unknown): ServerMsg | null {
   if (typeof t !== "string") return null;
   return data as ServerMsg;
 }
+
+// --- Client -> server requests (reliable stream). ---
+
+// Spawn-point preference from the deploy/respawn map: a zone index to spawn
+// at that flag while the team holds it, or one of the sentinels.
+export const SPAWN_AUTO = -1; // server picks (base or a random safe flag)
+export const SPAWN_HQ = -2; // always the team base
+
+export type ClientMsg =
+  | { type: "spawnat"; zone: number }
+  // Deploy request while dead: humans respawn only when they ask (once the
+  // respawn timer allows), never automatically.
+  | { type: "deploy" };
+
+export function parseClientMsg(data: unknown): ClientMsg | null {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
+  const m = data as { type?: unknown; zone?: unknown };
+  if (m.type === "deploy") return { type: "deploy" };
+  if (m.type !== "spawnat" || typeof m.zone !== "number" || !Number.isFinite(m.zone)) return null;
+  return { type: "spawnat", zone: Math.round(m.zone) };
+}

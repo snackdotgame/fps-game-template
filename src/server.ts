@@ -7,7 +7,7 @@
 // impacts, explosions) ride a ring of recent events inside the idempotent
 // snapshots.
 
-import { type Connection, server } from "snack:server";
+import { type Connection, type StreamEvent, server } from "snack:server";
 import {
   BOT_FILL,
   SANDBOX,
@@ -17,7 +17,7 @@ import {
   TICK_MS,
 } from "./shared/constants.js";
 import { craterList, heightAt, PLAY_HALF, ZONES } from "./shared/map.js";
-import { type PlayerInfo, type ServerMsg } from "./shared/messages.js";
+import { parseClientMsg, type PlayerInfo, type ServerMsg } from "./shared/messages.js";
 import {
   decodeInputs,
   encodeSnapshot,
@@ -156,15 +156,19 @@ export async function main() {
     botNav.warm(sim);
   }
 
-  // Clients never send stream messages; a stream recv settling is the
-  // shutdown signal (it rejects when the runtime stops this module).
+  // Client stream messages carry explicit requests (currently the spawn
+  // choice). The recv REJECTING is the shutdown signal — it only rejects
+  // when the runtime stops this module.
   let stopped = false;
-  const stopSignal = server.streams
-    .recv()
-    .catch(() => {})
-    .then(() => {
-      stopped = true;
-    });
+  const stopSignal = (async () => {
+    try {
+      while (true) {
+        handleClientMsg(await server.streams.recv());
+      }
+    } catch {
+      stopped = true; // the runtime is stopping this module
+    }
+  })();
 
   let nextTickAt = server.elapsedMs() + TICK_MS;
   while (server.running && !stopped) {
@@ -690,6 +694,7 @@ function addPlayer(conn: Connection): void {
   const team = park?.team ?? (humansA <= humansB ? 0 : 1);
 
   const sp = sim.addPlayer(slot, team);
+  sp.autoRespawn = false; // humans deploy from the respawn screen
   sp.kills = park?.kills ?? 0;
   sp.deaths = park?.deaths ?? 0;
   const p: Player = {
@@ -740,6 +745,22 @@ function removePlayer(connId: string, p: Player): void {
 }
 
 // --- Inputs ---------------------------------------------------------------------
+
+// Reliable client requests. Validate hard: anything malformed or from an
+// unknown connection is dropped silently.
+function handleClientMsg(event: StreamEvent): void {
+  let msg = null;
+  try {
+    msg = parseClientMsg(event.json());
+  } catch {
+    return;
+  }
+  if (!msg) return;
+  const p = players.get(event.connection.id);
+  if (!p || p.bot) return;
+  if (msg.type === "spawnat") sim.setSpawnZone(p.slot, msg.zone);
+  else if (msg.type === "deploy") sim.requestDeploy(p.slot);
+}
 
 function drainInputs(): void {
   for (const event of server.datagrams.drain()) {
