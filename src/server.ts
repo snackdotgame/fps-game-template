@@ -44,7 +44,7 @@ import {
   readChar,
 } from "./shared/physics.js";
 import { BotNav, initBotNav, type BotNavPoint } from "./server/botNav.js";
-import { CLASSES, PISTOL_IDX } from "./shared/weapons.js";
+import { CLASSES, secondaryIdxFor } from "./shared/weapons.js";
 import { GameSim, type SimPlayer } from "./shared/sim.js";
 
 // The Snack runtime provides console/performance; the DOM-less lib doesn't type them.
@@ -954,7 +954,7 @@ function broadcastSnapshots(): void {
         idx: q.slot,
         flags,
         weapon: packWeaponByte(
-          sq.state.slot === 1 ? PISTOL_IDX : sq.state.primary,
+          sq.state.slot === 1 ? secondaryIdxFor(sq.state.primary) : sq.state.primary,
           sq.state.primary,
         ),
         x: sq.state.x,
