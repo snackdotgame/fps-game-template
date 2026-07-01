@@ -16,7 +16,15 @@ import {
   ROUND_TICKS,
   TICK_MS,
 } from "./shared/constants.js";
-import { craterList, heightAt, PLAY_HALF, ZONES } from "./shared/map.js";
+import {
+  craterList,
+  DEFAULT_MAP_SEED,
+  ENEMY_BASE_RADIUS,
+  heightAt,
+  initMap,
+  PLAY_HALF,
+  ZONES,
+} from "./shared/map.js";
 import { parseClientMsg, type PlayerInfo, type ServerMsg } from "./shared/messages.js";
 import {
   decodeInputs,
@@ -121,8 +129,17 @@ interface Parked {
 
 let sim: GameSim;
 let mapEpoch = 1;
+let mapSeed = DEFAULT_MAP_SEED;
 let configuredBotFill = BOT_FILL;
 let botNav: BotNav | null = null;
+
+// Every game is a new level: a fresh seed at boot and per round restart,
+// announced in welcome/phase messages so every client rebuilds the same
+// world. SANDBOX keeps the fixture seed for reproducible iteration.
+function pickMapSeed(): number {
+  if (SANDBOX) return DEFAULT_MAP_SEED;
+  return ((Math.random() * 0x100000000) ^ (server.elapsedMs() * 2654435761)) >>> 0;
+}
 
 const players = new Map<string, Player>(); // by connection id, or "bot:<n>"
 const parked = new Map<string, Parked>();
@@ -149,6 +166,8 @@ function readBotFillConfig(): number {
 
 export async function main() {
   await joltModule();
+  mapSeed = pickMapSeed();
+  initMap(mapSeed); // before sim.init(): the physics world builds from MAP
   sim = new GameSim(0xbeac4);
   await sim.init();
   sim.phaseEndTick = ROUND_TICKS;
@@ -466,20 +485,22 @@ function updateBotDecision(p: SimPlayer, b: BotBrain): void {
         );
       } else {
         const bound = PLAY_HALF - 5; // keep bots inside the play area (no OOB suicides)
+        // The enemy home bowl runs the return-or-die countdown — never send a
+        // bot to wander (and die) in there.
+        const enemySpawnZ = p.team === 0 ? 100 : -100;
+        const outsideEnemyBase = (x: number, z: number): number => {
+          if (Math.hypot(x, z - enemySpawnZ) >= ENEMY_BASE_RADIUS + 6) return z;
+          return enemySpawnZ - Math.sign(enemySpawnZ) * (ENEMY_BASE_RADIUS + 8 + rng() * 12);
+        };
         const randomPoint = navForBots()?.randomPoint(sim, rng);
         if (randomPoint && rng() < 0.65) {
           const rx = Math.max(-bound, Math.min(bound, randomPoint[0]));
-          const rz = Math.max(-bound, Math.min(bound, randomPoint[2]));
+          const rz = outsideEnemyBase(rx, Math.max(-bound, Math.min(bound, randomPoint[2])));
           setBotDestination(b, rx, heightAt(rx, rz) + 0.15, rz);
         } else {
           const half = bound;
-          let x = (rng() * 2 - 1) * half;
-          let z = (rng() * 2 - 1) * half;
-          // Don't camp the enemy spawn zone — keep the fight in the field.
-          const enemySpawnZ = p.team === 0 ? 100 : -100;
-          if (Math.abs(z - enemySpawnZ) < 15 && Math.abs(x) < 15) {
-            z = enemySpawnZ - Math.sign(enemySpawnZ) * (16 + rng() * 12);
-          }
+          const x = (rng() * 2 - 1) * half;
+          const z = outsideEnemyBase(x, (rng() * 2 - 1) * half);
           setBotDestination(b, x, heightAt(x, z) + 0.15, z);
         }
       }
@@ -727,6 +748,7 @@ function addPlayer(conn: Connection): void {
     phaseEndTick: sim.phaseEndTick,
     scores: [sim.scores[0], sim.scores[1]],
     mapEpoch,
+    mapSeed,
     destroyed: [...sim.destroyedPanels],
     built: [...sim.builtPanels.values()],
     collapsed: [...sim.collapsedBuildings],
@@ -836,6 +858,7 @@ async function stepPhase(): Promise<void> {
         phaseEndTick: sim.phaseEndTick,
         scores: [sim.scores[0], sim.scores[1]],
         mapEpoch,
+        mapSeed,
       });
     } else if (players.size === 0 && sim.tick >= sim.phaseEndTick) {
       sim.phaseEndTick = sim.tick + ROUND_TICKS; // idle server: keep pushing the clock
@@ -847,6 +870,8 @@ async function stepPhase(): Promise<void> {
 
 async function resetRound(): Promise<void> {
   mapEpoch++;
+  mapSeed = pickMapSeed();
+  initMap(mapSeed); // a brand-new level; sim.reset() rebuilds physics from it
   await sim.reset();
   botNav = null;
   for (const p of players.values()) {
@@ -878,6 +903,7 @@ async function resetRound(): Promise<void> {
     phaseEndTick: sim.phaseEndTick,
     scores: [sim.scores[0], sim.scores[1]],
     mapEpoch,
+    mapSeed,
   });
 }
 

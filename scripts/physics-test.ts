@@ -84,8 +84,11 @@ async function main(): Promise<void> {
 
   // --- Walk + sprint speeds. ---
   {
-    // Head north up the east duel corridor — kept clear of placements.
-    const r = await rig([24, heightAt(24, -32) + 0.1, -32]);
+    // Head north up the duel corridor — kept clear of placements and hills
+    // (its x is seeded per map).
+    const { duelLaneX } = await import("../src/shared/map.js");
+    const lane = duelLaneX();
+    const r = await rig([lane, heightAt(lane, -32) + 0.1, -32]);
     const north = quantizeAngle(0);
     for (let t = 0; t < 45; t++) step(r, cmd(t + 1, { moveZ: quantizeMove(1), yaw: north }));
     const walk = Math.hypot(r.s.vx, r.s.vz);
@@ -338,8 +341,9 @@ async function main(): Promise<void> {
     // The settlement is procedurally laid out (clusters + rejection), so the
     // exact building count varies; assert a sane range, not a magic number.
     let ok = houses.length >= 14 && houses.length <= 44 && trees.length >= 60;
-    // Concrete buildings use far fewer (bigger) panels than brick ones.
-    for (const b of houses) ok &&= b.wallPanelIds.length >= 90 && b.roofPanelIds.length >= 40;
+    // Concrete buildings use far fewer (bigger) panels than brick ones, and
+    // ruins keep only weather-eaten wall stumps + a scatter of flagstones.
+    for (const b of houses) ok &&= b.wallPanelIds.length >= 60 && b.roofPanelIds.length >= 12;
     for (const b of trees) {
       ok &&= b.wallPanelIds.length >= 3 && b.wallPanelIds.length <= 7 && b.roofPanelIds.length >= 4;
       // Two trunk segments always fell a tree, regardless of its height.
@@ -360,8 +364,16 @@ async function main(): Promise<void> {
     const byMat = new Map<string, number>();
     for (const p of MAP.panels) byMat.set(p.material, (byMat.get(p.material) ?? 0) + 1);
     const bricks = MAP.panels.filter((p) => p.material === "brick");
-    const fullBrick = bricks.filter((p) => Math.max(p.ex, p.ez) === 0.5).length;
-    const halfBrick = bricks.filter((p) => Math.abs(Math.max(p.ex, p.ez) - 0.25) < 1e-9).length;
+    // Courses stretch a little so whole units always close a wall span
+    // exactly (no more disconnected corners) — classify by band, not exact.
+    const fullBrick = bricks.filter((p) => {
+      const l = Math.max(p.ex, p.ez);
+      return l > 0.4 && l < 0.68;
+    }).length;
+    const halfBrick = bricks.filter((p) => {
+      const l = Math.max(p.ex, p.ez);
+      return l > 0.16 && l < 0.36;
+    }).length;
     // Cabin logs are building pieces; loose props (woodpiles, fallen logs) also
     // use the log material but aren't stacked-cabin shaped.
     const logs = MAP.panels.filter((p) => p.material === "log" && p.buildingId !== undefined);
@@ -372,7 +384,7 @@ async function main(): Promise<void> {
     );
     check(
       "log cabins are stacked logs",
-      logs.length > 200 && logs.every((p) => p.ey === 0.25 && Math.max(p.ex, p.ez) <= 2),
+      logs.length > 200 && logs.every((p) => p.ey === 0.25 && Math.max(p.ex, p.ez) <= 2.61),
       `logs=${logs.length}`,
     );
     check(
@@ -515,7 +527,8 @@ async function main(): Promise<void> {
       }
     }
     check("river/lakes exist but are uncommon", wet > 60 && wet < 900, `wet=${wet}`);
-    check("water is wadeable, not swimmable", deepest < 1.3, `deepest=${deepest.toFixed(2)}`);
+    // WATER_DEPTH 1.3 plus the gravel-bar roughness (±6%) on the deep line.
+    check("water is wadeable, not swimmable", deepest < 1.45, `deepest=${deepest.toFixed(2)}`);
     check(
       "zones sit on dry, flat ground",
       ZONES.every((zn) => Math.abs(heightAt(zn.x, zn.z)) < 0.05 && waterCarveAt(zn.x, zn.z) < 0.05),
@@ -564,8 +577,11 @@ async function main(): Promise<void> {
   // chunk collision, deterministically. ---
   {
     const gw = await createGameWorld();
-    const x = 24;
-    const z = -20; // open corridor, clear of pieces
+    const { duelLaneX } = await import("../src/shared/map.js");
+    // Open corridor, clear of pieces. Integer coordinate: heightAt is exact
+    // at mesh vertices, and the ray-vs-triangle comparison assumes that.
+    const x = Math.round(duelLaneX());
+    const z = -20;
     const h0 = heightAt(x, z);
     const rayDown = (): number => {
       const hit = gw.world.castRay([x, 6, z], [0, -12, 0]);

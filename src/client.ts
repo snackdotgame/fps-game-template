@@ -25,10 +25,17 @@ import {
   APRON_OUTER,
   BACKDROP_OUTER,
   baseHeightAt,
+  biomeAt,
+  BIOME_FOREST,
+  BIOME_MARSH,
+  BIOME_ROCKY,
   chunksTouching,
   craterList,
   heightAt,
+  inEnemyBase,
+  initMap,
   MAP,
+  mapSeed,
   PANEL_HP,
   type PanelDef,
   type PanelMaterial,
@@ -462,6 +469,10 @@ const TERRAIN_SCORCH = new THREE.Color(0x4f463b);
 const TERRAIN_BED = new THREE.Color(0x6a6f52); // silty riverbed
 const ROAD_DIRT = new THREE.Color(0x7a6446);
 const ROAD_COBBLE = new THREE.Color(0x8a857d);
+// Biome ground casts (lerped over the base grass so borders stay soft).
+const T_FOREST_FLOOR = new THREE.Color(0x42632f); // darker, richer woodland
+const T_ROCKY_GROUND = new THREE.Color(0x7d7a5e); // thin bleached highland turf
+const T_MARSH = new THREE.Color(0x4c5c33); // wet olive bog
 
 function smoothstep01(x: number, a: number, b: number): number {
   const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
@@ -559,6 +570,13 @@ function colorTerrainFace(c: THREE.Color, cx: number, cy: number, cz: number, ny
   c.copy(T_GRASS_A).lerp(T_GRASS_B, m1);
   c.lerp(T_GRASS_C, smoothstep01(m2, 0.55, 1));
   c.lerp(T_DRY, smoothstep01(m2, 0, 0.25) * 0.55);
+  // Biome cast: woodland floors darken, the rocky tops bleach thin, marshes
+  // go wet olive. Borders are already noise-warped map-side, so a flat lerp
+  // per face reads as organic transition.
+  const biome = biomeAt(cx, cz);
+  if (biome === BIOME_FOREST) c.lerp(T_FOREST_FLOOR, 0.42);
+  else if (biome === BIOME_ROCKY) c.lerp(T_ROCKY_GROUND, 0.4);
+  else if (biome === BIOME_MARSH) c.lerp(T_MARSH, 0.5);
   c.lerp(T_HIGH, Math.max(0, Math.min(1, (cy - 0.4) / 1.2)) * 0.4);
   const slope = 1 - ny;
   const rock = smoothstep01(slope, 0.3, 0.6);
@@ -937,6 +955,15 @@ function buildMapVisuals(): void {
   decals.length = 0;
   corpses.length = 0; // their groups died with the old mapGroup
   fallingChunks.clear(); // ditto
+
+  // The map may have been re-seeded since the last build: refresh the water
+  // depth texture (which also warms the pristine height grid the face
+  // coloring below reads).
+  {
+    const u = (waterMat.uniforms as { uHeight: { value: THREE.Texture } }).uHeight;
+    u.value.dispose();
+    u.value = makeWaterHeightTexture();
+  }
 
   for (let ci = 0; ci < TERRAIN_CHUNKS; ci++) {
     for (let cj = 0; cj < TERRAIN_CHUNKS; cj++) {
@@ -2424,6 +2451,19 @@ function copyCtrl(into: CharState, from: CharState): void {
   into.supply = from.supply;
 }
 
+// Rebuild the shared map from the server's seed — every game is a new level.
+// Idempotent per seed (reconnects mid-round pay nothing); on a real change,
+// every client-side cache derived from the old terrain drops here. The scene
+// itself rebuilds in buildWorlds(), which callers trigger right after.
+function applyMapSeed(seed: number): void {
+  if (seed >>> 0 === mapSeed()) return;
+  initMap(seed);
+  baseHGrid = null;
+  mmBase = null;
+  warmBaseHeightGrid(); // one exact pass; minimap + face coloring read it
+  for (const m of minimaps) m.repaint();
+}
+
 async function buildWorlds(): Promise<void> {
   const buildId = ++worldBuildSeq;
   needHardAdopt = true;
@@ -2497,6 +2537,7 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       phaseEndTick = msg.phaseEndTick;
       scores = [msg.scores[0], msg.scores[1]];
       mapEpoch = msg.mapEpoch;
+      applyMapSeed(msg.mapSeed); // BEFORE replaying destruction/craters below
       destroyedSet = new Set(msg.destroyed);
       builtList = [...msg.built];
       collapsedList = [...msg.collapsed];
@@ -2642,6 +2683,7 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       scores = [msg.scores[0], msg.scores[1]];
       if (msg.mapEpoch !== mapEpoch) {
         mapEpoch = msg.mapEpoch;
+        applyMapSeed(msg.mapSeed); // a new epoch is a brand-new level
         destroyedSet.clear();
         builtList = [];
         collapsedList = [];
@@ -4366,12 +4408,16 @@ function frame(): void {
 
   // Out of bounds: no walls, so leaving the play area shows a warning + a
   // return countdown and desaturates the view; the server enforces the kill.
+  // The enemy's home bowl counts too (no spawn camping).
   {
     const dead = (selfStatus & SS_DEAD) !== 0;
+    const team = roster.get(selfIdx)?.team ?? -1;
     const oob =
       !dead &&
       predState != null &&
-      (Math.abs(predState.x) > PLAY_HALF || Math.abs(predState.z) > PLAY_HALF);
+      (Math.abs(predState.x) > PLAY_HALF ||
+        Math.abs(predState.z) > PLAY_HALF ||
+        (team >= 0 && inEnemyBase(team, predState.x, predState.z)));
     if (oob) {
       if (oobStartMs < 0) oobStartMs = now;
       const left = Math.max(0, OOB_LIMIT_SECONDS - (now - oobStartMs) / 1000);
@@ -4777,6 +4823,9 @@ function minimapBase(): HTMLCanvasElement {
   const lo = new THREE.Color(0x4a7440);
   const hi = new THREE.Color(0x93a464);
   const water = new THREE.Color(0x2a5a74);
+  const mmForest = new THREE.Color(0x3c5a2c);
+  const mmRocky = new THREE.Color(0x77745c);
+  const mmMarsh = new THREE.Color(0x4a5a34);
   const c = new THREE.Color();
   for (let j = 0; j < MM_N; j++) {
     const z = -PLAY_HALF + ((j + 0.5) / MM_N) * 2 * PLAY_HALF;
@@ -4787,6 +4836,10 @@ function minimapBase(): HTMLCanvasElement {
         c.copy(water);
       } else {
         c.copy(lo).lerp(hi, Math.max(0, Math.min(1, (h + 0.4) / 3.5)));
+        const biome = biomeAt(x, z);
+        if (biome === BIOME_FOREST) c.lerp(mmForest, 0.45);
+        else if (biome === BIOME_ROCKY) c.lerp(mmRocky, 0.4);
+        else if (biome === BIOME_MARSH) c.lerp(mmMarsh, 0.5);
         const road = roadAt(x, z);
         if (road.w > 0.4) c.setHex(road.cobble ? 0x8a857d : 0x7a6446);
       }
@@ -4805,7 +4858,8 @@ function minimapBase(): HTMLCanvasElement {
 const mmPct = (v: number): string => `${(((v + PLAY_HALF) / (2 * PLAY_HALF)) * 100).toFixed(1)}%`;
 
 interface Minimap {
-  refresh(): void;
+  refresh(): void; // ownership/selection state
+  repaint(): void; // new map: base image + flag positions
 }
 const minimaps: Minimap[] = [];
 
@@ -4892,8 +4946,18 @@ function makeMinimap(container: HTMLElement): void {
         : "HQ";
     status.innerHTML = `spawning at <b style="color:${team >= 0 ? TEAM_COLORS_CSS[team] : "#fff"}">${label}</b>`;
   };
+  const repaint = (): void => {
+    canvas.getContext("2d")!.drawImage(minimapBase(), 0, 0);
+    for (let i = 0; i < zoneBtns.length; i++) {
+      const def = ZONES[i];
+      if (!def) continue;
+      zoneBtns[i].style.left = mmPct(def.x);
+      zoneBtns[i].style.top = mmPct(def.z);
+    }
+    refresh();
+  };
   refresh();
-  minimaps.push({ refresh });
+  minimaps.push({ refresh, repaint });
 }
 
 function refreshMinimaps(): void {
