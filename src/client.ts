@@ -480,15 +480,58 @@ function vnoise(x: number, z: number, freq: number): number {
   return a + (b - a) * sx + (c - a) * sz + (a - b - c + d) * sx * sz;
 }
 
+// The pristine base heights, cached on a 1m grid. Terrain-face coloring reads
+// the heightfield ~5× per face across ~100k faces, and every exact
+// baseHeightAt walks river/road/noise tables — it was ~5s of the load. The
+// pristine field never changes (craters layer on top in heightAt), so one
+// grid pass + bilinear reads replaces the half-million exact calls. Visual
+// path only: the shared sim keeps calling the exact function.
+let baseHGrid: Float32Array | null = null;
+let baseHGridN = 0; // points per side
+let baseHGridMin = 0;
+const BASEH_PAD = 8; // cover AO taps just past the core edge
+
+function warmBaseHeightGrid(): void {
+  if (baseHGrid) return;
+  baseHGridMin = -MAP.size / 2 - BASEH_PAD;
+  baseHGridN = MAP.size + 2 * BASEH_PAD + 1; // 1m step
+  const g = new Float32Array(baseHGridN * baseHGridN);
+  for (let j = 0; j < baseHGridN; j++) {
+    const z = baseHGridMin + j;
+    for (let i = 0; i < baseHGridN; i++) {
+      g[j * baseHGridN + i] = baseHeightAt(baseHGridMin + i, z);
+    }
+  }
+  baseHGrid = g;
+}
+
+// Bilinear read of the cached pristine grid; falls back to the exact function
+// outside it (the apron/backdrop rings sample far past the core).
+function baseHeightFast(x: number, z: number): number {
+  const g = baseHGrid;
+  const i = Math.floor(x - baseHGridMin);
+  const j = Math.floor(z - baseHGridMin);
+  if (!g || i < 0 || j < 0 || i >= baseHGridN - 1 || j >= baseHGridN - 1) {
+    return baseHeightAt(x, z);
+  }
+  const tx = x - baseHGridMin - i;
+  const tz = z - baseHGridMin - j;
+  const a = g[j * baseHGridN + i];
+  const b = g[j * baseHGridN + i + 1];
+  const c = g[(j + 1) * baseHGridN + i];
+  const d = g[(j + 1) * baseHGridN + i + 1];
+  return a + (b - a) * tx + (c - a) * tz + (a - b - c + d) * tx * tz;
+}
+
 // Analytic ambient occlusion from the heightfield: faces lower than their
 // neighborhood (hollows, crater bowls, the river channel) darken; bumps lift.
 function computeFaceAO(cx: number, cy: number, cz: number): number {
   const r = 3;
   const avg =
-    (baseHeightAt(cx + r, cz) +
-      baseHeightAt(cx - r, cz) +
-      baseHeightAt(cx, cz + r) +
-      baseHeightAt(cx, cz - r)) *
+    (baseHeightFast(cx + r, cz) +
+      baseHeightFast(cx - r, cz) +
+      baseHeightFast(cx, cz + r) +
+      baseHeightFast(cx, cz - r)) *
     0.25;
   return Math.max(0.76, Math.min(1.06, 1 + (cy - avg) * 0.35));
 }
@@ -515,7 +558,7 @@ function colorTerrainFace(c: THREE.Color, cx: number, cy: number, cz: number, ny
   const aboveWater = cy - WATER_SURFACE_Y;
   const shore = smoothstep01(aboveWater, 0.5, 0) * smoothstep01(aboveWater, -0.15, 0.06);
   c.lerp(T_SAND, Math.min(1, shore) * 0.85 * (1 - rock));
-  const dug = baseHeightAt(cx, cz) - cy;
+  const dug = baseHeightFast(cx, cz) - cy;
   if (dug > 0.08) c.lerp(TERRAIN_SCORCH, Math.min(1, dug / 0.6));
   if (cy < WATER_SURFACE_Y + 0.05) {
     c.lerp(TERRAIN_BED, Math.min(1, (WATER_SURFACE_Y + 0.05 - cy) / 0.5));
@@ -563,6 +606,7 @@ function makeWaterHeightTexture(): THREE.DataTexture {
   // RGBA8 (universally linear-filterable) with ground height encoded into the
   // [-2,2]m range; the shader decodes r*4-2. (Float textures aren't reliably
   // linear-filterable across GPUs.)
+  warmBaseHeightGrid(); // one grid pass serves this texture AND face coloring
   const N = 192;
   const span = MAP.size;
   const data = new Uint8Array(N * N * 4);
@@ -570,7 +614,7 @@ function makeWaterHeightTexture(): THREE.DataTexture {
     for (let i = 0; i < N; i++) {
       const x = -span / 2 + (i / (N - 1)) * span;
       const z = -span / 2 + (j / (N - 1)) * span;
-      const v = Math.max(0, Math.min(255, Math.round(((baseHeightAt(x, z) + 2) / 4) * 255)));
+      const v = Math.max(0, Math.min(255, Math.round(((baseHeightFast(x, z) + 2) / 4) * 255)));
       const o = (j * N + i) * 4;
       data[o] = v;
       data[o + 1] = v;
@@ -853,7 +897,22 @@ function removeDecalsInCrater(c: { x: number; z: number; r: number }): void {
   }
 }
 
+// Startup stage timings (exposed via __fps.bootPerf, logged once per stage) —
+// the load screen hides real seconds of synchronous work; this says where.
+const bootPerf: Record<string, number> = {};
+let bootPerfSeq = 0;
+
+function recordBootStage(stage: string, t0: number): void {
+  const ms = performance.now() - t0;
+  bootPerf[`${++bootPerfSeq}:${stage}`] = Math.round(ms);
+  console.log(`[fps] ${stage}: ${ms.toFixed(0)}ms (at ${performance.now().toFixed(0)}ms)`);
+}
+
+let mapVisualsBuilt = false;
+
 function buildMapVisuals(): void {
+  const tBuild0 = performance.now();
+  mapVisualsBuilt = true;
   scene.remove(mapGroup);
   mapGroup.traverse((o) => {
     if (o instanceof THREE.InstancedMesh) o.dispose();
@@ -873,10 +932,13 @@ function buildMapVisuals(): void {
       rebuildTerrainChunk(ci, cj);
     }
   }
+  recordBootStage("buildMapVisuals:terrain", tBuild0);
+  const tRings0 = performance.now();
   // The world beyond the core: a collidable apron then a fog-bound backdrop.
   // (Roads are baked into the terrain faces in colorTerrainFace — no overlay.)
   mapGroup.add(makeRingVisual(MAP.size / 2 - 4, APRON_OUTER, 8, false));
   mapGroup.add(makeRingVisual(APRON_OUTER, BACKDROP_OUTER, 18, true));
+  recordBootStage("buildMapVisuals:rings", tRings0);
 
   // Conquest flags: a pole at each zone center, cloth raising toward the
   // capturing team's color.
@@ -900,6 +962,7 @@ function buildMapVisuals(): void {
     zoneFlags.push({ flag, mat, baseY, x: def.x, z: def.z });
   }
 
+  const tRest0 = performance.now();
   // One translucent sheet at water level: it only shows where the terrain
   // dips below it (the river and the lakes).
   const water = new THREE.Mesh(new THREE.PlaneGeometry(MAP.size, MAP.size), waterMat);
@@ -965,6 +1028,8 @@ function buildMapVisuals(): void {
   for (let i = 0; i < fracturePools.length; i++) {
     fracturePools[i].rebuild(FRACTURE_GEOS[i], mapGroup);
   }
+  recordBootStage("buildMapVisuals:panels+rest", tRest0);
+  recordBootStage("buildMapVisuals", tBuild0);
 }
 
 // Runtime pieces (rubble, settled fallen pieces, deployed cover) claim
@@ -2167,8 +2232,15 @@ function copyCtrl(into: CharState, from: CharState): void {
 async function buildWorlds(): Promise<void> {
   const buildId = ++worldBuildSeq;
   needHardAdopt = true;
+  // Let the browser paint (the intro screen, the roster) before the scene
+  // build blocks the main thread for seconds; also lets the queued model
+  // fetches dispatch instead of stalling behind it.
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  if (buildId !== worldBuildSeq) return;
   buildMapVisuals();
+  const tWorld0 = performance.now();
   const next = await createGameWorld(destroyedSet);
+  recordBootStage("createGameWorld", tWorld0);
   if (buildId !== worldBuildSeq) {
     destroyGameWorld(next);
     return;
@@ -4328,7 +4400,9 @@ function introAssetsLoaded(): { loaded: number; total: number } {
 
 function introReady(): boolean {
   const { loaded, total } = introAssetsLoaded();
-  return (introAssetsTimedOut || loaded >= total) && connected && selfIdx >= 0;
+  // gw != null means buildWorlds finished: the scene + physics mirror are in
+  // place, so deploying drops into a live world instead of a blocked frame.
+  return (introAssetsTimedOut || loaded >= total) && connected && selfIdx >= 0 && gw !== null;
 }
 
 function updateIntroPanel(): void {
@@ -4345,14 +4419,28 @@ function updateIntroPanel(): void {
     el.introStatus.textContent = wantsTouch ? "tap to enter the battlefield" : "good hunting";
   } else {
     el.deploy.disabled = true;
-    el.deploy.textContent = assetsReady ? "CONNECTING…" : `LOADING ASSETS ${loaded}/${total}…`;
-    el.introStatus.textContent = assetsReady ? "waiting for the server…" : "fetching models…";
+    if (!assetsReady) {
+      el.deploy.textContent = `LOADING ASSETS ${loaded}/${total}…`;
+      el.introStatus.textContent = "fetching models…";
+    } else if (!connected || selfIdx < 0) {
+      el.deploy.textContent = "CONNECTING…";
+      el.introStatus.textContent = "waiting for the server…";
+    } else {
+      el.deploy.textContent = "PREPARING BATTLEFIELD…";
+      el.introStatus.textContent = "building the world…";
+    }
   }
 }
 
 const introTimer = setInterval(() => {
   if (!introVisible) return;
-  if (performance.now() - INTRO_BORN_AT > INTRO_ASSET_TIMEOUT_MS) introAssetsTimedOut = true;
+  if (performance.now() - INTRO_BORN_AT > INTRO_ASSET_TIMEOUT_MS) {
+    introAssetsTimedOut = true;
+    // No server in sight (e.g. the bare Vite client in dev): build the world
+    // anyway so a forced deploy / free-cam inspection has something to show.
+    // With a connection this never runs — the welcome triggers buildWorlds().
+    if (!connected && !mapVisualsBuilt) buildMapVisuals();
+  }
   updateIntroPanel();
 }, 150);
 
@@ -4379,10 +4467,13 @@ document.getElementById("boot")?.remove();
 // Boot.
 
 async function boot(): Promise<void> {
-  buildMapVisuals();
+  bootPerf["0:moduleEvalDoneAt"] = Math.round(performance.now());
   void readStreams();
   void readDatagrams();
   frame();
+  // No scene build here: the welcome message triggers buildWorlds(), which
+  // does it with the round's actual destruction state. Building eagerly too
+  // used to double the load time (two ~4s builds back to back).
   try {
     await client.ready;
     connected = true;
@@ -4444,6 +4535,7 @@ declare global {
       audioVolume(): number;
       setAudioVolume(value: number): void;
       introVisible(): boolean;
+      bootPerf(): Record<string, number>;
       deploy(): void;
       nameTags(): Array<{ idx: number; name: string; visible: boolean }>;
       perf(): Record<string, number>;
@@ -4515,6 +4607,7 @@ window.__fps = {
     setMasterVolume(value);
   },
   introVisible: () => introVisible,
+  bootPerf: () => ({ ...bootPerf }),
   deploy: () => dismissIntro(), // force-dismiss for scripted playtests
   nameTags: () =>
     [...remotes.entries()].map(([idx, rp]) => {
