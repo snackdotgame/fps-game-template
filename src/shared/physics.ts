@@ -22,7 +22,7 @@ import {
   SANDBOX,
   TICK_RATE,
 } from "./constants.js";
-import { WEAPONS, weaponByIdx, type WeaponDef } from "./weapons.js";
+import { secondaryIdxFor, weaponByIdx, type WeaponDef } from "./weapons.js";
 import {
   APRON_OUTER,
   type BuildingDef,
@@ -115,7 +115,7 @@ export const RECOIL_CAP_TICKS = 27;
 const RECOIL_ADD_TICKS = 9;
 
 export function activeWeapon(s: CharState): WeaponDef {
-  return s.slot === 1 ? WEAPONS.pistol : weaponByIdx(s.primary);
+  return weaponByIdx(s.slot === 1 ? secondaryIdxFor(s.primary) : s.primary);
 }
 
 // Recoil bends the actual bullet path up, not just the view: consecutive
@@ -198,7 +198,7 @@ export function makeChar(spawn: readonly number[], primary = 0): CharState {
     cooldownTicks: 0,
     reloadTicks: 0,
     ammo: weaponByIdx(primary).mag,
-    ammo2: WEAPONS.pistol.mag,
+    ammo2: weaponByIdx(secondaryIdxFor(primary)).mag,
     slot: 0,
     primary,
     recoilTicks: 0,
@@ -869,7 +869,7 @@ export function stepPlayerController(
 
   // --- Weapons (deterministic state; effects via hooks). ---
   const primaryDef = weaponByIdx(s.primary);
-  const secondaryDef = WEAPONS.pistol;
+  const secondaryDef = weaponByIdx(secondaryIdxFor(s.primary));
   if (SANDBOX) {
     // Bottomless supplies in the test environment (shared constant, so
     // prediction and server still agree exactly).

@@ -56,11 +56,11 @@ export const WEAPONS = {
     cooldownTicks: 12,
     mag: 8,
     reloadTicks: 72,
-    range: 26,
+    range: 34,
     panelDamage: 16, // per pellet — shreds cover up close
-    spreadBase: 0.05,
-    spreadMove: 0.07,
-    spreadAir: 0.11,
+    spreadBase: 0.034,
+    spreadMove: 0.05,
+    spreadAir: 0.09,
     kick: 0.07,
     pellets: 7,
   },
@@ -93,6 +93,21 @@ export const WEAPONS = {
     kick: 0.028,
     semiAuto: true,
   },
+  revolver: {
+    name: "Revolver",
+    damage: 34, // two body shots kill — a real hand cannon
+    headshotMult: 2,
+    cooldownTicks: 9, // slow, deliberate hammer
+    mag: 6,
+    reloadTicks: 48,
+    range: 75,
+    panelDamage: 10,
+    spreadBase: 0.004,
+    spreadMove: 0.012,
+    spreadAir: 0.05,
+    kick: 0.055,
+    semiAuto: true,
+  },
 } satisfies Record<string, WeaponDef>;
 
 export type WeaponId = keyof typeof WEAPONS;
@@ -104,36 +119,47 @@ export const WEAPON_IDS = [
   "shotgun",
   "sniper",
   "pistol",
+  "revolver",
 ] as const satisfies readonly WeaponId[];
 export const WEAPON_LIST: readonly WeaponDef[] = WEAPON_IDS.map((id) => WEAPONS[id]);
 export const WEAPON_IDX: Record<WeaponId, number> = Object.fromEntries(
   WEAPON_IDS.map((id, i) => [id, i]),
 ) as Record<WeaponId, number>;
-export const PISTOL_IDX = WEAPON_IDX.pistol;
 
 export function weaponByIdx(idx: number): WeaponDef {
   return WEAPON_LIST[idx] ?? WEAPONS.rifle;
 }
 
-// --- Classes: a primary weapon pick. Appearance stays team-only (red vs
+// --- Classes: a primary + sidearm pick. Appearance stays team-only (red vs
 // blue soldiers) — the class reads from the weapon in their hands. Everyone
-// carries the pistol secondary, the sledgehammer, grenades, and build supply.
+// also carries the sledgehammer, grenades, and build supply.
 export interface ClassDef {
   name: string;
   primary: WeaponId;
+  secondary: WeaponId;
   blurb: string; // one-liner for the class picker
 }
 
 export const CLASSES: readonly ClassDef[] = [
-  { name: "Assault", primary: "rifle", blurb: "all-round rifle" },
-  { name: "Raider", primary: "smg", blurb: "run & gun up close" },
-  { name: "Breacher", primary: "shotgun", blurb: "door-kicking shredder" },
-  { name: "Marksman", primary: "sniper", blurb: "one shot, one kill" },
+  { name: "Assault", primary: "rifle", secondary: "pistol", blurb: "all-round rifle" },
+  { name: "Raider", primary: "smg", secondary: "pistol", blurb: "run & gun up close" },
+  { name: "Breacher", primary: "shotgun", secondary: "revolver", blurb: "door-kicking shredder" },
+  { name: "Marksman", primary: "sniper", secondary: "pistol", blurb: "one shot, one kill" },
 ];
 
 export function classPrimaryIdx(classId: number): number {
   const cls = CLASSES[classId] ?? CLASSES[0];
   return WEAPON_IDX[cls.primary];
+}
+
+// The sidearm that pairs with a primary. Each class has a unique primary, so
+// the secondary derives from the primary index already in CharState — no
+// extra networked state needed.
+export function secondaryIdxFor(primaryIdx: number): number {
+  for (const cls of CLASSES) {
+    if (WEAPON_IDX[cls.primary] === primaryIdx) return WEAPON_IDX[cls.secondary];
+  }
+  return WEAPON_IDX.pistol;
 }
 
 export const RIFLE = WEAPONS.rifle;

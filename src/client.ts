@@ -13,7 +13,13 @@ import {
   TICK_MS,
   TICK_RATE,
 } from "./shared/constants.js";
-import { CLASSES, PISTOL_IDX, WEAPON_IDX, WEAPON_LIST, classPrimaryIdx } from "./shared/weapons.js";
+import {
+  CLASSES,
+  WEAPON_IDX,
+  WEAPON_LIST,
+  classPrimaryIdx,
+  secondaryIdxFor,
+} from "./shared/weapons.js";
 import {
   addCrater,
   APRON_OUTER,
@@ -1761,6 +1767,7 @@ const SHOT_FX: Record<string, { pitch: number; vol: number }> = {
   Shotgun: { pitch: 0.72, vol: 1.1 },
   Sniper: { pitch: 0.62, vol: 1.15 },
   Pistol: { pitch: 1.35, vol: 0.8 },
+  Revolver: { pitch: 0.9, vol: 1.05 },
 };
 
 const sounds = {
@@ -3050,12 +3057,13 @@ const VIEW_WEAPON_FILES: RegExp[] = [
   /\/Shotgun\.gltf$/i,
   /\/Sniper\.gltf$/i,
   /\/Pistol\.gltf$/i,
+  /\/Revolver\.gltf$/i,
 ];
 // Bounding-height each view weapon is scaled to (the models' proportions
 // differ wildly; a pistol scaled to rifle height fills the screen).
-const VIEW_WEAPON_HEIGHT = [0.42, 0.34, 0.4, 0.46, 0.22];
+const VIEW_WEAPON_HEIGHT = [0.42, 0.34, 0.4, 0.46, 0.22, 0.26];
 // The weapon node shown in a character's hands, by WEAPON_LIST index.
-const WEAPON_NODE_NAMES = ["AK", "SMG", "Shotgun", "Sniper", "Pistol"];
+const WEAPON_NODE_NAMES = ["AK", "SMG", "Shotgun", "Sniper", "Pistol", "Revolver"];
 let externalAssetsRequested = false;
 const EXTERNAL_CHARACTER_YAW = 0; // Quaternius characters face local +Z, like the blocky rig.
 const EXTERNAL_VIEW_WEAPON_YAW = -Math.PI / 2; // gun barrels run down -X; turn to the camera's -Z (forward).
@@ -3424,7 +3432,7 @@ function applyRemoteWeapon(rp: RemotePlayer): void {
 function updateViewWeapon(): void {
   const want = predState
     ? predState.slot === 1
-      ? PISTOL_IDX
+      ? secondaryIdxFor(predState.primary)
       : predState.primary
     : WEAPON_IDX.rifle;
   const current = viewModel.userData.weaponIdx as number | undefined;
@@ -4822,7 +4830,7 @@ function makeClassPicker(container: HTMLElement): void {
     b.title = cls.blurb;
     b.innerHTML = `<div class="cn">${cls.name.toUpperCase()}</div><div class="cw">${
       WEAPON_LIST[classPrimaryIdx(i)].name
-    } + Pistol</div>`;
+    } + ${WEAPON_LIST[secondaryIdxFor(classPrimaryIdx(i))].name}</div>`;
     b.addEventListener("click", (e) => {
       e.stopPropagation();
       selectClass(i);
