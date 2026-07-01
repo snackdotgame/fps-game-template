@@ -26,6 +26,7 @@
     },
     "name": "Breachpoint",
     "titleImage": "assets/breachpoint-cover.webp",
+    "genre": "shooter",
     "visibility": "public",
     "slug": "breachpoint",
     "id": "dfcbff67-a970-4e0e-b355-557d9770b1a4"
