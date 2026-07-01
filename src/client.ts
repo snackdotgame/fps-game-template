@@ -39,7 +39,7 @@ import {
 import { RUBBLE_HEIGHT } from "./shared/constants.js";
 import { BUILT_PANEL_ID_BASE } from "./shared/map.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
-import { parseServerMsg, type PlayerInfo } from "./shared/messages.js";
+import { parseServerMsg, SPAWN_AUTO, SPAWN_HQ, type PlayerInfo } from "./shared/messages.js";
 import {
   decodeSnapshot,
   encodeInputs,
@@ -1231,12 +1231,41 @@ hud.innerHTML = `
   #introKeys kbd { flex:0 0 auto; min-width:32px; text-align:center; padding:3px 7px; border-radius:6px; background:rgba(255,255,255,.12);
     border:1px solid rgba(255,255,255,.18); border-bottom-width:2px; font:700 12px/1.2 ui-monospace,monospace; }
   #introKeys span { opacity:.85; }
-  #deploy { margin-top:20px; width:100%; padding:13px 0; font:900 16px/1 "Trebuchet MS",system-ui,sans-serif; letter-spacing:2px;
+  #deploy, #respawnDeploy { margin-top:20px; width:100%; padding:13px 0; font:900 16px/1 "Trebuchet MS",system-ui,sans-serif; letter-spacing:2px;
     color:#fff; background:#2f6fe0; border:0; border-radius:12px; cursor:pointer; transition:background 120ms ease, transform 80ms ease; }
-  #deploy:hover:not(:disabled) { background:#3f7ff0; }
-  #deploy:active:not(:disabled) { transform:scale(.98); }
-  #deploy:disabled { background:rgba(255,255,255,.12); color:rgba(255,255,255,.55); cursor:default; }
+  #deploy:hover:not(:disabled), #respawnDeploy:hover:not(:disabled) { background:#3f7ff0; }
+  #deploy:active:not(:disabled), #respawnDeploy:active:not(:disabled) { transform:scale(.98); }
+  #deploy:disabled, #respawnDeploy:disabled { background:rgba(255,255,255,.12); color:rgba(255,255,255,.55); cursor:default; }
+  #respawnDeploy { margin-top:14px; }
   #introStatus { margin-top:9px; font-size:12px; opacity:.6; min-height:14px; }
+  /* Spawn-selection minimap (intro + respawn overlay). */
+  .mapcap { font-size:12px; opacity:.72; margin:10px 0 6px; }
+  .minimap { position:relative; width:100%; aspect-ratio:1/1; border-radius:10px; overflow:hidden;
+    border:1px solid rgba(255,255,255,.16); background:#22303c; }
+  .minimap canvas { position:absolute; inset:0; width:100%; height:100%; }
+  .mm-flag { position:absolute; transform:translate(-50%,-50%); width:32px; height:32px; padding:0;
+    border-radius:9px; display:flex; align-items:center; justify-content:center; color:#fff;
+    font:900 14px "Trebuchet MS",system-ui,sans-serif; background:rgba(18,22,32,.82);
+    border:2px solid rgba(255,255,255,.3); transition:transform 80ms ease; }
+  .mm-flag.own { cursor:pointer; }
+  .mm-flag.own:hover { transform:translate(-50%,-50%) scale(1.15); }
+  .mm-flag:disabled { cursor:default; opacity:.8; }
+  /* Selectable-but-not-selected points pulse so it's obvious they're choices. */
+  .mm-flag.own:not(.sel) { animation:mmpulse 1.6s ease-in-out infinite; }
+  @keyframes mmpulse { 0%,100% { box-shadow:0 0 0 0 rgba(255,255,255,0); } 50% { box-shadow:0 0 10px 3px rgba(255,255,255,.55); } }
+  .mm-flag.sel { outline:3px solid #fff; outline-offset:1px; transform:translate(-50%,-50%) scale(1.12); }
+  .mm-hq { width:42px; height:26px; border-radius:7px; font-size:12px; letter-spacing:1px; }
+  .mm-hq.foe { opacity:.6; pointer-events:none; }
+  .mm-status { margin-top:8px; font-size:13px; font-weight:800; letter-spacing:.5px; opacity:.95; }
+  .mm-status b { letter-spacing:1px; }
+  #introMap { width:min(280px, 64vw); margin:0 auto; }
+  #respawn { position:fixed; inset:0; z-index:120; display:none; align-items:center; justify-content:center;
+    pointer-events:auto; background:rgba(6,9,15,.55); }
+  #respawn .rp { width:min(440px, 94vw); max-height:calc(100vh - 24px); overflow-y:auto; box-sizing:border-box;
+    text-align:center; padding:16px 24px 16px; background:rgba(12,16,26,.92);
+    border:1px solid rgba(255,255,255,.09); border-radius:16px; }
+  #respawn h2 { margin:0; font-size:24px; letter-spacing:2px; }
+  #respawnMap { width:min(380px, 84vw); margin:0 auto; }
 </style>
 <div id="hud">
   <div id="audioMenu" data-open="false">
@@ -1283,10 +1312,20 @@ hud.innerHTML = `
       <h1>FLAG CONQUEST</h1>
       <div class="isub">CAPTURE · CONTROL · CONQUER</div>
       <div id="introTeam">ASSIGNING TEAM…</div>
-      <div class="igoal"><b>Capture and control the flags.</b> Hold more zones (A · B · C) than the enemy to bleed their tickets — every death costs one too. First team to run the other down to zero wins.</div>
+      <div class="igoal"><b>Capture and hold the flags.</b></div>
+      <div class="mapcap">pick a spawn point — your HQ or any flag your team holds</div>
+      <div id="introMap"></div>
       <div id="introKeys"></div>
       <button id="deploy" type="button" disabled>LOADING…</button>
       <div id="introStatus"></div>
+    </div>
+  </div>
+  <div id="respawn">
+    <div class="rp">
+      <h2>YOU'RE DOWN</h2>
+      <div class="mapcap">pick a spawn point — your HQ or any flag your team holds</div>
+      <div id="respawnMap"></div>
+      <button id="respawnDeploy" type="button" disabled></button>
     </div>
   </div>
 </div>`;
@@ -1321,7 +1360,11 @@ const el = {
   introTeam: document.getElementById("introTeam")!,
   introKeys: document.getElementById("introKeys")!,
   introStatus: document.getElementById("introStatus")!,
+  introMap: document.getElementById("introMap")!,
   deploy: document.getElementById("deploy") as HTMLButtonElement,
+  respawn: document.getElementById("respawn")!,
+  respawnMap: document.getElementById("respawnMap")!,
+  respawnDeploy: document.getElementById("respawnDeploy") as HTMLButtonElement,
 };
 
 function updateAudioMenu(): void {
@@ -2310,6 +2353,9 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       for (const c of msg.craters) addCrater(c);
       lastAckTick = msg.serverTick;
       refreshAllNameTags();
+      // A fresh welcome means a fresh server-side player: replay our spawn
+      // preference so it survives reconnects.
+      if (spawnChoice !== SPAWN_AUTO) sendSpawnChoice();
       void buildWorlds();
       break;
     }
@@ -2503,8 +2549,13 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
   const prevSelfStatus = selfStatus;
   selfStatus = snap.self.status;
   if ((prevSelfStatus & SS_DEAD) === 0 && (selfStatus & SS_DEAD) !== 0 && predState) {
-    const myTeam = roster.get(selfIdx)?.team ?? 0;
-    spawnCorpse(new THREE.Vector3(predState.x, predState.y, predState.z), yaw, myTeam);
+    const team = roster.get(selfIdx)?.team ?? 0;
+    spawnCorpse(new THREE.Vector3(predState.x, predState.y, predState.z), yaw, team);
+  }
+  // Back alive: the server just respawned us — face the action from the new
+  // spawn position before the first rendered frame.
+  if ((prevSelfStatus & SS_DEAD) !== 0 && (selfStatus & SS_DEAD) === 0) {
+    faceTheAction(snap.self.state.x, snap.self.state.z);
   }
   selfHp = snap.self.hp;
   respawnTicks = snap.self.respawnTicks;
@@ -4317,17 +4368,15 @@ function updateHud(): void {
   }
 
   const dead = (selfStatus & SS_DEAD) !== 0;
-  if (introVisible) {
-    // The intro/deploy screen owns the viewport; the state overlay would just
-    // bleed through behind it.
+  updateRespawnOverlay(dead, performance.now());
+  if (introVisible || (dead && phase === "playing")) {
+    // The intro/deploy screen or the respawn overlay owns the viewport; the
+    // state overlay would just bleed through behind it.
     el.overlay.style.display = "none";
   } else if (phase === "results") {
     const winner =
       scores[0] === scores[1] ? "Draw" : `${TEAM_NAMES[scores[0] > scores[1] ? 0 : 1]} wins`;
     el.overlaypanel.innerHTML = `<h1>${winner}</h1><p>${scores[0]} — ${scores[1]}</p><p>next round starting…</p>`;
-    el.overlay.style.display = "flex";
-  } else if (dead) {
-    el.overlaypanel.innerHTML = `<h1>You're down</h1><p>respawn in ${Math.ceil(respawnTicks / TICK_RATE)}s</p>`;
     el.overlay.style.display = "flex";
   } else if (!connected) {
     el.overlaypanel.innerHTML = `<h1>Flag Conquest</h1><p>connecting…</p>`;
@@ -4355,6 +4404,242 @@ function updateHud(): void {
   el.netinfo.textContent = `rtt ${rtt === null ? "—" : Math.round(rtt)}ms · rollbacks ${rollbacks} · ${perf.fps.toFixed(
     0,
   )}fps · ${perf.avgFrameMs.toFixed(1)}ms`;
+}
+
+// ---------------------------------------------------------------------------
+// Spawn selection: a clickable minimap (in the intro and the respawn overlay)
+// that lets the player deploy at their HQ or any flag their team holds. The
+// choice is a reliable stream message; the server honors it at (re)spawn time
+// while the flag is still held, falling back to auto otherwise.
+
+// HQ is pre-selected so the map always shows exactly where you'll spawn;
+// picking a held flag overrides it.
+let spawnChoice = SPAWN_HQ;
+
+function sendSpawnChoice(): void {
+  void client.streams.send({ type: "spawnat", zone: spawnChoice }).catch(() => {});
+}
+
+function selectSpawn(zone: number): void {
+  spawnChoice = zone;
+  sendSpawnChoice();
+  refreshMinimaps();
+}
+
+// Face the fight on spawn: aim at the nearest flag the team does NOT hold
+// (that's where the action is in conquest), or the map centre if they hold
+// everything. Spawning with your back to the battlefield reads as a bug.
+function faceTheAction(fromX: number, fromZ: number): void {
+  const team = myTeam();
+  let tx = 0;
+  let tz = 0;
+  let best = Infinity;
+  for (let i = 0; i < ZONES.length && i < zoneState.length; i++) {
+    if (zoneState[i].owner === team) continue;
+    const d = Math.hypot(ZONES[i].x - fromX, ZONES[i].z - fromZ);
+    if (d < best) {
+      best = d;
+      tx = ZONES[i].x;
+      tz = ZONES[i].z;
+    }
+  }
+  const dx = tx - fromX;
+  const dz = tz - fromZ;
+  if (Math.hypot(dx, dz) < 2) return;
+  yaw = Math.atan2(dx, dz);
+  pitch = 0;
+}
+
+// Terrain backdrop for the minimaps, painted once from the cached pristine
+// heightfield: water, height-shaded grass, and the baked roads.
+const MM_N = 216; // 1px per metre across ±PLAY_HALF
+let mmBase: HTMLCanvasElement | null = null;
+
+function minimapBase(): HTMLCanvasElement {
+  if (mmBase) return mmBase;
+  const canvas = document.createElement("canvas");
+  canvas.width = MM_N;
+  canvas.height = MM_N;
+  const ctx = canvas.getContext("2d")!;
+  const img = ctx.createImageData(MM_N, MM_N);
+  const lo = new THREE.Color(0x4a7440);
+  const hi = new THREE.Color(0x93a464);
+  const water = new THREE.Color(0x2a5a74);
+  const c = new THREE.Color();
+  for (let j = 0; j < MM_N; j++) {
+    const z = -PLAY_HALF + ((j + 0.5) / MM_N) * 2 * PLAY_HALF;
+    for (let i = 0; i < MM_N; i++) {
+      const x = -PLAY_HALF + ((i + 0.5) / MM_N) * 2 * PLAY_HALF;
+      const h = baseHeightFast(x, z);
+      if (h < WATER_SURFACE_Y) {
+        c.copy(water);
+      } else {
+        c.copy(lo).lerp(hi, Math.max(0, Math.min(1, (h + 0.4) / 3.5)));
+        const road = roadAt(x, z);
+        if (road.w > 0.4) c.setHex(road.cobble ? 0x8a857d : 0x7a6446);
+      }
+      const o = (j * MM_N + i) * 4;
+      img.data[o] = c.r * 255;
+      img.data[o + 1] = c.g * 255;
+      img.data[o + 2] = c.b * 255;
+      img.data[o + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+  mmBase = canvas;
+  return canvas;
+}
+
+const mmPct = (v: number): string => `${(((v + PLAY_HALF) / (2 * PLAY_HALF)) * 100).toFixed(1)}%`;
+
+interface Minimap {
+  refresh(): void;
+}
+const minimaps: Minimap[] = [];
+
+function makeMinimap(container: HTMLElement): void {
+  const root = document.createElement("div");
+  root.className = "minimap";
+  const canvas = document.createElement("canvas");
+  canvas.width = MM_N;
+  canvas.height = MM_N;
+  canvas.getContext("2d")!.drawImage(minimapBase(), 0, 0);
+  root.appendChild(canvas);
+
+  const zoneBtns = ZONES.map((def, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "mm-flag";
+    b.disabled = true;
+    b.textContent = def.letter;
+    b.style.left = mmPct(def.x);
+    b.style.top = mmPct(def.z);
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (!b.disabled) selectSpawn(i);
+    });
+    root.appendChild(b);
+    return b;
+  });
+  const hq = document.createElement("button");
+  hq.type = "button";
+  hq.className = "mm-flag mm-hq own";
+  hq.textContent = "HQ";
+  hq.style.display = "none"; // positioned once the team is known
+  hq.addEventListener("click", (e) => {
+    e.stopPropagation();
+    selectSpawn(SPAWN_HQ);
+  });
+  root.appendChild(hq);
+  // The enemy base, marked but never selectable — both HQs read as the
+  // anchors of the map, and yours doubles as a spawn point.
+  const hqFoe = document.createElement("div");
+  hqFoe.className = "mm-flag mm-hq foe";
+  hqFoe.textContent = "HQ";
+  hqFoe.style.display = "none";
+  root.appendChild(hqFoe);
+  const status = document.createElement("div");
+  status.className = "mm-status";
+  container.appendChild(root);
+  container.appendChild(status);
+
+  const refresh = (): void => {
+    const team = myTeam();
+    for (let i = 0; i < zoneBtns.length; i++) {
+      const owner = zoneState[i]?.owner ?? -1;
+      const own = owner >= 0 && owner === team;
+      const b = zoneBtns[i];
+      b.disabled = !own;
+      b.classList.toggle("own", own);
+      // A pick the team has since lost falls back to auto server-side, so
+      // don't keep showing it as the selection.
+      b.classList.toggle("sel", spawnChoice === i && own);
+      b.style.borderColor = owner >= 0 ? TEAM_COLORS_CSS[owner] : "rgba(255,255,255,.3)";
+      b.style.background = owner >= 0 ? `${TEAM_COLORS_CSS[owner]}cc` : "rgba(18,22,32,.82)";
+    }
+    if (team >= 0) {
+      const base = MAP.spawns[team];
+      hq.style.display = "flex";
+      hq.style.left = mmPct(base[0]);
+      hq.style.top = mmPct(base[2]);
+      hq.style.borderColor = TEAM_COLORS_CSS[team];
+      hq.style.background = `${TEAM_COLORS_CSS[team]}cc`;
+      hq.classList.toggle("sel", spawnChoice === SPAWN_HQ);
+      const foeBase = MAP.spawns[1 - team];
+      hqFoe.style.display = "flex";
+      hqFoe.style.left = mmPct(foeBase[0]);
+      hqFoe.style.top = mmPct(foeBase[2]);
+      hqFoe.style.borderColor = TEAM_COLORS_CSS[1 - team];
+      hqFoe.style.background = `${TEAM_COLORS_CSS[1 - team]}55`;
+    }
+    const picked = spawnChoice >= 0 && zoneState[spawnChoice]?.owner === team;
+    const label = picked
+      ? `FLAG ${ZONES[spawnChoice].letter}`
+      : spawnChoice >= 0
+        ? "AUTO — flag lost"
+        : "HQ";
+    status.innerHTML = `spawning at <b style="color:${team >= 0 ? TEAM_COLORS_CSS[team] : "#fff"}">${label}</b>`;
+  };
+  refresh();
+  minimaps.push({ refresh });
+}
+
+function refreshMinimaps(): void {
+  for (const m of minimaps) m.refresh();
+}
+
+makeMinimap(el.introMap);
+makeMinimap(el.respawnMap);
+
+// The respawn overlay: shown while dead (after the intro), hosting the spawn
+// map + the DEPLOY button — respawning is always an explicit click, never
+// automatic. Pointer lock is released so the buttons are clickable, and
+// re-requested on respawn (browsers that demand a fresh gesture fall back to
+// the usual click-to-lock).
+let respawnShown = false;
+let deployRequested = false;
+let lastMinimapRefresh = 0;
+
+el.respawnDeploy.addEventListener("click", () => {
+  if (deployRequested || respawnTicks > 0) return;
+  deployRequested = true;
+  void client.streams.send({ type: "deploy" }).catch(() => {});
+});
+
+function updateRespawnOverlay(dead: boolean, now: number): void {
+  const show = dead && !introVisible && phase === "playing" && connected;
+  if (show !== respawnShown) {
+    respawnShown = show;
+    (el.respawn as HTMLElement).style.display = show ? "flex" : "none";
+    if (show) {
+      deployRequested = false;
+      document.exitPointerLock();
+      refreshMinimaps();
+    } else if (!wantsTouch && !introVisible) {
+      try {
+        void (
+          renderer.domElement.requestPointerLock() as unknown as Promise<void> | undefined
+        )?.catch(() => {});
+      } catch {
+        /* needs a fresh gesture; the canvas click handler covers it */
+      }
+    }
+  }
+  if (!show) return;
+  if (deployRequested) {
+    el.respawnDeploy.disabled = true;
+    el.respawnDeploy.textContent = "DEPLOYING…";
+  } else if (respawnTicks > 0) {
+    el.respawnDeploy.disabled = true;
+    el.respawnDeploy.textContent = `DEPLOY IN ${Math.ceil(respawnTicks / TICK_RATE)}s`;
+  } else {
+    el.respawnDeploy.disabled = false;
+    el.respawnDeploy.textContent = "DEPLOY";
+  }
+  if (now - lastMinimapRefresh > 250) {
+    lastMinimapRefresh = now;
+    refreshMinimaps();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -4442,6 +4727,7 @@ const introTimer = setInterval(() => {
     if (!connected && !mapVisualsBuilt) buildMapVisuals();
   }
   updateIntroPanel();
+  refreshMinimaps(); // live zone ownership on the deploy map
 }, 150);
 
 function dismissIntro(): void {
@@ -4450,6 +4736,8 @@ function dismissIntro(): void {
   clearInterval(introTimer);
   el.intro.style.display = "none";
   ensureAudio();
+  // Deploy into the fight, not staring at the map edge.
+  if (predState) faceTheAction(predState.x, predState.z);
   if (!wantsTouch) renderer.domElement.requestPointerLock();
 }
 
@@ -4538,6 +4826,9 @@ declare global {
       bootPerf(): Record<string, number>;
       deploy(): void;
       nameTags(): Array<{ idx: number; name: string; visible: boolean }>;
+      spawnChoice(): number;
+      selectSpawn(zone: number): void;
+      yawPitch(): [number, number];
       perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
       drive(over: Partial<Omit<InputCmd, "seq">> & { trackIdx?: number }, ticks: number): void;
@@ -4609,6 +4900,9 @@ window.__fps = {
   introVisible: () => introVisible,
   bootPerf: () => ({ ...bootPerf }),
   deploy: () => dismissIntro(), // force-dismiss for scripted playtests
+  spawnChoice: () => spawnChoice,
+  selectSpawn: (zone) => selectSpawn(zone),
+  yawPitch: () => [yaw, pitch] as [number, number],
   nameTags: () =>
     [...remotes.entries()].map(([idx, rp]) => {
       const sprite = rp.group.userData.nameSprite as THREE.Sprite | undefined;

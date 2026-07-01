@@ -58,7 +58,7 @@ import {
   spawnPoint,
   ZONES,
 } from "./map.js";
-import { type ServerMsg } from "./messages.js";
+import { SPAWN_AUTO, SPAWN_HQ, type ServerMsg } from "./messages.js";
 import {
   EV_EXPLOSION,
   EV_HIT_PLAYER,
@@ -157,6 +157,14 @@ export interface SimPlayer {
   kills: number;
   deaths: number;
   oobSinceTick: number; // tick this player left the play area, or -1 if in bounds
+  // Requested respawn point: a ZONES index, SPAWN_HQ, or SPAWN_AUTO (default;
+  // bots always stay on auto). Honored while the team holds the flag.
+  spawnZone: number;
+  // Humans (autoRespawn=false, set by the server) stay down until they send a
+  // deploy request; the respawn timer is the minimum, not the trigger. Bots
+  // keep the automatic respawn.
+  autoRespawn: boolean;
+  wantsRespawn: boolean;
 }
 
 export interface Grenade {
@@ -311,6 +319,9 @@ export class GameSim {
       kills: 0,
       deaths: 0,
       oobSinceTick: -1,
+      spawnZone: SPAWN_AUTO,
+      autoRespawn: true,
+      wantsRespawn: false,
     };
     this.players[slot] = p;
     return p;
@@ -967,12 +978,18 @@ export class GameSim {
       p.history.push(p.state.x, p.state.y, p.state.z);
       if (p.dead) p.history.clear(); // don't rewind into a corpse
 
-      if (p.dead && this.tick >= p.respawnAtTick && this.phase === "playing") {
-        const spawn = this.chooseSpawn(p.team, p.idx);
+      if (
+        p.dead &&
+        this.tick >= p.respawnAtTick &&
+        this.phase === "playing" &&
+        (p.autoRespawn || p.wantsRespawn)
+      ) {
+        const spawn = this.chooseSpawn(p);
         p.state = makeChar(spawn);
         writeChar(p.body, p.state);
         p.hp = MAX_HP;
         p.dead = false;
+        p.wantsRespawn = false;
         p.protectUntilTick = this.tick + PROTECT_TICKS;
         p.oobSinceTick = -1;
       }
@@ -1048,9 +1065,47 @@ export class GameSim {
     }
   }
 
-  // Conquest spawning: at the base or any safely-held zone.
-  private chooseSpawn(team: number, idx: number): [number, number, number] {
-    const safe: Array<[number, number]> = [];
+  // Deploy request from a dead human: spawn as soon as the timer allows.
+  requestDeploy(idx: number): void {
+    const p = this.players[idx];
+    if (p && p.dead) p.wantsRespawn = true;
+  }
+
+  // Requested respawn point for a player, validated live at spawn time.
+  setSpawnZone(idx: number, zone: number): void {
+    const p = this.players[idx];
+    if (!p) return;
+    if (!Number.isInteger(zone) || zone < SPAWN_HQ || zone >= ZONES.length) return;
+    p.spawnZone = zone;
+    // A pick made on the deploy screen: the player is still untouched on the
+    // join pad, so this is a pre-battle choice — move them there right away
+    // (joins spawn at the base before the client can ask for anything else).
+    const held = zone >= 0 && this.zones[zone].owner === p.team;
+    if ((held || zone === SPAWN_HQ) && !p.dead && p.hp === MAX_HP && this.phase === "playing") {
+      const base = spawnPoint(p.team, p.idx);
+      if (Math.hypot(p.state.x - base[0], p.state.z - base[2]) < 2.5) {
+        p.state = makeChar(this.chooseSpawn(p));
+        writeChar(p.body, p.state);
+        p.history.clear(); // don't lag-comp rewind across the map
+        p.protectUntilTick = this.tick + PROTECT_TICKS;
+      }
+    }
+  }
+
+  // Conquest spawning: the player's chosen flag while their team holds it
+  // (their call — hot or not, spawn protection covers the landing), their
+  // base on request, else auto: the base or a random safely-held zone.
+  private chooseSpawn(p: SimPlayer): [number, number, number] {
+    const team = p.team;
+    if (p.spawnZone >= 0 && p.spawnZone < ZONES.length) {
+      if (this.zones[p.spawnZone].owner === team) {
+        return this.spawnAroundZone(p.spawnZone);
+      }
+      // The flag fell while they were down: auto below.
+    } else if (p.spawnZone === SPAWN_HQ) {
+      return spawnPoint(team, p.idx);
+    }
+    const safe: number[] = [];
     for (let i = 0; i < ZONES.length; i++) {
       if (this.zones[i].owner !== team) continue;
       const def = ZONES[i];
@@ -1066,13 +1121,17 @@ export class GameSim {
           break;
         }
       }
-      if (!hot) safe.push([def.x, def.z]);
+      if (!hot) safe.push(i);
     }
-    if (safe.length === 0 || this.rng() < 0.35) return spawnPoint(team, idx);
-    const [zx, zz] = safe[Math.floor(this.rng() * safe.length)];
+    if (safe.length === 0 || this.rng() < 0.35) return spawnPoint(team, p.idx);
+    return this.spawnAroundZone(safe[Math.floor(this.rng() * safe.length)]);
+  }
+
+  private spawnAroundZone(zoneIdx: number): [number, number, number] {
+    const def = ZONES[zoneIdx];
     const ang = this.rng() * Math.PI * 2;
-    const x = zx + Math.sin(ang) * 7;
-    const z = zz + Math.cos(ang) * 7;
+    const x = def.x + Math.sin(ang) * 7;
+    const z = def.z + Math.cos(ang) * 7;
     return [x, heightAt(x, z) + 0.1, z];
   }
 
@@ -1109,6 +1168,7 @@ export class GameSim {
       p.lastCmd = { seq: 0, ...ZERO_INPUT };
       p.hp = MAX_HP;
       p.dead = false;
+      p.wantsRespawn = false;
       p.kills = 0;
       p.deaths = 0;
       p.protectUntilTick = this.tick + PROTECT_TICKS;
