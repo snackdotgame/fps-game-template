@@ -12,7 +12,7 @@ files are checked in, renamed by the family prefix the manifest generator reads
 | `Isolated/7.62x39/WAV/762x39 Single Isolated WAV.wav` | `shot_ak_762.wav`    | `rifle_shot` |
 | `Full Sound/7.62x39/WAV/762x39 Single WAV.wav`        | `tail_ak_762.wav`    | `rifle_tail` |
 | `Reloads, Cycling & More/WAV/AK Reload Full WAV.wav`  | `reload_ak_full.wav` | `reload`     |
-| `Reloads, Cycling & More/WAV/AK Rack WAV.wav`         | `reload_ak_rack.wav` | `reload`     |
+| `Reloads, Cycling & More/WAV/AK Rack WAV.wav`         | `pump_ak_rack.wav`   | `pump`       |
 
 After changing the selected sounds, run:
 

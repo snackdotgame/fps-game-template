@@ -1696,8 +1696,9 @@ function playSoundAt(family: string, at: THREE.Vector3, volume = 1, pitch = 1): 
 }
 
 // Play a one-shot stretched to ~`seconds` long so a sample (e.g. the reload)
-// matches a fixed gameplay duration. No random pitch jitter.
-function playSoundFit(family: string, seconds: number, volume = 1): boolean {
+// matches a fixed gameplay duration. No random pitch jitter. Positional when
+// `at` is given.
+function playSoundFit(family: string, seconds: number, volume = 1, at?: THREE.Vector3): boolean {
   if (!audioCtx) return false;
   const buffers = soundBuffers.get(family);
   if (!buffers || buffers.length === 0) return false;
@@ -1705,7 +1706,7 @@ function playSoundFit(family: string, seconds: number, volume = 1): boolean {
   const source = audioCtx.createBufferSource();
   source.buffer = buffer;
   source.playbackRate.value = Math.max(0.5, Math.min(2, buffer.duration / seconds));
-  connectAudioNode(source, volume);
+  connectAudioNode(source, volume, at);
   source.start();
   logSound(family);
   return true;
@@ -1830,9 +1831,10 @@ const sounds = {
     if (!playSound("rifle_shot", fx.vol, fx.pitch)) noiseBurst(0.09, 0.16);
     void playSound("rifle_tail", 0.35, fx.pitch);
   },
-  shotAt: (at: THREE.Vector3) => {
-    if (!playSoundAt("rifle_shot", at, 0.9)) noiseBurst(0.1, 0.15, true, at);
-    void playSoundAt("rifle_tail", at, 0.35);
+  shotAt: (at: THREE.Vector3, weapon = "Rifle") => {
+    const fx = SHOT_FX[weapon] ?? SHOT_FX.Rifle;
+    if (!playSoundAt("rifle_shot", at, fx.vol, fx.pitch)) noiseBurst(0.1, 0.15, true, at);
+    void playSoundAt("rifle_tail", at, 0.35, fx.pitch);
   },
   shotFar: (d: number) => noiseBurst(0.12, Math.max(0.02, 0.14 - d * 0.002), true),
   explosionAt: (at: THREE.Vector3) => {
@@ -1869,6 +1871,17 @@ const sounds = {
     // Stretch the sample to the weapon's reload time so audio and the dip
     // line up.
     if (!playSoundFit("reload", seconds, 0.8)) blip(700, 0.06, 0.08);
+  },
+  // Pump-action rack between shotgun blasts (the AK-rack sample squeezed to a
+  // quick shk-shk); two dry clicks if samples haven't loaded.
+  pump: () => {
+    if (!playSoundFit("pump", 0.33, 0.8)) {
+      blip(300, 0.04, 0.12, "square");
+      setTimeout(() => blip(220, 0.05, 0.12, "square"), 110);
+    }
+  },
+  pumpAt: (at: THREE.Vector3) => {
+    if (!playSoundFit("pump", 0.33, 0.7, at)) blip(260, 0.05, 0.1, "square", at);
   },
   buildAt: (at: THREE.Vector3) => {
     if (!playSoundAt("impactWood_medium", at, 0.75, 0.9)) blip(240, 0.1, 0.14, "square", at);
@@ -2260,6 +2273,7 @@ interface RemotePlayer {
   // nibble, class primary (character model) high nibble.
   weaponByte: number;
   heldWeapon: number; // weapon node currently shown on the rig
+  lastPumpMs: number; // dedupes the pump sound across a blast's tracer events
   // Set once the Quaternius model + AnimationMixer replace the blocky fallback.
   anim?: CharacterAnim;
 }
@@ -2733,6 +2747,7 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
         createdAt: performance.now(),
         weaponByte: r.weapon,
         heldWeapon: -1,
+        lastPumpMs: 0,
       };
       remotes.set(r.idx, rp);
       attachExternalSoldier(rp); // swaps in the animated model when ready
@@ -2995,6 +3010,11 @@ function predictionTick(): void {
       // (sniper, revolver) blow past the light-weapon cap and slam the view,
       // the rifle nudges it.
       recoil = Math.min(1.6, recoil + (w.kick > 0.1 ? 1.5 : w.kick > 0.06 ? 0.7 : 0.4));
+      // Pump-action: rack the next shell shortly after the blast (while the
+      // ~570ms cycle runs), as long as a shell is left to chamber.
+      if (w.pellets && predState && (predState.slot === 1 ? predState.ammo2 : predState.ammo) > 0) {
+        setTimeout(() => sounds.pump(), 230);
+      }
       // Predicted tracers from local raycasts — instant feedback; the
       // server's events remain authoritative for hits and damage. Rays start
       // at the barrel like the server's (dir already carries recoil), and
@@ -3482,16 +3502,12 @@ function applyRemoteWeapon(rp: RemotePlayer): void {
   }
 }
 
-// Keep the first-person weapon in sync with the predicted state: the class
-// primary or the pistol, swapped the moment the state's slot flips.
-function updateViewWeapon(): void {
-  const want = predState
-    ? predState.slot === 1
-      ? secondaryIdxFor(predState.primary)
-      : predState.primary
-    : WEAPON_IDX.rifle;
-  const current = viewModel.userData.weaponIdx as number | undefined;
-  if (current === want) return;
+// Weapon-swap draw animation: the outgoing gun dips down off the viewport
+// (like the reload dip, but all the way out), the models trade at the bottom,
+// and the incoming gun rises back up. Paced to the shared draw delay.
+let swapDip = 0; // 0 = gun up; 1 = fully lowered off-screen
+
+function attachViewWeapon(want: number): void {
   const tpl = viewWeaponTemplates[want];
   if (!tpl) return; // template not loaded yet; retry next frame
   const old = viewModel.getObjectByName("externalWeapon");
@@ -3505,6 +3521,27 @@ function updateViewWeapon(): void {
   viewModel.add(model);
   viewModel.userData.weaponIdx = want;
   viewModel.userData.externalAttached = true;
+}
+
+// Keep the first-person weapon in sync with the predicted state: the class
+// primary or the sidearm, holstered/drawn through the swap animation.
+function updateViewWeapon(dt: number): void {
+  const want = predState
+    ? predState.slot === 1
+      ? secondaryIdxFor(predState.primary)
+      : predState.primary
+    : WEAPON_IDX.rifle;
+  const current = viewModel.userData.weaponIdx as number | undefined;
+  if (current === undefined) {
+    attachViewWeapon(want); // first load: no draw animation
+    return;
+  }
+  if (current !== want) {
+    swapDip = Math.min(1, swapDip + dt * 8); // holster: sink off-screen
+    if (swapDip >= 0.97) attachViewWeapon(want); // trade models at the bottom
+  } else {
+    swapDip = Math.max(0, swapDip - dt * 6.5); // draw: rise back up
+  }
 }
 
 loadExternalVisualAssets();
@@ -4117,10 +4154,21 @@ function processEvents(list: GameEvent[]): void {
         if (e.a !== selfIdx) {
           const from = muzzleOf(e.a);
           if (from) {
-            spawnTracer(from, at);
-            sounds.shotAt(from);
             const shooterRp = remotes.get(e.a);
+            const shooterWeapon = shooterRp ? weaponByteActive(shooterRp.weaponByte) : 0;
+            spawnTracer(from, at);
+            sounds.shotAt(from, WEAPON_LIST[shooterWeapon]?.name);
             if (shooterRp?.anim) shooterRp.anim.shootUntil = performance.now() + 280;
+            // Shotgun blasts arrive as several tracer events — pump once per
+            // blast, racking the next shell just after the boom.
+            if (shooterRp && shooterWeapon === WEAPON_IDX.shotgun) {
+              const nowMs = performance.now();
+              if (nowMs - shooterRp.lastPumpMs > 300) {
+                shooterRp.lastPumpMs = nowMs;
+                const pumpPos = from.clone();
+                setTimeout(() => sounds.pumpAt(pumpPos), 230);
+              }
+            }
             // Decal where the remote shot landed (skip max-range whiffs):
             // re-cast locally to learn what surface the endpoint sits on.
             const d = at.clone().sub(from);
@@ -4365,8 +4413,8 @@ function frame(): void {
   }
 
   // First-person weapon feel: a rest pose plus recoil, melee, a walk/sprint
-  // bob, a reload dip, and a distinct sprint sway (gun lowered and canted).
-  updateViewWeapon();
+  // bob, a reload dip, the swap holster/draw, and a distinct sprint sway.
+  updateViewWeapon(dt);
   const grounded = !!predState?.onGround && (selfStatus & SS_DEAD) === 0;
   const localSpeed = predState ? Math.hypot(predState.vx, predState.vz) : 0;
   const movingNow = grounded && localSpeed > ANIM_MOVE_SPEED;
@@ -4384,7 +4432,7 @@ function frame(): void {
   const sway = sprintBlend;
   viewModel.position.set(
     0.2 + bobX + sway * 0.05,
-    -0.3 - meleeSwing * 0.12 + bobY - dip * 0.14 - sway * 0.07,
+    -0.3 - meleeSwing * 0.12 + bobY - dip * 0.14 - sway * 0.07 - swapDip * 0.55,
     -0.34 + recoil * 0.06 + meleeSwing * -0.25 - dip * 0.05 + sway * 0.06,
   );
   // Converge the barrel on the crosshair: aim at a point down the view ray
@@ -4401,6 +4449,7 @@ function frame(): void {
       recoil * 0.25 +
       meleeSwing * 0.9 -
       dip * 0.55 - // reload: drop the muzzle
+      swapDip * 1.2 - // holster/draw: swing the gun down out of view
       sway * 0.3; // sprint: lower the muzzle, not raise it
     viewModel.rotation.z = sway * 0.35;
   }

@@ -53,7 +53,7 @@ export const WEAPONS = {
     name: "Shotgun",
     damage: 12, // per pellet
     headshotMult: 1.5,
-    cooldownTicks: 12,
+    cooldownTicks: 17, // pump-action: the ~570ms cycle leaves room for the shk-shk
     mag: 8,
     reloadTicks: 72,
     range: 34,
