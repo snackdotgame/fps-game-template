@@ -97,7 +97,7 @@ export const WEAPONS = {
     name: "Revolver",
     damage: 34, // two body shots kill — a real hand cannon
     headshotMult: 2,
-    cooldownTicks: 9, // slow, deliberate hammer
+    cooldownTicks: 15, // half a second between shots: cock the hammer
     mag: 6,
     reloadTicks: 48,
     range: 75,
@@ -105,7 +105,7 @@ export const WEAPONS = {
     spreadBase: 0.004,
     spreadMove: 0.012,
     spreadAir: 0.05,
-    kick: 0.055,
+    kick: 0.13, // bucks harder than the sniper — follow-ups must re-settle
     semiAuto: true,
   },
 } satisfies Record<string, WeaponDef>;
