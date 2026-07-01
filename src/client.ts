@@ -1295,7 +1295,7 @@ hud.innerHTML = `
 </style>
 <div id="hud">
   <div id="audioMenu" data-open="false">
-    <button id="audioTrigger" type="button" aria-label="Open audio settings" aria-expanded="false" aria-controls="audioPanel">
+    <button id="audioTrigger" type="button" aria-label="Open settings" aria-expanded="false" aria-controls="audioPanel">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/>
         <path d="M19.4 15a1.8 1.8 0 0 0 .36 1.98l.05.05a2.1 2.1 0 1 1-2.97 2.97l-.05-.05a1.8 1.8 0 0 0-1.98-.36 1.8 1.8 0 0 0-1.09 1.65V21.4a2.1 2.1 0 1 1-4.2 0v-.07a1.8 1.8 0 0 0-1.13-1.66 1.8 1.8 0 0 0-1.98.36l-.05.05a2.1 2.1 0 1 1-2.97-2.97l.05-.05a1.8 1.8 0 0 0 .36-1.98 1.8 1.8 0 0 0-1.65-1.09H2.6a2.1 2.1 0 1 1 0-4.2h.07a1.8 1.8 0 0 0 1.66-1.13 1.8 1.8 0 0 0-.36-1.98l-.05-.05A2.1 2.1 0 1 1 6.89 3.66l.05.05a1.8 1.8 0 0 0 1.98.36H9a1.8 1.8 0 0 0 1.09-1.65V2.6a2.1 2.1 0 1 1 4.2 0v.07a1.8 1.8 0 0 0 1.09 1.65h.08a1.8 1.8 0 0 0 1.98-.36l.05-.05a2.1 2.1 0 1 1 2.97 2.97l-.05.05a1.8 1.8 0 0 0-.36 1.98V9a1.8 1.8 0 0 0 1.65 1.09h.1a2.1 2.1 0 1 1 0 4.2h-.07A1.8 1.8 0 0 0 19.4 15Z"/>
@@ -1303,11 +1303,18 @@ hud.innerHTML = `
     </button>
     <section id="audioPanel" role="dialog" aria-modal="false" aria-labelledby="audioTitle">
       <header>
-        <h2 id="audioTitle">Audio</h2>
-        <button id="audioClose" type="button" aria-label="Close audio settings">
+        <h2 id="audioTitle">Settings</h2>
+        <button id="audioClose" type="button" aria-label="Close settings">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
         </button>
       </header>
+      <div class="audio-separator"></div>
+      <div class="audio-row">
+        <label class="audio-label" for="sensRange"><span>Mouse sensitivity</span><span id="sensValue">1.00x</span></label>
+        <input id="sensRange" type="range" min="20" max="300" step="5" value="100" />
+      </div>
+      <div class="audio-separator"></div>
+      <label class="audio-toggle" for="scopeMode" title="On: right-click toggles the sniper scope. Off: hold right-click to stay scoped."><span>Sniper scope: toggle zoom</span><input id="scopeMode" type="checkbox" checked /></label>
       <div class="audio-separator"></div>
       <div class="audio-row">
         <label class="audio-label" for="audioVolume"><span>Master volume</span><span id="audioVolumeValue">70%</span></label>
@@ -1369,6 +1376,9 @@ const el = {
   audioVolume: document.getElementById("audioVolume") as HTMLInputElement,
   audioVolumeValue: document.getElementById("audioVolumeValue")!,
   audioMute: document.getElementById("audioMute") as HTMLInputElement,
+  sensRange: document.getElementById("sensRange") as HTMLInputElement,
+  sensValue: document.getElementById("sensValue")!,
+  scopeMode: document.getElementById("scopeMode") as HTMLInputElement,
   crossname: document.getElementById("crossname")!,
   scope: document.getElementById("scope")!,
   hitmark: document.getElementById("hitmark")!,
@@ -1401,11 +1411,35 @@ const el = {
   respawnDeploy: document.getElementById("respawnDeploy") as HTMLButtonElement,
 };
 
+// Sniper scope input (client-side view zoom only). Toggle mode (default):
+// right-click flips the scope on/off; hold mode: scoped while RMB is held.
+const SENS_KEY = "breachpoint.sensitivity";
+const SCOPE_MODE_KEY = "breachpoint.scopeToggle";
+let sensMultiplier = (() => {
+  try {
+    const v = Number(localStorage.getItem(SENS_KEY));
+    return Number.isFinite(v) && v >= 0.2 && v <= 3 ? v : 1;
+  } catch {
+    return 1;
+  }
+})();
+let scopeToggleMode = (() => {
+  try {
+    return localStorage.getItem(SCOPE_MODE_KEY) !== "0"; // default: toggle
+  } catch {
+    return true;
+  }
+})();
+let scopeActive = false;
+
 function updateAudioMenu(): void {
   const pct = Math.round(masterVolume * 100);
   el.audioVolume.value = pct.toString();
   el.audioVolumeValue.textContent = `${pct}%`;
   el.audioMute.checked = masterVolume <= 0;
+  el.sensRange.value = Math.round(sensMultiplier * 100).toString();
+  el.sensValue.textContent = `${sensMultiplier.toFixed(2)}x`;
+  el.scopeMode.checked = scopeToggleMode;
 }
 
 function audioMenuOpen(): boolean {
@@ -1440,6 +1474,24 @@ el.audioMute.addEventListener("change", () => {
     setMasterVolume(0);
   } else {
     setMasterVolume(lastAudibleVolume || DEFAULT_MASTER_VOLUME);
+  }
+});
+el.sensRange.addEventListener("input", () => {
+  sensMultiplier = Math.max(0.2, Math.min(3, Number(el.sensRange.value) / 100));
+  el.sensValue.textContent = `${sensMultiplier.toFixed(2)}x`;
+  try {
+    localStorage.setItem(SENS_KEY, sensMultiplier.toFixed(2));
+  } catch {
+    // Storage can be unavailable in private or embedded contexts.
+  }
+});
+el.scopeMode.addEventListener("change", () => {
+  scopeToggleMode = el.scopeMode.checked;
+  scopeActive = false; // switching modes never leaves you stuck zoomed
+  try {
+    localStorage.setItem(SCOPE_MODE_KEY, scopeToggleMode ? "1" : "0");
+  } catch {
+    // Storage can be unavailable in private or embedded contexts.
   }
 });
 el.audioMenu.addEventListener("pointerdown", (event) => event.stopPropagation());
@@ -1767,7 +1819,7 @@ const SHOT_FX: Record<string, { pitch: number; vol: number }> = {
   Shotgun: { pitch: 0.72, vol: 1.1 },
   Sniper: { pitch: 0.62, vol: 1.15 },
   Pistol: { pitch: 1.35, vol: 0.8 },
-  Revolver: { pitch: 0.9, vol: 1.05 },
+  Revolver: { pitch: 0.72, vol: 1.35 }, // a deep, LOUD hand-cannon boom
 };
 
 const sounds = {
@@ -1854,8 +1906,6 @@ let pointerLocked = false;
 let fireHeld = false;
 // Desired weapon slot (0 primary, 1 pistol) — rides every input as slot2.
 let desiredSlot = 0;
-// Right mouse held: aims down the sniper scope (client-side view zoom only).
-let aimHeld = false;
 // Touch (mobile): the floating joystick writes these, blended into the keyboard
 // move in sampleInput(); look + buttons drive yaw/pitch/keys/fireHeld directly,
 // exactly like mouse + keyboard — so no server or netcode changes are needed.
@@ -1869,25 +1919,25 @@ renderer.domElement.addEventListener("mousedown", (e) => {
     return;
   }
   if (e.button === 0) fireHeld = true;
-  if (e.button === 2) aimHeld = true;
+  if (e.button === 2) scopeActive = scopeToggleMode ? !scopeActive : true;
 });
 window.addEventListener("mouseup", (e) => {
   if (e.button === 0) fireHeld = false;
-  if (e.button === 2) aimHeld = false;
+  if (e.button === 2 && !scopeToggleMode) scopeActive = false;
 });
 renderer.domElement.addEventListener("contextmenu", (e) => e.preventDefault());
 document.addEventListener("pointerlockchange", () => {
   pointerLocked = document.pointerLockElement === renderer.domElement;
   if (!pointerLocked) {
     fireHeld = false;
-    aimHeld = false;
+    scopeActive = false;
   }
 });
 document.addEventListener("mousemove", (e) => {
   if (!pointerLocked) return;
-  // Scoped-in zoom scales look sensitivity down with it, so a scoped flick
-  // covers the same on-screen distance as an unscoped one.
-  const sens = 1 / camera.zoom;
+  // The user's sensitivity setting, additionally scaled down while scoped so
+  // a scoped flick covers the same on-screen distance as an unscoped one.
+  const sens = sensMultiplier / camera.zoom;
   yaw -= e.movementX * 0.0023 * sens;
   pitch = Math.max(-1.45, Math.min(1.45, pitch - e.movementY * 0.0021 * sens));
   while (yaw > Math.PI) yaw -= Math.PI * 2;
@@ -1905,7 +1955,7 @@ window.addEventListener("keyup", (e) => keys.delete(e.code));
 window.addEventListener("blur", () => {
   keys.clear();
   fireHeld = false;
-  aimHeld = false;
+  scopeActive = false;
 });
 
 // Test hook: scripted input overrides everything for N ticks. trackIdx
@@ -2939,7 +2989,9 @@ function predictionTick(): void {
     onFire: (_eye, dir) => {
       const w = predState ? activeWeapon(predState) : WEAPON_LIST[0];
       sounds.shot(w.name);
-      recoil = Math.min(1, recoil + (w.kick > 0.06 ? 0.7 : 0.4));
+      // Visual camera kick scales with the weapon's real recoil — the
+      // revolver (0.13) slams the view, the rifle nudges it.
+      recoil = Math.min(1, recoil + (w.kick > 0.1 ? 1 : w.kick > 0.06 ? 0.7 : 0.4));
       // Predicted tracers from local raycasts — instant feedback; the
       // server's events remain authoritative for hits and damage. Rays start
       // at the barrel like the server's (dir already carries recoil), and
@@ -4288,13 +4340,14 @@ function frame(): void {
   // without touching the base fov), fade in the scope mask, and hide the
   // rifle. Purely a client-side view — ballistics are unchanged.
   {
-    const scoped =
-      aimHeld &&
+    const canScope =
       pointerLocked &&
       (selfStatus & SS_DEAD) === 0 &&
       predState !== null &&
       predState.slot === 0 &&
       predState.primary === WEAPON_IDX.sniper;
+    if (!canScope) scopeActive = false; // swapping/dying/unlocking unscopes
+    const scoped = scopeActive;
     scopeBlend += ((scoped ? 1 : 0) - scopeBlend) * Math.min(1, dt * 14);
     if (scopeBlend < 0.005) scopeBlend = 0;
     const zoomTarget = 1 + (SCOPE_ZOOM - 1) * scopeBlend;
