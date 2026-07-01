@@ -24,7 +24,7 @@
     "@recast-navigation/core": "^0.43.1",
     "@recast-navigation/generators": "^0.43.1",
     "jolt-ts": "^0.1.0",
-    "jolt-ts-character-controller": "0.0.0",
+    "jolt-ts-character-controller": "^0.1.0",
     "simplex-noise": "^4.0.3",
     "three": "^0.184.0"
   },

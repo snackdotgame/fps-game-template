@@ -13,7 +13,7 @@
 // the client snaps it back onto the server.
 
 import { Shape, World } from "jolt-ts";
-import { EcctrlJoltController } from "jolt-ts-character-controller";
+import { CharacterController } from "jolt-ts-character-controller";
 import {
   CHAR_STATE_BYTES,
   decodeCharControllerState,
@@ -50,8 +50,8 @@ async function makeWorld(): Promise<World> {
   return world;
 }
 
-function makeController(world: World): EcctrlJoltController {
-  return new EcctrlJoltController({
+function makeController(world: World): CharacterController {
+  return new CharacterController({
     world,
     position: [0, 1, 0],
     enableToggleRun: false,
@@ -75,7 +75,7 @@ function scriptedInput(tick: number): {
 }
 
 function drive(
-  ctrl: EcctrlJoltController,
+  ctrl: CharacterController,
   world: World,
   input: { forward: boolean; run: boolean; jump: boolean; yaw: number },
 ): void {
