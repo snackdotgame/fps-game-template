@@ -131,6 +131,7 @@ const families = {
   rifle_shot: soundFiles.filter((file) => baseName(file).startsWith("shot_")),
   rifle_tail: soundFiles.filter((file) => baseName(file).startsWith("tail_")),
   reload: soundFiles.filter((file) => baseName(file).startsWith("reload_")),
+  pump: soundFiles.filter((file) => baseName(file).startsWith("pump_")),
   melee: soundFiles.filter((file) => includesAny(baseName(file), ["melee", "punch", "impact"])),
   death: soundFiles.filter((file) => baseName(file).startsWith("death_")),
 };

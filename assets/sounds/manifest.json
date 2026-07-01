@@ -7,9 +7,9 @@
     "rifle_tail": ["/assets/sounds/snakef8-authentic-gun-sounds/tail_ak_762.wav"],
     "reload": [
       "/assets/sounds/snakef8-authentic-gun-sounds/reload_ak_full.wav",
-      "/assets/sounds/snakef8-authentic-gun-sounds/reload_ak_rack.wav",
       "/assets/sounds/snakef8-second-authentic-gun-sounds/reload_ak_mag.wav"
     ],
+    "pump": ["/assets/sounds/snakef8-authentic-gun-sounds/pump_ak_rack.wav"],
     "melee": [
       "/assets/sounds/impactMetal_medium_000.ogg",
       "/assets/sounds/impactMetal_medium_001.ogg",
