@@ -10,7 +10,7 @@
 
 import initJolt from "jolt-ts/native/jolt/dist/jolt-physics.wasm-compat.js";
 import { type Body, Shape, World } from "jolt-ts";
-import { EcctrlJoltController, type EcctrlSyncState } from "jolt-ts-character-controller";
+import { CharacterController, type SyncState } from "jolt-ts-character-controller";
 import {
   BUILD_COOLDOWN_TICKS,
   SPREAD_AIR,
@@ -124,7 +124,7 @@ const JUMP_VEL = 5.6;
 const COYOTE_TICKS = 4;
 export const STEP_MAX = 0.55; // kept for importers; stair step-up handled by the controller now
 // NOTE(branch): the bespoke ground probe, ground/air accel, friction, and
-// step-up constants were dropped when EcctrlJoltController took over locomotion.
+// step-up constants were dropped when CharacterController took over locomotion.
 // Ladders are still handled here (the controller has no ladder concept).
 const LADDER_REACH = 0.85;
 const LADDER_CLIMB = 3.0;
@@ -211,12 +211,12 @@ export interface GameWorld {
   players: Map<number, Body>; // by player idx
   grenades: Map<number, Body>; // by grenade id
   terrain: Map<number, Body>; // by chunk key ci * TERRAIN_CHUNKS + cj
-  controllers: Map<number, EcctrlJoltController>; // jolt-ts character controller, by player idx
+  controllers: Map<number, CharacterController>; // jolt-ts character controller, by player idx
 }
 
 // Body -> controller, so the body-only readChar/writeChar can sync the
 // controller's full deterministic state without threading it through everywhere.
-const playerControllers = new WeakMap<Body, EcctrlJoltController>();
+const playerControllers = new WeakMap<Body, CharacterController>();
 
 // Controller equilibrium: the floating capsule rests `floatHeight` above where
 // a grounded capsule sat, so feet = bodyCenterY - PLAYER_HALF_HEIGHT - FLOAT_OFFSET
@@ -234,9 +234,9 @@ const ECCTRL_REF_MASS = 0.283;
 
 // Build the per-player character controller options once (client and server
 // must match exactly for deterministic prediction).
-function makePlayerController(world: World, body: Body): EcctrlJoltController {
+function makePlayerController(world: World, body: Body): CharacterController {
   const massScale = body.mass() / ECCTRL_REF_MASS;
-  return new EcctrlJoltController({
+  return new CharacterController({
     world,
     body,
     useCustomForward: true, // we feed a world-space move direction as "forward"
@@ -257,7 +257,7 @@ function makePlayerController(world: World, body: Body): EcctrlJoltController {
   });
 }
 
-function syncStateFromChar(s: CharState): EcctrlSyncState {
+function syncStateFromChar(s: CharState): SyncState {
   return {
     position: [s.x, s.y + PLAYER_HALF_HEIGHT + FLOAT_OFFSET, s.z],
     linearVelocity: [s.vx, s.vy, s.vz],
