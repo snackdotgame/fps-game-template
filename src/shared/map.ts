@@ -2337,18 +2337,40 @@ function planLayout(rng: () => number): Layout {
     if (Math.abs(x - DUEL_LANE_X) < 13 && Math.abs(z) < 52) return false;
     return anchors.every((a) => Math.hypot(a.x - x, a.z - z) >= minD);
   };
+  // The first two pairs carry the four outer conquest flags (A/C, D/E).
+  // Twins sit NEAR the 180° mirror of each other with a few metres of drift —
+  // organic rather than copy-pasted, but each team's flag distances stay
+  // within a hand-off of fair. Flags also keep real breathing room: at least
+  // 46m from every other flag (including B at the center house).
+  const FLAG_MIN_DIST = 46;
   const hamletPairs: Array<[Anchor, Anchor]> = [];
   for (let pair = 0; pair < 4; pair++) {
+    const flagPair = pair < 2;
+    // Flags already placed (for spacing): B, then both zones of prior pairs.
+    const flagPts: Array<[number, number]> = [[0, 0]];
+    for (const [pa, pb] of hamletPairs.slice(0, 2)) flagPts.push([pa.x, pa.z], [pb.x, pb.z]);
+    const flagRoom = (px: number, pz: number): boolean =>
+      flagPts.every(([fx, fz]) => Math.hypot(fx - px, fz - pz) >= FLAG_MIN_DIST);
     for (let attempt = 0; attempt < 40; attempt++) {
       const ang = rng() * Math.PI * 2;
-      const rad = 40 + rng() * 48;
+      const rad = (flagPair ? 48 : 40) + rng() * (flagPair ? 40 : 48);
       const x = Math.cos(ang) * rad;
       const z = Math.sin(ang) * rad;
-      if (!anchorClear(x, z, 36, 68, 0.04) || !anchorClear(-x, -z, 36, 68, 0.04)) continue;
+      // The twin drifts off the exact mirror point.
+      const bx = -x + (rng() * 2 - 1) * 7;
+      const bz = -z + (rng() * 2 - 1) * 7;
+      if (!anchorClear(x, z, 36, 68, 0.04) || !anchorClear(bx, bz, 36, 68, 0.04)) continue;
+      if (flagPair && (!flagRoom(x, z) || !flagRoom(bx, bz))) continue;
       const axis = rng() * Math.PI;
       const count = 5 + Math.floor(rng() * 2);
       const a: Anchor = { type: "hamlet", x, z, axis, count };
-      const b: Anchor = { type: "hamlet", x: -x, z: -z, axis, count };
+      const b: Anchor = {
+        type: "hamlet",
+        x: bx,
+        z: bz,
+        axis: axis + (rng() * 2 - 1) * 0.4,
+        count,
+      };
       anchors.push(a, b);
       hamletPairs.push([a, b]);
       break;
@@ -2747,8 +2769,9 @@ function planLayout(rng: () => number): Layout {
     zonePos.push([a.x, a.z], [b.x, b.z]);
   }
   while (zonePos.length < 4) {
-    const x = 54 + zonePos.length * 3;
-    const z = 30;
+    // Mirrored fallback pairs, far apart from each other and from B.
+    const x = 54 + zonePos.length * 6;
+    const z = zonePos.length >= 2 ? -32 : 30;
     zonePos.push([-x, -z], [x, z]);
     pads.push([-x, -z, 5, 5], [x, z, 5, 5]);
   }
