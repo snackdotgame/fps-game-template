@@ -75,12 +75,18 @@ export type ClientMsg =
   | { type: "spawnat"; zone: number }
   // Deploy request while dead: humans respawn only when they ask (once the
   // respawn timer allows), never automatically.
-  | { type: "deploy" };
+  | { type: "deploy" }
+  // Class pick (CLASSES index); takes effect at the next spawn.
+  | { type: "class"; cls: number };
 
 export function parseClientMsg(data: unknown): ClientMsg | null {
   if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
-  const m = data as { type?: unknown; zone?: unknown };
+  const m = data as { type?: unknown; zone?: unknown; cls?: unknown };
   if (m.type === "deploy") return { type: "deploy" };
+  if (m.type === "class") {
+    if (typeof m.cls !== "number" || !Number.isFinite(m.cls)) return null;
+    return { type: "class", cls: Math.round(m.cls) };
+  }
   if (m.type !== "spawnat" || typeof m.zone !== "number" || !Number.isFinite(m.zone)) return null;
   return { type: "spawnat", zone: Math.round(m.zone) };
 }

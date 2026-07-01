@@ -30,9 +30,6 @@ import {
   REGEN_DELAY_TICKS,
   REGEN_PER_TICK,
   RESPAWN_TICKS,
-  RIFLE_DAMAGE,
-  RIFLE_PANEL_DAMAGE,
-  RIFLE_RANGE,
   ROUND_TICKS,
   RUBBLE_HEIGHT,
   SANDBOX,
@@ -41,7 +38,7 @@ import {
   TICKETS_START,
   ZONE_CAP_RATE,
 } from "./constants.js";
-import { RIFLE } from "./weapons.js";
+import { CLASSES, classPrimaryIdx, weaponByIdx } from "./weapons.js";
 import {
   addCrater,
   BUILT_PANEL_ID_BASE,
@@ -69,12 +66,14 @@ import {
   unwrapViewTick,
 } from "./netCodec.js";
 import {
+  activeWeapon,
   addPanelBody,
   addRubbleBody,
   applyCraterBodies,
   type Body,
   castWallDistance,
   type CharState,
+  muzzleOrigin,
   createFallingChunkBody,
   createGameWorld,
   createGrenadeBody,
@@ -160,6 +159,9 @@ export interface SimPlayer {
   // Requested respawn point: a ZONES index, SPAWN_HQ, or SPAWN_AUTO (default;
   // bots always stay on auto). Honored while the team holds the flag.
   spawnZone: number;
+  // CLASSES index; decides the primary weapon (and the character model
+  // clients render). Picked from the deploy screens, applied at spawn.
+  classId: number;
   // Humans (autoRespawn=false, set by the server) stay down until they send a
   // deploy request; the respawn timer is the minimum, not the trigger. Bots
   // keep the automatic respawn.
@@ -302,13 +304,13 @@ export class GameSim {
     return this.players[idx] ?? null;
   }
 
-  addPlayer(slot: number, team: number): SimPlayer {
+  addPlayer(slot: number, team: number, classId = 0): SimPlayer {
     const spawn = spawnPoint(team, slot);
     const p: SimPlayer = {
       idx: slot,
       team,
       body: createPlayerBody(this.gw, slot, spawn),
-      state: makeChar(spawn),
+      state: makeChar(spawn, classPrimaryIdx(classId)),
       lastCmd: { seq: 0, ...ZERO_INPUT },
       hp: MAX_HP,
       dead: false,
@@ -320,6 +322,7 @@ export class GameSim {
       deaths: 0,
       oobSinceTick: -1,
       spawnZone: SPAWN_AUTO,
+      classId,
       autoRespawn: true,
       wantsRespawn: false,
     };
@@ -444,23 +447,50 @@ export class GameSim {
     dir: [number, number, number],
     opts: ApplyInputOpts,
   ): void {
-    // Spread is server-side randomness; the client predicts the muzzle effect
-    // and ammo, never the trajectory.
-    const spread = spreadFor(p.state);
-    const d = perturb(dir, (this.rng() - 0.5) * 2 * spread, (this.rng() - 0.5) * 2 * spread);
+    // The dir already carries deterministic recoil (shared controller); the
+    // random spread below is server-side only — clients predict the muzzle
+    // effect and ammo, never the trajectory.
+    const w = activeWeapon(p.state);
 
-    const hit = this.resolveAttack(p, eye, d, RIFLE_RANGE, this.rewindFor(p, opts));
-    this.pushEvent(EV_TRACER, p.idx, hit.point);
-    if (hit.victim) {
-      const dmg = hit.headshot ? Math.round(RIFLE_DAMAGE * RIFLE.headshotMult) : RIFLE_DAMAGE;
-      this.damagePlayer(hit.victim, dmg, p, "rifle");
-      // a packs victim (low nibble) and shooter (high nibble): idx < 16.
-      this.pushEvent(EV_HIT_PLAYER, (hit.victim.idx & 0xf) | ((p.idx & 0xf) << 4), hit.point);
-    } else if (hit.panelBody) {
-      const pieceId = pieceIdFromHit(hit.panelBody, hit.point, this.pieceAlive);
-      if (pieceId !== null) {
-        this.damagePanel(pieceId, RIFLE_PANEL_DAMAGE);
-        this.pushEvent(EV_PANEL_HIT, 0, hit.point);
+    // Bullets leave the BARREL, not the eye — unless the barrel pokes into a
+    // wall (eye->muzzle pre-check), which would let shots skip thin cover.
+    let origin = eye;
+    const mo = muzzleOrigin(p.state, p.lastCmd.yaw, p.lastCmd.pitch);
+    const mdx = mo[0] - eye[0];
+    const mdy = mo[1] - eye[1];
+    const mdz = mo[2] - eye[2];
+    const mDist = Math.hypot(mdx, mdy, mdz);
+    if (mDist > 1e-4) {
+      const toMuzzle: [number, number, number] = [mdx / mDist, mdy / mDist, mdz / mDist];
+      if (castWallDistance(this.gw, eye, toMuzzle, mDist).dist >= mDist - 1e-3) origin = mo;
+    }
+
+    const rewind = this.rewindFor(p, opts);
+    const pellets = w.pellets ?? 1;
+    // Caps keep a shotgun blast from flooding the event ring: a few tracers
+    // and one hit event per victim still read clearly on every client.
+    let tracersLeft = Math.min(pellets, 3);
+    let panelHitsLeft = 2;
+    const victimsHit = new Set<number>();
+    for (let i = 0; i < pellets; i++) {
+      const spread = spreadFor(p.state);
+      const d = perturb(dir, (this.rng() - 0.5) * 2 * spread, (this.rng() - 0.5) * 2 * spread);
+      const hit = this.resolveAttack(p, origin, d, w.range, rewind);
+      if (tracersLeft-- > 0) this.pushEvent(EV_TRACER, p.idx, hit.point);
+      if (hit.victim) {
+        const dmg = hit.headshot ? Math.round(w.damage * w.headshotMult) : w.damage;
+        this.damagePlayer(hit.victim, dmg, p, "rifle");
+        if (!victimsHit.has(hit.victim.idx)) {
+          victimsHit.add(hit.victim.idx);
+          // a packs victim (low nibble) and shooter (high nibble): idx < 16.
+          this.pushEvent(EV_HIT_PLAYER, (hit.victim.idx & 0xf) | ((p.idx & 0xf) << 4), hit.point);
+        }
+      } else if (hit.panelBody) {
+        const pieceId = pieceIdFromHit(hit.panelBody, hit.point, this.pieceAlive);
+        if (pieceId !== null) {
+          this.damagePanel(pieceId, w.panelDamage);
+          if (panelHitsLeft-- > 0) this.pushEvent(EV_PANEL_HIT, 0, hit.point);
+        }
       }
     }
   }
@@ -522,7 +552,7 @@ export class GameSim {
       this.outbox.push({ type: "kill", killer: attacker.idx, victim: victim.idx, weapon });
       // Park the body at the spawn until respawn; clients hide it via RF_DEAD.
       const spawn = spawnPoint(victim.team, victim.idx);
-      victim.state = makeChar(spawn);
+      victim.state = makeChar(spawn, classPrimaryIdx(victim.classId));
       writeChar(victim.body, victim.state);
     }
   }
@@ -985,7 +1015,7 @@ export class GameSim {
         (p.autoRespawn || p.wantsRespawn)
       ) {
         const spawn = this.chooseSpawn(p);
-        p.state = makeChar(spawn);
+        p.state = makeChar(spawn, classPrimaryIdx(p.classId));
         writeChar(p.body, p.state);
         p.hp = MAX_HP;
         p.dead = false;
@@ -1024,7 +1054,7 @@ export class GameSim {
     this.scores[p.team] = Math.max(0, this.scores[p.team] - 1);
     this.outbox.push({ type: "kill", killer: p.idx, victim: p.idx, weapon: "oob" });
     const spawn = spawnPoint(p.team, p.idx);
-    p.state = makeChar(spawn);
+    p.state = makeChar(spawn, classPrimaryIdx(p.classId));
     writeChar(p.body, p.state);
   }
 
@@ -1071,6 +1101,26 @@ export class GameSim {
     if (p && p.dead) p.wantsRespawn = true;
   }
 
+  // Class pick: takes effect at the next spawn. Like the spawn pick, a choice
+  // made while still untouched on the join pad re-kits the player in place.
+  setClass(idx: number, classId: number): void {
+    const p = this.players[idx];
+    if (!p) return;
+    if (!Number.isInteger(classId) || classId < 0 || classId >= CLASSES.length) return;
+    p.classId = classId;
+    if (!p.dead && p.hp === MAX_HP && this.phase === "playing") {
+      const base = spawnPoint(p.team, p.idx);
+      if (Math.hypot(p.state.x - base[0], p.state.z - base[2]) < 2.5) {
+        const primary = classPrimaryIdx(classId);
+        p.state.primary = primary;
+        p.state.slot = 0;
+        p.state.ammo = weaponByIdx(primary).mag;
+        p.state.reloadTicks = 0;
+        p.state.recoilTicks = 0;
+      }
+    }
+  }
+
   // Requested respawn point for a player, validated live at spawn time.
   setSpawnZone(idx: number, zone: number): void {
     const p = this.players[idx];
@@ -1084,7 +1134,7 @@ export class GameSim {
     if ((held || zone === SPAWN_HQ) && !p.dead && p.hp === MAX_HP && this.phase === "playing") {
       const base = spawnPoint(p.team, p.idx);
       if (Math.hypot(p.state.x - base[0], p.state.z - base[2]) < 2.5) {
-        p.state = makeChar(this.chooseSpawn(p));
+        p.state = makeChar(this.chooseSpawn(p), classPrimaryIdx(p.classId));
         writeChar(p.body, p.state);
         p.history.clear(); // don't lag-comp rewind across the map
         p.protectUntilTick = this.tick + PROTECT_TICKS;
@@ -1164,7 +1214,7 @@ export class GameSim {
       if (!p) continue;
       const spawn = spawnPoint(p.team, p.idx);
       p.body = createPlayerBody(this.gw, p.idx, spawn);
-      p.state = makeChar(spawn);
+      p.state = makeChar(spawn, classPrimaryIdx(p.classId));
       p.lastCmd = { seq: 0, ...ZERO_INPUT };
       p.hp = MAX_HP;
       p.dead = false;

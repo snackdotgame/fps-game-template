@@ -13,21 +13,16 @@ import { type Body, Shape, World } from "jolt-ts";
 import { CharacterController, type SyncState } from "jolt-ts-character-controller";
 import {
   BUILD_COOLDOWN_TICKS,
-  SPREAD_AIR,
-  SPREAD_BASE,
-  SPREAD_MOVE,
   BUILD_RANGE,
   BUILD_SUPPLY,
   GRENADE_COUNT,
   GRENADE_RADIUS,
   GRENADE_THROW_SPEED,
   MELEE_COOLDOWN_TICKS,
-  RELOAD_TICKS,
-  RIFLE_COOLDOWN_TICKS,
-  RIFLE_MAG,
   SANDBOX,
   TICK_RATE,
 } from "./constants.js";
+import { WEAPONS, weaponByIdx, type WeaponDef } from "./weapons.js";
 import {
   APRON_OUTER,
   type BuildingDef,
@@ -57,6 +52,9 @@ export interface InputCmd {
   grenade: boolean;
   melee: boolean;
   build: boolean;
+  // Desired weapon slot rides every input (true = sidearm): drop-proof, no
+  // edge detection — the controller switches whenever state disagrees.
+  slot2: boolean;
   // Low 16 bits of the server tick of the world the client was rendering
   // when this input was sampled. Lag compensation rewinds hit tests to it.
   viewTick: number;
@@ -74,6 +72,7 @@ export const ZERO_INPUT: Omit<InputCmd, "seq"> = {
   grenade: false,
   melee: false,
   build: false,
+  slot2: false,
   viewTick: 0,
 };
 
@@ -96,11 +95,46 @@ export interface CharState {
   meleeHeld: boolean;
   buildHeld: boolean;
   coyoteTicks: number;
-  cooldownTicks: number; // rifle/melee/build shared cooldown
+  cooldownTicks: number; // fire/melee/build/draw shared cooldown
   reloadTicks: number;
-  ammo: number;
+  ammo: number; // primary magazine
+  ammo2: number; // sidearm magazine
+  slot: number; // 0 = primary, 1 = sidearm
+  primary: number; // WEAPON_LIST index of the class primary
+  recoilTicks: number; // recoil climb (decays 1/tick; see recoilPitch)
   grenades: number;
   supply: number; // buildable cover left this life
+}
+
+// Draw delay when swapping weapons (also blocks fire via the shared cooldown).
+export const WEAPON_SWAP_TICKS = 8;
+// Recoil climb state: each shot adds ticks, capped; pitch deviation scales
+// with the fraction of the cap. All-integer so quantized wire round-trips
+// replay exactly.
+export const RECOIL_CAP_TICKS = 27;
+const RECOIL_ADD_TICKS = 9;
+
+export function activeWeapon(s: CharState): WeaponDef {
+  return s.slot === 1 ? WEAPONS.pistol : weaponByIdx(s.primary);
+}
+
+// Recoil bends the actual bullet path up, not just the view: consecutive
+// shots climb, settling ~0.9s after the trigger is released.
+export function recoilPitch(s: CharState): number {
+  return (s.recoilTicks / RECOIL_CAP_TICKS) * activeWeapon(s).kick;
+}
+
+// Where bullets leave the gun: the first-person barrel sits right of and
+// slightly below the eye, ahead of the face. Shared by the server's hitscan
+// and the client's predicted tracer so they trace the same ray.
+export function muzzleOrigin(s: CharState, yaw: number, pitch: number): [number, number, number] {
+  const eye = eyePosition(s);
+  const cp = Math.cos(pitch);
+  return [
+    eye[0] - Math.cos(yaw) * 0.2 + Math.sin(yaw) * cp * 0.35,
+    eye[1] - 0.16 + Math.sin(pitch) * 0.35,
+    eye[2] + Math.sin(yaw) * 0.2 + Math.cos(yaw) * cp * 0.35,
+  ];
 }
 
 export const PLAYER_RADIUS = 0.35;
@@ -143,7 +177,7 @@ function ladderAt(x: number, feetY: number, z: number): { nx: number; nz: number
   return null;
 }
 
-export function makeChar(spawn: readonly number[]): CharState {
+export function makeChar(spawn: readonly number[], primary = 0): CharState {
   return {
     x: spawn[0],
     y: spawn[1],
@@ -163,7 +197,11 @@ export function makeChar(spawn: readonly number[]): CharState {
     coyoteTicks: 0,
     cooldownTicks: 0,
     reloadTicks: 0,
-    ammo: RIFLE_MAG,
+    ammo: weaponByIdx(primary).mag,
+    ammo2: WEAPONS.pistol.mag,
+    slot: 0,
+    primary,
+    recoilTicks: 0,
     grenades: GRENADE_COUNT,
     supply: BUILD_SUPPLY,
   };
@@ -830,34 +868,60 @@ export function stepPlayerController(
   const grounded = s.onGround;
 
   // --- Weapons (deterministic state; effects via hooks). ---
+  const primaryDef = weaponByIdx(s.primary);
+  const secondaryDef = WEAPONS.pistol;
   if (SANDBOX) {
     // Bottomless supplies in the test environment (shared constant, so
     // prediction and server still agree exactly).
-    s.ammo = Math.max(s.ammo, RIFLE_MAG);
+    s.ammo = Math.max(s.ammo, primaryDef.mag);
+    s.ammo2 = Math.max(s.ammo2, secondaryDef.mag);
     s.grenades = Math.max(s.grenades, GRENADE_COUNT);
     s.supply = Math.max(s.supply, BUILD_SUPPLY);
   }
   if (s.cooldownTicks > 0) s.cooldownTicks--;
+  if (s.recoilTicks > 0) s.recoilTicks--;
   if (s.reloadTicks > 0) {
     s.reloadTicks--;
-    if (s.reloadTicks === 0) s.ammo = RIFLE_MAG;
+    if (s.reloadTicks === 0) {
+      if (s.slot === 1) s.ammo2 = secondaryDef.mag;
+      else s.ammo = primaryDef.mag;
+    }
   }
+
+  // Weapon swap: switch whenever the input's desired slot disagrees with the
+  // state. Holstering cancels a reload and costs a draw delay.
+  if (!locked) {
+    const wantSlot = input.slot2 ? 1 : 0;
+    if (wantSlot !== s.slot) {
+      s.slot = wantSlot;
+      s.reloadTicks = 0;
+      s.recoilTicks = 0;
+      s.cooldownTicks = Math.max(s.cooldownTicks, WEAPON_SWAP_TICKS);
+    }
+  }
+  const active = s.slot === 1 ? secondaryDef : primaryDef;
+  const activeAmmo = (): number => (s.slot === 1 ? s.ammo2 : s.ammo);
 
   readChar(body, s); // refresh pos before aiming from the eye
   const eye = eyePosition(s);
-  const dir = aimDirection(input.yaw, input.pitch);
+  // Recoil climbs the barrel — the real flight path, not just a view kick.
+  const dir = aimDirection(input.yaw, input.pitch + recoilPitch(s));
 
   if (!locked && s.reloadTicks === 0) {
-    if (input.reload && s.ammo < RIFLE_MAG) {
-      s.reloadTicks = RELOAD_TICKS;
-    } else if (input.fire && !sprinting && s.cooldownTicks === 0 && s.ammo > 0) {
-      // Full-auto: held fire keeps shooting on cooldown. Can't fire while
-      // sprinting — the gun is lowered.
-      s.ammo--;
-      s.cooldownTicks = RIFLE_COOLDOWN_TICKS;
+    // Semi-auto weapons fire once per trigger pull; full-auto keeps firing
+    // on cooldown while held.
+    const trigger = input.fire && (!active.semiAuto || !s.fireHeld);
+    if (input.reload && activeAmmo() < active.mag) {
+      s.reloadTicks = active.reloadTicks;
+    } else if (trigger && !sprinting && s.cooldownTicks === 0 && activeAmmo() > 0) {
+      // Can't fire while sprinting — the gun is lowered.
+      if (s.slot === 1) s.ammo2--;
+      else s.ammo--;
+      s.cooldownTicks = active.cooldownTicks;
       opts.onFire?.(eye, dir);
-    } else if (input.fire && s.cooldownTicks === 0 && s.ammo === 0 && !s.fireHeld) {
-      s.reloadTicks = RELOAD_TICKS; // dry fire -> auto reload
+      s.recoilTicks = Math.min(RECOIL_CAP_TICKS, s.recoilTicks + RECOIL_ADD_TICKS);
+    } else if (input.fire && s.cooldownTicks === 0 && activeAmmo() === 0 && !s.fireHeld) {
+      s.reloadTicks = active.reloadTicks; // dry fire -> auto reload
     }
 
     const meleePressed = input.melee && !s.meleeHeld;
@@ -989,10 +1053,11 @@ export function rayVsCapsule(
   return distSq <= r * r ? t : null;
 }
 
-// Current rifle spread (radians) — worse while moving or airborne.
+// Current spread of the ACTIVE weapon (radians) — worse moving or airborne.
 export function spreadFor(s: CharState): number {
+  const w = activeWeapon(s);
   const moveFactor = Math.min(1, Math.hypot(s.vx, s.vz) / WALK_SPEED);
-  let spread = SPREAD_BASE + moveFactor * SPREAD_MOVE;
-  if (!s.onGround) spread += SPREAD_AIR;
+  let spread = w.spreadBase + moveFactor * w.spreadMove;
+  if (!s.onGround) spread += w.spreadAir;
   return spread;
 }

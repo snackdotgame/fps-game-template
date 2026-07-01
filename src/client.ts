@@ -9,11 +9,11 @@ import {
   INPUT_REDUNDANCY,
   MAX_HP,
   OOB_LIMIT_TICKS,
-  RELOAD_TICKS,
   TEAM_NAMES,
   TICK_MS,
   TICK_RATE,
 } from "./shared/constants.js";
+import { CLASSES, PISTOL_IDX, WEAPON_IDX, WEAPON_LIST, classPrimaryIdx } from "./shared/weapons.js";
 import {
   addCrater,
   APRON_OUTER,
@@ -56,15 +56,19 @@ import {
   RF_TEAM,
   type Snapshot,
   SS_DEAD,
+  weaponByteActive,
+  weaponBytePrimary,
   type ZoneSnap,
 } from "./shared/netCodec.js";
 import {
+  activeWeapon,
   addPanelBody,
   addRubbleBody,
   applyCraterBodies,
   type Body,
   buildPlacement,
   type CharState,
+  muzzleOrigin,
   createGameWorld,
   createGrenadeBody,
   createPlayerBody,
@@ -1258,6 +1262,15 @@ hud.innerHTML = `
   .mm-hq.foe { opacity:.6; pointer-events:none; }
   .mm-status { margin-top:8px; font-size:13px; font-weight:800; letter-spacing:.5px; opacity:.95; }
   .mm-status b { letter-spacing:1px; }
+  /* Class picker: one card per kit, shared by intro + respawn overlay. */
+  .classrow { display:flex; gap:7px; margin:10px auto 0; max-width:430px; }
+  .classbtn { flex:1; padding:8px 2px 7px; border-radius:10px; cursor:pointer; text-align:center;
+    color:#fff; background:rgba(255,255,255,.05); border:2px solid rgba(255,255,255,.14);
+    font-family:"Trebuchet MS",system-ui,sans-serif; transition:background 100ms ease,border-color 100ms ease; }
+  .classbtn:hover { background:rgba(255,255,255,.11); }
+  .classbtn.sel { border-color:#fff; background:rgba(255,255,255,.14); }
+  .classbtn .cn { font-size:13px; font-weight:900; letter-spacing:.5px; }
+  .classbtn .cw { font-size:11px; opacity:.75; margin-top:1px; }
   #introMap { width:min(280px, 64vw); margin:0 auto; }
   #respawn { position:fixed; inset:0; z-index:120; display:none; align-items:center; justify-content:center;
     pointer-events:auto; background:rgba(6,9,15,.55); }
@@ -1301,11 +1314,11 @@ hud.innerHTML = `
   <div id="timer" class="sh"></div>
   <div id="zones"></div>
   <div id="vitals" class="sh">HP<div class="hpbar"><div id="hpfill"></div></div></div>
-  <div id="ammo" class="sh"><div class="mag" id="ammotext">30</div><div class="sub" id="gear"></div></div>
+  <div id="ammo" class="sh"><div class="sub" id="wpnname"></div><div class="mag" id="ammotext">30</div><div class="sub" id="gear"></div></div>
   <div id="feed"></div>
   <div id="overlay"><div class="panel" id="overlaypanel"></div></div>
   <div id="board"></div>
-  <div id="hint" class="sh">click to play — WASD move · shift sprint · space jump · LMB fire · R reload · G grenade · F sledge · Q build cover · Tab scores</div>
+  <div id="hint" class="sh">click to play — WASD move · shift sprint · space jump · LMB fire · 1/2 weapons · R reload · G grenade · F sledge · Q build cover · Tab scores</div>
   <div id="netinfo" class="sh"></div>
   <div id="intro">
     <div class="ip">
@@ -1313,6 +1326,8 @@ hud.innerHTML = `
       <div class="isub">CAPTURE · CONTROL · CONQUER</div>
       <div id="introTeam">ASSIGNING TEAM…</div>
       <div class="igoal"><b>Capture and hold the flags.</b></div>
+      <div class="mapcap">pick your kit</div>
+      <div id="introClasses"></div>
       <div class="mapcap">pick a spawn point — your HQ or any flag your team holds</div>
       <div id="introMap"></div>
       <div id="introKeys"></div>
@@ -1323,6 +1338,7 @@ hud.innerHTML = `
   <div id="respawn">
     <div class="rp">
       <h2>YOU'RE DOWN</h2>
+      <div id="respawnClasses"></div>
       <div class="mapcap">pick a spawn point — your HQ or any flag your team holds</div>
       <div id="respawnMap"></div>
       <button id="respawnDeploy" type="button" disabled></button>
@@ -1346,6 +1362,7 @@ const el = {
   zones: document.getElementById("zones")!,
   hpfill: document.getElementById("hpfill")!,
   ammotext: document.getElementById("ammotext")!,
+  wpnname: document.getElementById("wpnname")!,
   gear: document.getElementById("gear")!,
   feed: document.getElementById("feed")!,
   overlay: document.getElementById("overlay")!,
@@ -1361,9 +1378,11 @@ const el = {
   introKeys: document.getElementById("introKeys")!,
   introStatus: document.getElementById("introStatus")!,
   introMap: document.getElementById("introMap")!,
+  introClasses: document.getElementById("introClasses")!,
   deploy: document.getElementById("deploy") as HTMLButtonElement,
   respawn: document.getElementById("respawn")!,
   respawnMap: document.getElementById("respawnMap")!,
+  respawnClasses: document.getElementById("respawnClasses")!,
   respawnDeploy: document.getElementById("respawnDeploy") as HTMLButtonElement,
 };
 
@@ -1725,10 +1744,21 @@ function panelMaterialUnderfoot(x: number, y: number, z: number): PanelMaterial 
   return best?.material ?? null;
 }
 
+// Weapon shot character: same rifle samples, re-pitched per weapon so an SMG
+// chatters, a sniper booms, and the pistol cracks — no extra assets needed.
+const SHOT_FX: Record<string, { pitch: number; vol: number }> = {
+  Rifle: { pitch: 1, vol: 0.9 },
+  SMG: { pitch: 1.2, vol: 0.75 },
+  Shotgun: { pitch: 0.72, vol: 1.1 },
+  Sniper: { pitch: 0.62, vol: 1.15 },
+  Pistol: { pitch: 1.35, vol: 0.8 },
+};
+
 const sounds = {
-  shot: () => {
-    if (!playSound("rifle_shot", 0.9)) noiseBurst(0.09, 0.16);
-    void playSound("rifle_tail", 0.35);
+  shot: (weapon = "Rifle") => {
+    const fx = SHOT_FX[weapon] ?? SHOT_FX.Rifle;
+    if (!playSound("rifle_shot", fx.vol, fx.pitch)) noiseBurst(0.09, 0.16);
+    void playSound("rifle_tail", 0.35, fx.pitch);
   },
   shotAt: (at: THREE.Vector3) => {
     if (!playSoundAt("rifle_shot", at, 0.9)) noiseBurst(0.1, 0.15, true, at);
@@ -1765,9 +1795,10 @@ const sounds = {
   hurtAt: (at: THREE.Vector3) => {
     if (!playSoundAt("impactPunch_medium", at, 0.85, 0.85)) blip(170, 0.12, 0.13, "sawtooth", at);
   },
-  reload: () => {
-    // Stretch the sample to the fixed reload time so audio and the dip line up.
-    if (!playSoundFit("reload", RELOAD_TICKS / TICK_RATE, 0.8)) blip(700, 0.06, 0.08);
+  reload: (seconds: number) => {
+    // Stretch the sample to the weapon's reload time so audio and the dip
+    // line up.
+    if (!playSoundFit("reload", seconds, 0.8)) blip(700, 0.06, 0.08);
   },
   buildAt: (at: THREE.Vector3) => {
     if (!playSoundAt("impactWood_medium", at, 0.75, 0.9)) blip(240, 0.1, 0.14, "square", at);
@@ -1805,6 +1836,8 @@ let yaw = 0;
 let pitch = 0;
 let pointerLocked = false;
 let fireHeld = false;
+// Desired weapon slot (0 primary, 1 pistol) — rides every input as slot2.
+let desiredSlot = 0;
 // Touch (mobile): the floating joystick writes these, blended into the keyboard
 // move in sampleInput(); look + buttons drive yaw/pitch/keys/fireHeld directly,
 // exactly like mouse + keyboard — so no server or netcode changes are needed.
@@ -1836,6 +1869,8 @@ document.addEventListener("mousemove", (e) => {
 window.addEventListener("keydown", (e) => {
   if (e.code === "Tab") e.preventDefault();
   if (e.repeat) return;
+  if (e.code === "Digit1") desiredSlot = 0;
+  if (e.code === "Digit2") desiredSlot = 1;
   keys.add(e.code);
   ensureAudio();
 });
@@ -1892,6 +1927,7 @@ function sampleInput(seq: number): InputCmd {
     grenade: keys.has("KeyG"),
     melee: keys.has("KeyF"),
     build: keys.has("KeyQ"),
+    slot2: desiredSlot === 1,
     viewTick,
   };
 }
@@ -1919,6 +1955,7 @@ function setupTouchControls(): void {
     reload: '<path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.5v5h-5"/>',
     nade: '<circle cx="11.5" cy="14" r="6.3"/><rect x="8.5" y="3.8" width="6" height="3.7" rx="1"/><circle cx="6.5" cy="5.2" r="2"/>',
     melee: '<path d="M2 22l8.5-8.5"/><path d="M17 2l5 5-4 4-5-5z"/><path d="M9 11l4 4"/>',
+    swap: '<path d="M4 7h12l-3-3"/><path d="M20 17H8l3 3"/>',
   };
   const icon = (n: string): string =>
     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n]}</svg>`;
@@ -1950,6 +1987,8 @@ function setupTouchControls(): void {
   #b-reload { right:180px; bottom:102px; width:52px; height:52px; }
   #b-grenade { right:122px; bottom:160px; width:52px; height:52px; }
   #b-melee { right:180px; bottom:160px; width:52px; height:52px; }
+  #b-swap { right:238px; bottom:44px; width:52px; height:52px; }
+  #b-swap.pistol { background:rgba(220,170,60,.5); }
   /* Lift the ammo readout above the button cluster on touch. */
   #ammo { right:16px; bottom:226px; }
   #rotate { position:fixed; inset:0; z-index:200; display:none; background:#0c0f14; color:#fff;
@@ -1967,6 +2006,7 @@ function setupTouchControls(): void {
   <div id="b-reload" class="tbtn">${icon("reload")}</div>
   <div id="b-grenade" class="tbtn">${icon("nade")}</div>
   <div id="b-melee" class="tbtn">${icon("melee")}</div>
+  <div id="b-swap" class="tbtn">${icon("swap")}</div>
 </div>
 <div id="rotate">
   <div style="font-size:34px">\u{1F504}</div>
@@ -2102,6 +2142,16 @@ function setupTouchControls(): void {
   press("b-reload", ...key("KeyR"));
   press("b-grenade", ...key("KeyG"));
   press("b-melee", ...key("KeyF"));
+
+  // Weapon swap is a toggle, not a hold: tap for pistol, tap again for primary.
+  const swapBtn = document.getElementById("b-swap")!;
+  swapBtn.addEventListener("pointerdown", (e: PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    ensureAudio();
+    desiredSlot = desiredSlot === 1 ? 0 : 1;
+    swapBtn.classList.toggle("pistol", desiredSlot === 1);
+  });
 }
 
 if (wantsTouch) setupTouchControls();
@@ -2126,6 +2176,11 @@ interface RemotePlayer {
   lastStepIndex: number;
   stepPhase: number;
   createdAt: number; // ms; used to grace-reveal the box rig if the model is slow
+  // Latest weapon byte from the snapshot: active weapon (held model) low
+  // nibble, class primary (character model) high nibble.
+  weaponByte: number;
+  modelIdx: number; // character template the current rig was built from
+  heldWeapon: number; // weapon node currently shown on the rig
   // Set once the Quaternius model + AnimationMixer replace the blocky fallback.
   anim?: CharacterAnim;
 }
@@ -2268,6 +2323,10 @@ function copyCtrl(into: CharState, from: CharState): void {
   into.cooldownTicks = from.cooldownTicks;
   into.reloadTicks = from.reloadTicks;
   into.ammo = from.ammo;
+  into.ammo2 = from.ammo2;
+  into.slot = from.slot;
+  into.primary = from.primary;
+  into.recoilTicks = from.recoilTicks;
   into.grenades = from.grenades;
   into.supply = from.supply;
 }
@@ -2354,8 +2413,9 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       lastAckTick = msg.serverTick;
       refreshAllNameTags();
       // A fresh welcome means a fresh server-side player: replay our spawn
-      // preference so it survives reconnects.
+      // and class preferences so they survive reconnects.
       if (spawnChoice !== SPAWN_AUTO) sendSpawnChoice();
+      if (classChoice !== 0) sendClassChoice();
       void buildWorlds();
       break;
     }
@@ -2550,12 +2610,18 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
   selfStatus = snap.self.status;
   if ((prevSelfStatus & SS_DEAD) === 0 && (selfStatus & SS_DEAD) !== 0 && predState) {
     const team = roster.get(selfIdx)?.team ?? 0;
-    spawnCorpse(new THREE.Vector3(predState.x, predState.y, predState.z), yaw, team);
+    spawnCorpse(
+      new THREE.Vector3(predState.x, predState.y, predState.z),
+      yaw,
+      team,
+      modelForPrimary(predState.primary),
+    );
   }
   // Back alive: the server just respawned us — face the action from the new
-  // spawn position before the first rendered frame.
+  // spawn position before the first rendered frame, primary in hand.
   if ((prevSelfStatus & SS_DEAD) !== 0 && (selfStatus & SS_DEAD) === 0) {
     faceTheAction(snap.self.state.x, snap.self.state.z);
+    desiredSlot = 0;
   }
   selfHp = snap.self.hp;
   respawnTicks = snap.self.respawnTicks;
@@ -2591,10 +2657,17 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
         lastStepIndex: -1,
         stepPhase: 0,
         createdAt: performance.now(),
+        weaponByte: r.weapon,
+        modelIdx: -1,
+        heldWeapon: -1,
       };
       remotes.set(r.idx, rp);
       attachExternalSoldier(rp); // swaps in the animated model when ready
       refreshNameTag(rp);
+    }
+    if (r.weapon !== rp.weaponByte) {
+      rp.weaponByte = r.weapon;
+      applyRemoteWeapon(rp);
     }
     const prevFlags = rp.lastFlags;
     const wasNew = rp.buffer.length === 0;
@@ -2612,7 +2685,12 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
     // Death transition: drop a ragdoll where viewers last saw them standing
     // (the server has already parked the body at spawn).
     if (!wasNew && (prevFlags & RF_DEAD) === 0 && (r.flags & RF_DEAD) !== 0) {
-      spawnCorpse(rp.group.position, rp.group.rotation.y, rp.info.team);
+      spawnCorpse(
+        rp.group.position,
+        rp.group.rotation.y,
+        rp.info.team,
+        modelForPrimary(weaponBytePrimary(rp.weaponByte)),
+      );
     }
   }
   for (const idx of remotes.keys()) {
@@ -2838,21 +2916,28 @@ function predictionTick(): void {
   const cmd = sampleInput(seq);
   const dead = (selfStatus & SS_DEAD) !== 0 || phase !== "playing";
 
-  const ammoBefore = predState.ammo;
+  const ammoBefore = predState.slot === 1 ? predState.ammo2 : predState.ammo;
   const reloadBefore = predState.reloadTicks;
   stepPlayerController(gw, selfBody, predState, cmd, {
     locked: dead,
-    onFire: (eye, dir) => {
-      sounds.shot();
-      recoil = Math.min(1, recoil + 0.4);
+    onFire: (_eye, dir) => {
+      const w = predState ? activeWeapon(predState) : WEAPON_LIST[0];
+      sounds.shot(w.name);
+      recoil = Math.min(1, recoil + (w.kick > 0.06 ? 0.7 : 0.4));
       // Predicted tracer from a local raycast — instant feedback; the
-      // server's events remain authoritative for hits and damage.
-      if (gw && selfBody) {
+      // server's events remain authoritative for hits and damage. The ray
+      // starts at the barrel like the server's (dir already carries recoil).
+      if (gw && selfBody && predState) {
+        const mo = muzzleOrigin(predState, cmd.yaw, cmd.pitch);
         const from = muzzleWorld().clone();
-        const hit = castLocal(eye, dir, 90);
+        const hit = castLocal(mo, dir, w.range);
         const end = hit
           ? new THREE.Vector3(hit.point[0], hit.point[1], hit.point[2])
-          : new THREE.Vector3(eye[0] + dir[0] * 90, eye[1] + dir[1] * 90, eye[2] + dir[2] * 90);
+          : new THREE.Vector3(
+              mo[0] + dir[0] * w.range,
+              mo[1] + dir[1] * w.range,
+              mo[2] + dir[2] * w.range,
+            );
         spawnTracer(from, end);
         const tag = (hit?.body.userData ?? {}) as { playerIdx?: number; grenadeId?: number };
         if (hit && tag.playerIdx === undefined && tag.grenadeId === undefined) {
@@ -2873,7 +2958,9 @@ function predictionTick(): void {
   gw.world.step(1 / TICK_RATE);
   readChar(selfBody, predState);
   stepSelfFootsteps(dead);
-  if (reloadBefore === 0 && predState.reloadTicks > 0 && ammoBefore < 30) sounds.reload();
+  if (reloadBefore === 0 && predState.reloadTicks > 0 && ammoBefore < activeWeapon(predState).mag) {
+    sounds.reload(activeWeapon(predState).reloadTicks / TICK_RATE);
+  }
 
   history.push({ seq, cmd });
   if (history.length > 240) history.shift();
@@ -2932,13 +3019,28 @@ interface CharacterAnim {
   sprintAnim: boolean; // hysteresis latch for the sprint clip
 }
 
-// Team 0 renders as the Soldier, team 1 as the Enemy — distinct silhouettes so
-// friend and foe read at a glance. Both share the kit's identical 17-clip rig.
-const characterTemplates: Array<CharacterTemplate | null> = [null, null];
-let externalWeaponTemplate: THREE.Group | null = null;
+// Character templates by MODEL index (0 Soldier, 1 Enemy, 2 Hazmat) — each
+// class maps to one (CLASSES[].model); team reads from the tint + badge. All
+// three share the kit's identical 17-clip rig and weapon nodes.
+const characterTemplates: Array<CharacterTemplate | null> = [null, null, null];
+const CHARACTER_FILES: RegExp[] = [/soldier/i, /enemy/i, /hazmat/i];
+// First-person weapon templates by WEAPON_LIST index (rifle..pistol).
+const viewWeaponTemplates: Array<THREE.Group | null> = WEAPON_LIST.map(() => null);
+const VIEW_WEAPON_FILES: RegExp[] = [
+  /\/AK\.gltf$/i,
+  /\/SMG\.gltf$/i,
+  /\/Shotgun\.gltf$/i,
+  /\/Sniper\.gltf$/i,
+  /\/Pistol\.gltf$/i,
+];
+// Bounding-height each view weapon is scaled to (the models' proportions
+// differ wildly; a pistol scaled to rifle height fills the screen).
+const VIEW_WEAPON_HEIGHT = [0.42, 0.34, 0.4, 0.46, 0.22];
+// The weapon node shown in a character's hands, by WEAPON_LIST index.
+const WEAPON_NODE_NAMES = ["AK", "SMG", "Shotgun", "Sniper", "Pistol"];
 let externalAssetsRequested = false;
 const EXTERNAL_CHARACTER_YAW = 0; // Quaternius characters face local +Z, like the blocky rig.
-const EXTERNAL_VIEW_WEAPON_YAW = -Math.PI / 2; // ak.gltf barrel runs down -X; turn it to the camera's -Z (forward).
+const EXTERNAL_VIEW_WEAPON_YAW = -Math.PI / 2; // gun barrels run down -X; turn to the camera's -Z (forward).
 const CHARACTER_WEAPON_NODES = new Set([
   "AK",
   "GrenadeLauncher",
@@ -2956,31 +3058,40 @@ const CHARACTER_WEAPON_NODES = new Set([
   "Sniper_2",
 ]);
 
+// Which character model a primary-weapon index renders as.
+function modelForPrimary(primaryIdx: number): number {
+  for (const cls of CLASSES) {
+    if (WEAPON_IDX[cls.primary] === primaryIdx) return cls.model;
+  }
+  return 0;
+}
+
 function loadExternalVisualAssets(): void {
   if (externalAssetsRequested) return;
   externalAssetsRequested = true;
   void fetch("/assets/vendor/quaternius-toon-shooter/manifest.json", { cache: "no-cache" })
     .then((response) => (response.ok ? response.json() : null))
     .then((manifest: ToonShooterManifest | null) => {
-      const urls = manifest?.characters ?? [];
-      const soldierUrl = urls.find((u) => /soldier/i.test(u)) ?? urls[0];
-      // One soldier model for both teams, tinted red vs blue per instance.
-      // Loading a single character keeps the models ready fast (the frame loop
-      // swaps them in on arrival, before the box rig is ever revealed).
-      if (soldierUrl) {
-        void loadCharacterTemplate(soldierUrl)
+      const charUrls = manifest?.characters ?? [];
+      for (let m = 0; m < CHARACTER_FILES.length; m++) {
+        const url = charUrls.find((u) => CHARACTER_FILES[m].test(u));
+        if (!url) continue;
+        const idx = m;
+        void loadCharacterTemplate(url)
           .then((t) => {
-            characterTemplates[0] = t;
+            characterTemplates[idx] = t;
           })
           .catch(() => {});
       }
-      const weaponUrl = manifest?.weapons?.[0];
-      if (weaponUrl) {
-        void loadModel(weaponUrl)
+      const weaponUrls = manifest?.weapons ?? [];
+      for (let w = 0; w < VIEW_WEAPON_FILES.length; w++) {
+        const url = weaponUrls.find((u) => VIEW_WEAPON_FILES[w].test(u));
+        if (!url) continue;
+        const idx = w;
+        void loadModel(url)
           .then(({ scene }) => {
-            externalWeaponTemplate = scene;
-            prepareExternalModel(externalWeaponTemplate, 0.42);
-            attachExternalViewWeapon();
+            prepareExternalModel(scene, VIEW_WEAPON_HEIGHT[idx]);
+            viewWeaponTemplates[idx] = scene;
           })
           .catch(() => {});
       }
@@ -3035,12 +3146,19 @@ async function loadCharacterTemplate(url: string): Promise<CharacterTemplate> {
 }
 
 function prepareExternalCharacterModel(root: THREE.Group): void {
+  // Hide every weapon node; instances reveal exactly one via setHeldWeapon.
   root.traverse((o) => {
-    if (CHARACTER_WEAPON_NODES.has(o.name) && o.name !== "AK") {
-      o.visible = false;
-    }
+    if (CHARACTER_WEAPON_NODES.has(o.name)) o.visible = false;
   });
   prepareExternalModel(root, 1.78, (o) => !hasNamedAncestor(o, CHARACTER_WEAPON_NODES));
+}
+
+// Show the weapon the player is actually holding on a character rig.
+function setHeldWeapon(root: THREE.Object3D, weaponIdx: number): void {
+  const want = WEAPON_NODE_NAMES[weaponIdx] ?? WEAPON_NODE_NAMES[0];
+  root.traverse((o) => {
+    if (WEAPON_NODE_NAMES.includes(o.name)) o.visible = o.name === want;
+  });
 }
 
 function prepareExternalModel(
@@ -3158,9 +3276,10 @@ const FOOTSTEP_CADENCE = 1.7; // step-phase radians per metre (~2.8 steps/s at r
 
 // Clone a character template into a fresh animated instance: its own skeleton,
 // per-instance materials (so flash/fade/spawn-ghost don't bleed across bodies),
-// and an AnimationMixer bound to the cloned rig.
-function instantiateCharacter(team: number): CharacterInstance | null {
-  const tpl = characterTemplates[team] ?? characterTemplates[0];
+// and an AnimationMixer bound to the cloned rig. `model` picks the class
+// silhouette (Soldier/Enemy/Hazmat); team reads from the tint.
+function instantiateCharacter(team: number, model = 0): CharacterInstance | null {
+  const tpl = characterTemplates[model] ?? characterTemplates[0];
   if (!tpl) return null;
   const root = cloneSkeleton(tpl.scene) as THREE.Group;
   const teamTint = TEAM_COLORS[team] ?? TEAM_COLORS[0];
@@ -3258,13 +3377,17 @@ function updateCharacterAnim(
 
 function attachExternalSoldier(rp: RemotePlayer): void {
   if (rp.anim) return;
-  const inst = instantiateCharacter(rp.info.team === 1 ? 1 : 0);
+  const model = modelForPrimary(weaponBytePrimary(rp.weaponByte));
+  const inst = instantiateCharacter(rp.info.team === 1 ? 1 : 0, model);
   if (!inst) return;
   const fallback = rp.group.userData.visualRoot as THREE.Object3D | undefined;
   if (fallback) fallback.visible = false; // retire the blocky placeholder rig
   inst.root.name = "externalCharacter";
   inst.root.rotation.y = EXTERNAL_CHARACTER_YAW;
   rp.group.add(inst.root);
+  rp.modelIdx = model;
+  rp.heldWeapon = weaponByteActive(rp.weaponByte);
+  setHeldWeapon(inst.root, rp.heldWeapon);
   rp.anim = {
     mixer: inst.mixer,
     actions: inst.actions,
@@ -3278,15 +3401,50 @@ function attachExternalSoldier(rp: RemotePlayer): void {
   playClip(rp.anim, "Idle", 0);
 }
 
-function attachExternalViewWeapon(): void {
-  if (!externalWeaponTemplate || viewModel.userData.externalAttached === true) return;
+// The snapshot says this remote holds a different weapon (swap) or a
+// different class (respawn): flip the held node, or rebuild the whole rig
+// when the class model changed.
+function applyRemoteWeapon(rp: RemotePlayer): void {
+  if (!rp.anim) return; // attach picks the byte up when the model lands
+  const model = modelForPrimary(weaponBytePrimary(rp.weaponByte));
+  if (model !== rp.modelIdx) {
+    const old = rp.group.getObjectByName("externalCharacter");
+    if (old) rp.group.remove(old);
+    rp.anim.mixer.stopAllAction();
+    rp.anim = undefined;
+    attachExternalSoldier(rp);
+    return;
+  }
+  const active = weaponByteActive(rp.weaponByte);
+  if (active !== rp.heldWeapon) {
+    rp.heldWeapon = active;
+    const root = rp.group.getObjectByName("externalCharacter");
+    if (root) setHeldWeapon(root, active);
+  }
+}
+
+// Keep the first-person weapon in sync with the predicted state: the class
+// primary or the pistol, swapped the moment the state's slot flips.
+function updateViewWeapon(): void {
+  const want = predState
+    ? predState.slot === 1
+      ? PISTOL_IDX
+      : predState.primary
+    : WEAPON_IDX.rifle;
+  const current = viewModel.userData.weaponIdx as number | undefined;
+  if (current === want) return;
+  const tpl = viewWeaponTemplates[want];
+  if (!tpl) return; // template not loaded yet; retry next frame
+  const old = viewModel.getObjectByName("externalWeapon");
+  if (old) viewModel.remove(old);
   const fallback = viewModel.userData.fallbackRoot as THREE.Object3D | undefined;
   if (fallback) fallback.visible = false;
-  const model = cloneExternalModel(externalWeaponTemplate, 0, false);
+  const model = cloneExternalModel(tpl, 0, false);
   model.name = "externalWeapon";
   model.position.set(0, -0.02, -0.12);
   model.rotation.y = EXTERNAL_VIEW_WEAPON_YAW;
   viewModel.add(model);
+  viewModel.userData.weaponIdx = want;
   viewModel.userData.externalAttached = true;
 }
 
@@ -3543,12 +3701,12 @@ const CORPSE_CAP = 18;
 const CORPSE_TTL_MS = 50_000; // bodies linger, then fade away
 const CORPSE_FADE_MS = 1500;
 
-function spawnCorpse(at: THREE.Vector3, yaw: number, team: number): void {
+function spawnCorpse(at: THREE.Vector3, yaw: number, team: number, model = 0): void {
   const group = new THREE.Group();
   group.position.set(at.x, at.y, at.z);
   group.rotation.y = yaw;
   let mixer: THREE.AnimationMixer | null = null;
-  const inst = instantiateCharacter(team);
+  const inst = instantiateCharacter(team, model);
   if (inst) {
     inst.root.rotation.y = EXTERNAL_CHARACTER_YAW;
     group.add(inst.root);
@@ -3688,7 +3846,6 @@ const viewModel = new THREE.Group();
   fallbackRoot.visible = false;
   viewModel.position.set(0.2, -0.3, -0.34);
   camera.add(viewModel);
-  attachExternalViewWeapon();
 }
 scene.add(camera);
 const VIEW_WEAPON_BORN = performance.now();
@@ -4121,6 +4278,7 @@ function frame(): void {
 
   // First-person weapon feel: a rest pose plus recoil, melee, a walk/sprint
   // bob, a reload dip, and a distinct sprint sway (gun lowered and canted).
+  updateViewWeapon();
   const grounded = !!predState?.onGround && (selfStatus & SS_DEAD) === 0;
   const localSpeed = predState ? Math.hypot(predState.vx, predState.vz) : 0;
   const movingNow = grounded && localSpeed > ANIM_MOVE_SPEED;
@@ -4131,7 +4289,9 @@ function frame(): void {
   const bobX = Math.sin(viewBobPhase) * 0.013 * bobAmt;
   const bobY = -Math.abs(Math.cos(viewBobPhase)) * 0.015 * bobAmt;
   const reloadProg =
-    predState && predState.reloadTicks > 0 ? predState.reloadTicks / RELOAD_TICKS : 0;
+    predState && predState.reloadTicks > 0
+      ? predState.reloadTicks / activeWeapon(predState).reloadTicks
+      : 0;
   const dip = reloadProg > 0 ? Math.sin((1 - reloadProg) * Math.PI) : 0; // 0→1→0 over reload
   const sway = sprintBlend;
   viewModel.position.set(
@@ -4363,7 +4523,10 @@ function updateHud(): void {
   (el.hpfill as HTMLElement).style.background =
     selfHp > 50 ? "#5ad05a" : selfHp > 25 ? "#d0b54a" : "#d05a4a";
   if (predState) {
-    el.ammotext.textContent = predState.reloadTicks > 0 ? "…" : `${predState.ammo}`;
+    const w = activeWeapon(predState);
+    const ammo = predState.slot === 1 ? predState.ammo2 : predState.ammo;
+    el.wpnname.textContent = `${w.name.toUpperCase()} · 1/2 to swap`;
+    el.ammotext.textContent = predState.reloadTicks > 0 ? "…" : `${ammo}`;
     el.gear.textContent = `🧨 ${predState.grenades}  🧱 ${predState.supply}`;
   }
 
@@ -4415,6 +4578,17 @@ function updateHud(): void {
 // HQ is pre-selected so the map always shows exactly where you'll spawn;
 // picking a held flag overrides it.
 let spawnChoice = SPAWN_HQ;
+
+const CLASS_STORAGE_KEY = "breachpoint.class";
+
+function loadStoredClass(): number {
+  try {
+    const raw = Number(localStorage.getItem(CLASS_STORAGE_KEY));
+    return Number.isInteger(raw) && raw >= 0 && raw < CLASSES.length ? raw : 0;
+  } catch {
+    return 0;
+  }
+}
 
 function sendSpawnChoice(): void {
   void client.streams.send({ type: "spawnat", zone: spawnChoice }).catch(() => {});
@@ -4591,6 +4765,58 @@ function refreshMinimaps(): void {
 makeMinimap(el.introMap);
 makeMinimap(el.respawnMap);
 
+// --- Class picker (intro + respawn overlay). The pick is sent as a reliable
+// message; the server applies it at the next spawn (or immediately while
+// still untouched on the join pad).
+
+let classChoice = loadStoredClass();
+const classPickers: Array<() => void> = [];
+
+function sendClassChoice(): void {
+  void client.streams.send({ type: "class", cls: classChoice }).catch(() => {});
+}
+
+function selectClass(cls: number): void {
+  if (cls < 0 || cls >= CLASSES.length) return;
+  classChoice = cls;
+  try {
+    localStorage.setItem(CLASS_STORAGE_KEY, String(cls));
+  } catch {
+    // Storage can be unavailable in private or embedded contexts.
+  }
+  sendClassChoice();
+  for (const refresh of classPickers) refresh();
+}
+
+function makeClassPicker(container: HTMLElement): void {
+  const row = document.createElement("div");
+  row.className = "classrow";
+  const btns = CLASSES.map((cls, i) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "classbtn";
+    b.title = cls.blurb;
+    b.innerHTML = `<div class="cn">${cls.name.toUpperCase()}</div><div class="cw">${
+      WEAPON_LIST[classPrimaryIdx(i)].name
+    } + Pistol</div>`;
+    b.addEventListener("click", (e) => {
+      e.stopPropagation();
+      selectClass(i);
+    });
+    row.appendChild(b);
+    return b;
+  });
+  container.appendChild(row);
+  const refresh = (): void => {
+    for (let i = 0; i < btns.length; i++) btns[i].classList.toggle("sel", classChoice === i);
+  };
+  refresh();
+  classPickers.push(refresh);
+}
+
+makeClassPicker(el.introClasses);
+makeClassPicker(el.respawnClasses);
+
 // The respawn overlay: shown while dead (after the intro), hosting the spawn
 // map + the DEPLOY button — respawning is always an explicit click, never
 // automatic. Pointer lock is released so the buttons are clickable, and
@@ -4676,8 +4902,8 @@ el.introKeys.innerHTML = wantsTouch
 
 function introAssetsLoaded(): { loaded: number; total: number } {
   const parts = [
-    characterTemplates[0] !== null,
-    viewModel.userData.externalAttached === true,
+    ...characterTemplates.map((t) => t !== null),
+    ...viewWeaponTemplates.map((t) => t !== null),
     grenadeTemplate !== null,
   ];
   return { loaded: parts.filter(Boolean).length, total: parts.length };
@@ -4813,6 +5039,7 @@ declare global {
       externalAssets(): {
         soldierLoaded: boolean;
         enemyLoaded: boolean;
+        hazmatLoaded: boolean;
         clipCount: number;
         weaponLoaded: boolean;
         remoteAnimatedCount: number;
@@ -4828,6 +5055,10 @@ declare global {
       nameTags(): Array<{ idx: number; name: string; visible: boolean }>;
       spawnChoice(): number;
       selectSpawn(zone: number): void;
+      classChoice(): number;
+      selectClass(cls: number): void;
+      activeWeapon(): { slot: number; name: string; ammo: number };
+      setSlot(slot: number): void;
       yawPitch(): [number, number];
       perf(): Record<string, number>;
       look(yawV: number, pitchV: number): void;
@@ -4885,8 +5116,9 @@ window.__fps = {
   externalAssets: () => ({
     soldierLoaded: characterTemplates[0] !== null,
     enemyLoaded: characterTemplates[1] !== null,
+    hazmatLoaded: characterTemplates[2] !== null,
     clipCount: characterTemplates[0]?.clips.length ?? 0,
-    weaponLoaded: externalWeaponTemplate !== null,
+    weaponLoaded: viewWeaponTemplates.every((t) => t !== null),
     remoteAnimatedCount: [...remotes.values()].filter((rp) => rp.anim !== undefined).length,
     corpseCount: corpses.length,
     viewWeaponLoaded: viewModel.userData.externalAttached === true,
@@ -4902,6 +5134,20 @@ window.__fps = {
   deploy: () => dismissIntro(), // force-dismiss for scripted playtests
   spawnChoice: () => spawnChoice,
   selectSpawn: (zone) => selectSpawn(zone),
+  classChoice: () => classChoice,
+  selectClass: (cls) => selectClass(cls),
+  activeWeapon: () => {
+    if (!predState) return { slot: 0, name: "Rifle", ammo: 0 };
+    const w = activeWeapon(predState);
+    return {
+      slot: predState.slot,
+      name: w.name,
+      ammo: predState.slot === 1 ? predState.ammo2 : predState.ammo,
+    };
+  },
+  setSlot: (slot) => {
+    desiredSlot = slot === 1 ? 1 : 0;
+  },
   yawPitch: () => [yaw, pitch] as [number, number],
   nameTags: () =>
     [...remotes.entries()].map(([idx, rp]) => {

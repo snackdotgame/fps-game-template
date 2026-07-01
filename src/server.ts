@@ -21,6 +21,7 @@ import { parseClientMsg, type PlayerInfo, type ServerMsg } from "./shared/messag
 import {
   decodeInputs,
   encodeSnapshot,
+  packWeaponByte,
   type ChunkSnap,
   type EntitySnap,
   type RemoteSnap,
@@ -43,6 +44,7 @@ import {
   readChar,
 } from "./shared/physics.js";
 import { BotNav, initBotNav, type BotNavPoint } from "./server/botNav.js";
+import { CLASSES, PISTOL_IDX } from "./shared/weapons.js";
 import { GameSim, type SimPlayer } from "./shared/sim.js";
 
 // The Snack runtime provides console/performance; the DOM-less lib doesn't type them.
@@ -111,6 +113,7 @@ interface Parked {
   team: number;
   kills: number;
   deaths: number;
+  classId: number;
   expiresAt: number;
 }
 
@@ -298,7 +301,8 @@ function addBot(): void {
   const team = a <= b ? 0 : 1;
   const serial = nextBotSerial++;
   const name = `BOT ${BOT_NAMES[serial % BOT_NAMES.length]}`;
-  const sp = sim.addPlayer(slot, team);
+  // Bots spread across the classes so every weapon shows up on the field.
+  const sp = sim.addPlayer(slot, team, serial % CLASSES.length);
   const p: Player = {
     conn: null,
     bot: {
@@ -545,6 +549,7 @@ function makeBotInput(p: SimPlayer, b: BotBrain, lastSeq: number): InputCmd {
     grenade: b.grenadeIntent,
     melee: b.meleeIntent,
     build: false,
+    slot2: false, // bots stick to their class primary
   };
   b.jumpIntent = false;
   b.grenadeIntent = false;
@@ -693,7 +698,7 @@ function addPlayer(conn: Connection): void {
   }
   const team = park?.team ?? (humansA <= humansB ? 0 : 1);
 
-  const sp = sim.addPlayer(slot, team);
+  const sp = sim.addPlayer(slot, team, park?.classId ?? 0);
   sp.autoRespawn = false; // humans deploy from the respawn screen
   sp.kills = park?.kills ?? 0;
   sp.deaths = park?.deaths ?? 0;
@@ -739,6 +744,7 @@ function removePlayer(connId: string, p: Player): void {
     team: sp.team,
     kills: sp.kills,
     deaths: sp.deaths,
+    classId: sp.classId,
     expiresAt: server.elapsedMs() + PARK_TTL_MS,
   });
   broadcast({ type: "leave", idx: p.slot });
@@ -760,6 +766,7 @@ function handleClientMsg(event: StreamEvent): void {
   if (!p || p.bot) return;
   if (msg.type === "spawnat") sim.setSpawnZone(p.slot, msg.zone);
   else if (msg.type === "deploy") sim.requestDeploy(p.slot);
+  else if (msg.type === "class") sim.setClass(p.slot, msg.cls);
 }
 
 function drainInputs(): void {
@@ -946,6 +953,10 @@ function broadcastSnapshots(): void {
       remotes.push({
         idx: q.slot,
         flags,
+        weapon: packWeaponByte(
+          sq.state.slot === 1 ? PISTOL_IDX : sq.state.primary,
+          sq.state.primary,
+        ),
         x: sq.state.x,
         y: sq.state.y,
         z: sq.state.z,
