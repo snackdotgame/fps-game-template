@@ -50,7 +50,6 @@ import {
   ZONES,
 } from "./shared/map.js";
 import { RUBBLE_HEIGHT } from "./shared/constants.js";
-import { BUILT_PANEL_ID_BASE } from "./shared/map.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { parseServerMsg, SPAWN_AUTO, SPAWN_HQ, type PlayerInfo } from "./shared/messages.js";
@@ -2655,9 +2654,9 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       for (const id of msg.panelIds) {
         destroyedSet.add(id);
         builtList = builtList.filter((p) => p.id !== id);
-        if (id < BUILT_PANEL_ID_BASE) {
-          const slabIdx = slabOfPiece(id);
-          if (slabIdx >= 0) dirty.add(slabIdx);
+        const slabIdx = slabOfPiece(id);
+        if (slabIdx >= 0) {
+          dirty.add(slabIdx);
         } else if (gw) {
           removePanelBody(gw, id);
         }

@@ -609,10 +609,8 @@ export class GameSim {
   // --- Destruction -----------------------------------------------------------
 
   private markPieceGone(panelId: number): void {
-    if (panelId < BUILT_PANEL_ID_BASE) {
-      const slabIdx = slabOfPiece(panelId);
-      if (slabIdx >= 0) this.dirtySlabs.add(slabIdx);
-    }
+    const slabIdx = slabOfPiece(panelId);
+    if (slabIdx >= 0) this.dirtySlabs.add(slabIdx);
   }
 
   private flushSlabRebuilds(): void {
@@ -873,6 +871,7 @@ export class GameSim {
   private destroyPanel(panelId: number, leaveRubble = true): void {
     if (this.destroyedPanels.has(panelId)) return;
     const src = panelById.get(panelId) ?? this.builtPanels.get(panelId);
+    const isMapPanel = panelById.has(panelId);
     this.destroyedPanels.add(panelId);
     this.panelHp.delete(panelId);
     this.builtPanels.delete(panelId);
@@ -880,7 +879,7 @@ export class GameSim {
     this.markPieceGone(panelId);
     this.pendingDestroys.push(panelId);
     if (leaveRubble && src) this.maybeLeaveRubble(src);
-    if (leaveRubble && panelId < BUILT_PANEL_ID_BASE) this.cascadeUnsupported(panelId);
+    if (leaveRubble && isMapPanel) this.cascadeUnsupported(panelId);
     if (leaveRubble && src) this.recheckSettledNear(src.x, src.y, src.z);
     // BattleBit-style critical health: enough wall damage fells the building.
     const buildingId = src?.buildingId;
