@@ -224,11 +224,11 @@ function fbm2(x: number, z: number, octaves: number, freq: number): number {
   return sum / norm;
 }
 
-// Hill stamps, placed in 180°-rotationally-symmetric pairs so neither team
-// gets a height advantage. [cx, cz, radius, amplitude]. Planned per seed:
-// each spawn is CRADLED by an arc of overlapping hills on its field side —
-// the natural high ground that blocks sightlines into the base — with a gap
-// only where the road leaves through the gate; more pairs wander midfield,
+// Hill stamps [cx, cz, radius, amplitude], planned per seed. Each spawn is
+// CRADLED by an independently-rolled arc of overlapping hills on its field
+// side — the natural high ground that blocks sightlines into the base — with
+// gaps only at the road gate and the sally; more hills wander midfield
+// wherever they land (the map is random; only the flags are near-mirrored),
 // and the sightline validator appends extras wherever a view still leaks.
 let HILLS: Array<[number, number, number, number]> = [];
 
@@ -253,76 +253,71 @@ function planHills(rng: () => number): void {
   HILLS = [];
   // The sniper lane commits first so the wandering hills can respect it.
   DUEL_LANE_X = (15 + rng() * 22) * (rng() < 0.5 ? 1 : -1);
-  const side = rng() < 0.5 ? 1 : -1;
-  const gx = side * (27 + rng() * 6);
-  const gz = 86 + rng() * 4;
-  GATES = [
-    [gx, -gz],
-    [-gx, gz],
-  ];
-  const wx = side * 15;
-  SPAWN_WAYPTS = [
-    [wx, -103.5],
-    [-wx, 103.5],
-  ];
-  // The cradle gap sits where the waypoint→gate leg crosses the arc ring.
-  const ringD = 21;
-  const legDx = gx - wx;
-  const legDz = -gz + 103.5;
-  let gapAz = Math.atan2(gx, 100 - gz);
-  for (let t = 0; t <= 1; t += 0.05) {
-    const px = wx + legDx * t;
-    const pz = -103.5 + legDz * t;
-    if (Math.hypot(px, pz + 100) >= ringD) {
-      gapAz = Math.atan2(px, pz + 100);
-      break;
+  // Each base rolls its own cradle independently — the MAP is random, only
+  // the flags are near-mirrored. Geometry is computed in a south-spawn frame
+  // and point-reflected into place for the north team.
+  for (const team of [0, 1] as const) {
+    const flip = team === 0 ? 1 : -1;
+    const put = (x: number, z: number, r: number, amp: number): void => {
+      HILLS.push([x * flip, z * flip, r, amp]);
+    };
+    const side = rng() < 0.5 ? 1 : -1;
+    const gx = side * (27 + rng() * 6);
+    const gz = 86 + rng() * 4;
+    GATES[team] = [gx * flip, -gz * flip];
+    const wx = side * 15;
+    SPAWN_WAYPTS[team] = [wx * flip, -103.5 * flip];
+    // The cradle gap sits where the waypoint→gate leg crosses the arc ring.
+    const ringD = 21;
+    const legDx = gx - wx;
+    const legDz = -gz + 103.5;
+    let gapAz = Math.atan2(gx, 100 - gz);
+    for (let t = 0; t <= 1; t += 0.05) {
+      const px = wx + legDx * t;
+      const pz = -103.5 + legDz * t;
+      if (Math.hypot(px, pz + 100) >= ringD) {
+        gapAz = Math.atan2(px, pz + 100);
+        break;
+      }
+    }
+    // A second sally gap on the opposite flank — the bowl must never be a
+    // one-door trap (the hills are walkable too, but a clean opening reads
+    // as a route). No road: infantry only.
+    const gap2Az = -gapAz;
+    // Cradle arc: hills every ~19° across the field-facing side. Gaps only
+    // at the road gate and the sally. Stamps ADD where they overlap, so
+    // amplitude is tuned for a ~4-5m ridge — enough to hide the pad, low
+    // enough to stay a hill, gentle enough to walk over anywhere (the
+    // countdown, not the dirt, keeps campers out).
+    for (let az = -1.75; az <= 1.75; az += 0.34) {
+      if (Math.abs(az - gapAz) < 0.42 || Math.abs(az - gap2Az) < 0.3) continue;
+      const dist = 20 + rng() * 4;
+      put(Math.sin(az) * dist, -100 + Math.cos(az) * dist, 15 + rng() * 4, 2.5 + rng() * 0.6);
+    }
+    // Gap-covering mounds INSIDE the ring, on the pad→gap axes. The road
+    // dog-leg means neither is crossed by a road; both stand past the pad
+    // fade. The sally's mound sits closer and taller: its gap has no road,
+    // so nothing stops it hugging the opening.
+    for (const [az, d, mr, ma] of [
+      [gapAz, 15, 11.5, 3.2 + rng() * 0.5],
+      [gap2Az, 14, 12.5, 3.5 + rng() * 0.5],
+    ] as const) {
+      put(Math.sin(az) * d, -100 + Math.cos(az) * d, mr, ma);
+    }
+    // And baffles outside each gap, offset off the exit lines, so neither
+    // opening can be scoped from across the map.
+    for (const [az, off] of [
+      [gapAz, side > 0 ? 0.5 : -0.5],
+      [gap2Az, side > 0 ? -0.5 : 0.5],
+    ] as const) {
+      const baffleD = 36 + rng() * 4;
+      const perp = az + off;
+      put(Math.sin(perp) * baffleD, -100 + Math.cos(perp) * baffleD, 13, 2.8);
     }
   }
-  // A second sally gap on the opposite flank — the bowl must never be a
-  // one-door trap (the hills are walkable too, but a clean opening reads as
-  // a route). No road: infantry only.
-  const gap2Az = -gapAz;
-  // Cradle arcs: hills every ~19° across the field-facing side of the south
-  // spawn, mirrored to the north spawn. Gaps only at the road gate and the
-  // sally. Stamps ADD where they overlap, so amplitude is tuned for a ~4-5m
-  // ridge — enough to hide the pad, low enough to stay a hill, gentle enough
-  // to walk over anywhere (the countdown, not the dirt, keeps campers out).
-  for (let az = -1.75; az <= 1.75; az += 0.34) {
-    if (Math.abs(az - gapAz) < 0.42 || Math.abs(az - gap2Az) < 0.3) continue;
-    const dist = 20 + rng() * 4;
-    const cx = Math.sin(az) * dist;
-    const cz = -100 + Math.cos(az) * dist;
-    const r = 15 + rng() * 4;
-    const amp = 2.5 + rng() * 0.6;
-    HILLS.push([cx, cz, r, amp], [-cx, -cz, r, amp]);
-  }
-  // Gap-covering mounds INSIDE the ring, on the pad→gap axes. The road
-  // dog-leg means neither is crossed by a road; both stand past the pad
-  // fade. The sally's mound sits closer and taller: its gap has no road, so
-  // nothing stops it hugging the opening.
-  for (const [az, d, mr, ma] of [
-    [gapAz, 15, 11.5, 3.2 + rng() * 0.5],
-    [gap2Az, 14, 12.5, 3.5 + rng() * 0.5],
-  ] as const) {
-    const mx = Math.sin(az) * d;
-    const mz = -100 + Math.cos(az) * d;
-    HILLS.push([mx, mz, mr, ma], [-mx, -mz, mr, ma]);
-  }
-  // And baffles outside each gap, offset off the exit lines, so neither
-  // opening can be scoped from across the map.
-  for (const [az, off] of [
-    [gapAz, side > 0 ? 0.5 : -0.5],
-    [gap2Az, side > 0 ? -0.5 : 0.5],
-  ] as const) {
-    const baffleD = 36 + rng() * 4;
-    const perp = az + off;
-    const bx = Math.sin(perp) * baffleD;
-    const bz = -100 + Math.cos(perp) * baffleD;
-    HILLS.push([bx, bz, 13, 2.8], [-bx, -bz, 13, 2.8]);
-  }
-  // Wandering pairs across the midfield band.
-  const pairs = 2 + Math.floor(rng() * 2);
-  for (let i = 0; i < pairs; i++) {
+  // Wandering hills across the midfield band, wherever they land.
+  const nHills = 4 + Math.floor(rng() * 3);
+  for (let i = 0; i < nHills; i++) {
     for (let attempt = 0; attempt < 12; attempt++) {
       const hx = (rng() * 2 - 1) * 92;
       const hz = (rng() * 2 - 1) * 56;
@@ -330,9 +325,7 @@ function planHills(rng: () => number): void {
       const r = 24 + rng() * 14;
       // The duel lane promises a clear north–south run — no hills across it.
       if (Math.abs(hx - DUEL_LANE_X) < r + 4 && Math.abs(hz) < 45 + r) continue;
-      if (Math.abs(-hx - DUEL_LANE_X) < r + 4 && Math.abs(hz) < 45 + r) continue;
-      const amp = 1.2 + rng() * 1.0;
-      HILLS.push([hx, hz, r, amp], [-hx, -hz, r, amp]);
+      HILLS.push([hx, hz, r, 1.2 + rng() * 1.0]);
       break;
     }
   }
@@ -667,16 +660,15 @@ function planWater(rng: () => number): void {
     }
   }
   LAKES = [];
-  const pairs = (HAS_RIVER ? 0 : 1) + (rng() < 0.55 ? 1 : 0);
-  for (let i = 0; i < pairs; i++) {
+  const nLakes = (HAS_RIVER ? 0 : 1) + (rng() < 0.55 ? 1 : 0) + (rng() < 0.35 ? 1 : 0);
+  for (let i = 0; i < nLakes; i++) {
     for (let attempt = 0; attempt < 20; attempt++) {
       const cx = (rng() * 2 - 1) * 90;
       const cz = (rng() * 2 - 1) * 60;
       if (Math.hypot(cx, cz) < 28) continue; // keep the center house dry
       if (HAS_RIVER && Math.abs(cz - RIVER_Z0) < 26) continue; // river valley stays a river
-      const rx = 10 + rng() * 7;
-      const rz = 8 + rng() * 5;
-      LAKES.push([cx, cz, rx, rz], [-cx, -cz, rx, rz]);
+      if (LAKES.some(([lx, lz]) => Math.hypot(lx - cx, lz - cz) < 40)) continue;
+      LAKES.push([cx, cz, 10 + rng() * 7, 8 + rng() * 5]);
       break;
     }
   }
@@ -1015,7 +1007,11 @@ function partitionInterior(
   const avoid = (pos: number, center: number, lo: number, hi: number): number => {
     if (Math.abs(pos - center) >= 1.3) return pos;
     const pushed = pos < center ? center - 1.3 : center + 1.3;
-    return Math.max(lo, Math.min(hi, pushed));
+    const clamped = Math.max(lo, Math.min(hi, pushed));
+    // If clamping lands the cut back over the centered exterior door, no
+    // nudge can save it — a wall through the doorway seals the building.
+    // NaN tells the caller to skip this split entirely.
+    return Math.abs(clamped - center) < 1.05 ? Number.NaN : clamped;
   };
   const rec = (ax0: number, az0: number, ax1: number, az1: number, depth: number): void => {
     const w = ax1 - ax0;
@@ -1032,6 +1028,7 @@ function partitionInterior(
       if (hi <= lo) return;
       let pos = snap(lo + (hi - lo) * (0.5 + (rng() - 0.5) * 0.5));
       pos = avoid(Math.max(lo, Math.min(hi, pos)), cx, lo, hi);
+      if (Number.isNaN(pos)) return; // one bigger room beats a blocked door
       out.push({ axis: "z", fixed: pos, lo: az0, hi: az1 });
       rec(ax0, az0, pos, az1, depth + 1);
       rec(pos, az0, ax1, az1, depth + 1);
@@ -1041,6 +1038,7 @@ function partitionInterior(
       if (hi <= lo) return;
       let pos = snap(lo + (hi - lo) * (0.5 + (rng() - 0.5) * 0.5));
       pos = avoid(Math.max(lo, Math.min(hi, pos)), cz, lo, hi);
+      if (Number.isNaN(pos)) return;
       out.push({ axis: "x", fixed: pos, lo: ax0, hi: ax1 });
       rec(ax0, az0, ax1, pos, depth + 1);
       rec(ax0, pos, ax1, az1, depth + 1);
@@ -1381,11 +1379,38 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
       for (const wseg of roomWalls) {
         const span = wseg.hi - wseg.lo;
         if (span < 2.0) continue; // too short to seat a 1.4m door with jambs
+        // Where perpendicular partitions abut this wall, a doorway placed
+        // there opens straight into the end of another wall — collect those
+        // spots so the door pick can steer clear.
+        const abuts: number[] = [];
+        for (const other of roomWalls) {
+          if (other === wseg || other.axis === wseg.axis) continue;
+          if (Math.abs(other.lo - wseg.fixed) > 0.2 && Math.abs(other.hi - wseg.fixed) > 0.2) {
+            continue;
+          }
+          if (other.fixed > wseg.lo + 0.2 && other.fixed < wseg.hi - 0.2) abuts.push(other.fixed);
+        }
         // Keep the 0.7m half-door at least 0.2m off each end (mid in [lo+0.9,
-        // hi-0.9]) so jambs survive instead of collapsing to slivers.
-        const gaps: GapRect[] = [doorGap(wseg.lo + 0.9 + o.rng() * (span - 1.8), baseY)];
+        // hi-0.9]) so jambs survive instead of collapsing to slivers, and at
+        // least ~a jamb clear of every abutting wall.
+        const pickDoor = (): number => {
+          let best = wseg.lo + 0.9 + o.rng() * (span - 1.8);
+          let bestClear = -1;
+          for (let t = 0; t < 14; t++) {
+            const mid = wseg.lo + 0.9 + o.rng() * (span - 1.8);
+            const clear =
+              abuts.length > 0 ? Math.min(...abuts.map((a) => Math.abs(mid - a))) : Infinity;
+            if (clear >= 1.05) return mid;
+            if (clear > bestClear) {
+              bestClear = clear;
+              best = mid;
+            }
+          }
+          return best;
+        };
+        const gaps: GapRect[] = [doorGap(pickDoor(), baseY)];
         if (span > 6.5 && o.rng() < 0.35) {
-          gaps.push(doorGap(wseg.lo + 0.9 + o.rng() * (span - 1.8), baseY));
+          gaps.push(doorGap(pickDoor(), baseY));
         }
         masonryRun(
           g,
@@ -2344,23 +2369,22 @@ function planLayout(rng: () => number): Layout {
   // 46m from every other flag (including B at the center house).
   const FLAG_MIN_DIST = 46;
   const hamletPairs: Array<[Anchor, Anchor]> = [];
-  for (let pair = 0; pair < 4; pair++) {
-    const flagPair = pair < 2;
+  for (let pair = 0; pair < 2; pair++) {
     // Flags already placed (for spacing): B, then both zones of prior pairs.
     const flagPts: Array<[number, number]> = [[0, 0]];
-    for (const [pa, pb] of hamletPairs.slice(0, 2)) flagPts.push([pa.x, pa.z], [pb.x, pb.z]);
+    for (const [pa, pb] of hamletPairs) flagPts.push([pa.x, pa.z], [pb.x, pb.z]);
     const flagRoom = (px: number, pz: number): boolean =>
       flagPts.every(([fx, fz]) => Math.hypot(fx - px, fz - pz) >= FLAG_MIN_DIST);
     for (let attempt = 0; attempt < 40; attempt++) {
       const ang = rng() * Math.PI * 2;
-      const rad = (flagPair ? 48 : 40) + rng() * (flagPair ? 40 : 48);
+      const rad = 48 + rng() * 40;
       const x = Math.cos(ang) * rad;
       const z = Math.sin(ang) * rad;
       // The twin drifts off the exact mirror point.
       const bx = -x + (rng() * 2 - 1) * 7;
       const bz = -z + (rng() * 2 - 1) * 7;
       if (!anchorClear(x, z, 36, 68, 0.04) || !anchorClear(bx, bz, 36, 68, 0.04)) continue;
-      if (flagPair && (!flagRoom(x, z) || !flagRoom(bx, bz))) continue;
+      if (!flagRoom(x, z) || !flagRoom(bx, bz)) continue;
       const axis = rng() * Math.PI;
       const count = 5 + Math.floor(rng() * 2);
       const a: Anchor = { type: "hamlet", x, z, axis, count };
@@ -2376,21 +2400,42 @@ function planLayout(rng: () => number): Layout {
       break;
     }
   }
-  const farmPairs = 2 + (rng() < 0.5 ? 1 : 0);
-  for (let pair = 0; pair < farmPairs; pair++) {
+  // Free hamlets and farms land wherever they land — no mirroring. The map
+  // is random; only the flag greens above are (nearly) fair-by-position.
+  const nFreeHamlets = 3 + Math.floor(rng() * 2);
+  for (let i = 0; i < nFreeHamlets; i++) {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const ang = rng() * Math.PI * 2;
+      const rad = 40 + rng() * 48;
+      const x = Math.cos(ang) * rad;
+      const z = Math.sin(ang) * rad;
+      if (!anchorClear(x, z, 36, 68, 0.3)) continue;
+      anchors.push({
+        type: "hamlet",
+        x,
+        z,
+        axis: rng() * Math.PI,
+        count: 5 + Math.floor(rng() * 2),
+      });
+      break;
+    }
+  }
+  const nFarms = 4 + Math.floor(rng() * 3);
+  for (let i = 0; i < nFarms; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const ang = rng() * Math.PI * 2;
       const rad = 74 + rng() * 24;
       const x = Math.cos(ang) * rad;
       const z = Math.sin(ang) * rad;
       // zLim 70 keeps farm pads off the spawn cradle arcs.
-      if (!anchorClear(x, z, 32, 70, 0.5) || !anchorClear(-x, -z, 32, 70, 0.5)) continue;
-      const axis = rng() * Math.PI;
-      const count = 1 + (rng() < 0.55 ? 1 : 0);
-      anchors.push(
-        { type: "farm", x, z, axis, count },
-        { type: "farm", x: -x, z: -z, axis, count },
-      );
+      if (!anchorClear(x, z, 32, 70, 0.5)) continue;
+      anchors.push({
+        type: "farm",
+        x,
+        z,
+        axis: rng() * Math.PI,
+        count: 1 + (rng() < 0.55 ? 1 : 0),
+      });
       break;
     }
   }
@@ -2959,11 +3004,12 @@ function validateSpawnCover(): void {
       if (placedNow.some(([qx, qz]) => Math.hypot(qx - px, qz - pz) < 12)) continue;
       amp = Math.min(4.6, Math.max(1.6, amp));
       const r = Math.max(11, Math.min(17, amp * 4.2));
-      HILLS.push([px, pz, r, amp], [-px, -pz, r, amp]);
+      // Single stamp, only where the leak is — the map is asymmetric, so a
+      // mirrored twin would be a hill with no job.
+      HILLS.push([px, pz, r, amp]);
       refreshPatch(px, pz, r);
-      refreshPatch(-px, -pz, r);
       placedNow.push([px, pz]);
-      fixStamps.push([px, pz], [-px, -pz]);
+      fixStamps.push([px, pz]);
     }
     if (placedNow.length === 0) return; // nowhere left to raise ground: stop
   }
