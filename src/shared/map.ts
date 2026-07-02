@@ -227,7 +227,7 @@ function fbm2(x: number, z: number, octaves: number, freq: number): number {
 // Hill stamps [cx, cz, radius, amplitude], planned per seed. Each spawn is
 // CRADLED by an independently-rolled arc of overlapping hills on its field
 // side — the natural high ground that blocks sightlines into the base — with
-// gaps only at the road gate and the sally; more hills wander midfield
+// gaps only at the two road gates; more hills wander midfield
 // wherever they land (the map is random; only the flags are near-mirrored),
 // and the sightline validator appends extras wherever a view still leaks.
 let HILLS: Array<[number, number, number, number]> = [];
@@ -245,18 +245,31 @@ let GATES2: [[number, number], [number, number]] = [
   [24, 92],
 ];
 
-// Every base road leaves through a dog-leg BEHIND the pad: spawn → a
-// waypoint out past the pad's flank (level with the back line) → out through
-// its cradle gap. No flattened road channel ever points from the field into
-// the pad, so each gap can be covered by an interior mound the road never
-// touches.
+// Every base road leaves FORWARD: spawn → a waypoint at the pad's front
+// corner → out through its cradle gap. Players face the field on deploy
+// (the client's faceTheAction), so both exit roads sit in a fresh spawn's
+// view instead of dog-legging behind the pad. The field-facing corridors
+// this opens are covered by the exterior baffles and by the sightline
+// validator, which grows off-road hills wherever a view still leaks.
 let SPAWN_WAYPTS: [[number, number], [number, number]] = [
-  [15, -103.5],
-  [-15, 103.5],
+  [12, -94],
+  [-12, 94],
 ];
 let SPAWN_WAYPTS2: [[number, number], [number, number]] = [
-  [-15, -103.5],
-  [15, 103.5],
+  [-12, -94],
+  [12, 94],
+];
+
+// Where each exit road bends once it's outside the gate (rotated toward
+// midfield). The straight spawn→gate leg ends here; past the bend the exit
+// axis is bare dirt, so the on-axis baffle (and the validator) can seal it.
+let OUTER_WAYPTS: [[number, number], [number, number]] = [
+  [30, -55],
+  [-30, 55],
+];
+let OUTER_WAYPTS2: [[number, number], [number, number]] = [
+  [-30, -55],
+  [30, 55],
 ];
 
 function planHills(rng: () => number): void {
@@ -272,62 +285,74 @@ function planHills(rng: () => number): void {
       HILLS.push([x * flip, z * flip, r, amp]);
     };
     // Where a waypoint→gate leg crosses the arc ring — the cradle leaves its
-    // gap there.
+    // gap there. South-frame coordinates throughout (both z negative).
     const ringD = 21;
-    const legGapAz = (wpx: number, gpx: number, gpz: number): number => {
-      const legDx = gpx - wpx;
-      const legDz = -gpz + 103.5;
+    const legGapAz = (wpx: number, wpz: number, gpx: number, gpz: number): number => {
       for (let t = 0; t <= 1; t += 0.05) {
-        const px = wpx + legDx * t;
-        const pz = -103.5 + legDz * t;
+        const px = wpx + (gpx - wpx) * t;
+        const pz = wpz + (gpz - wpz) * t;
         if (Math.hypot(px, pz + 100) >= ringD) return Math.atan2(px, pz + 100);
       }
-      return Math.atan2(gpx, 100 - gpz);
+      return Math.atan2(gpx, gpz + 100);
     };
     const side = rng() < 0.5 ? 1 : -1;
     const gx = side * (27 + rng() * 6);
-    const gz = 86 + rng() * 4;
-    GATES[team] = [gx * flip, -gz * flip];
-    const wx = side * 15;
-    SPAWN_WAYPTS[team] = [wx * flip, -103.5 * flip];
-    const gapAz = legGapAz(wx, gx, gz);
-    // The second exit road leaves out the OPPOSITE flank through its own
-    // gate — the bowl is never a one-door trap, and both routes read as
-    // roads from the spawn pad.
+    const gz = -(86 + rng() * 4);
+    GATES[team] = [gx * flip, gz * flip];
+    // Front-corner waypoint: the road leaves the pad toward the field.
+    const wx = side * (12 + rng() * 2);
+    const wz = -(93.5 + rng() * 1.5);
+    SPAWN_WAYPTS[team] = [wx * flip, wz * flip];
+    const gapAz = legGapAz(wx, wz, gx, gz);
+    // The second exit road leaves out the OPPOSITE front flank through its
+    // own gate — the bowl is never a one-door trap, and a fresh spawn sees
+    // both routes fan out ahead.
     const gx2 = -side * (27 + rng() * 6);
-    const gz2 = 86 + rng() * 4;
-    GATES2[team] = [gx2 * flip, -gz2 * flip];
-    const wx2 = -side * 15;
-    SPAWN_WAYPTS2[team] = [wx2 * flip, -103.5 * flip];
-    const gap2Az = legGapAz(wx2, gx2, gz2);
-    // Cradle arc: hills every ~19° across the field-facing side. Gaps only
-    // at the road gate and the sally. Stamps ADD where they overlap, so
-    // amplitude is tuned for a ~4-5m ridge — enough to hide the pad, low
-    // enough to stay a hill, gentle enough to walk over anywhere (the
-    // countdown, not the dirt, keeps campers out).
-    for (let az = -1.75; az <= 1.75; az += 0.34) {
-      if (Math.abs(az - gapAz) < 0.42 || Math.abs(az - gap2Az) < 0.42) continue;
+    const gz2 = -(86 + rng() * 4);
+    GATES2[team] = [gx2 * flip, gz2 * flip];
+    const wx2 = -side * (12 + rng() * 2);
+    const wz2 = -(93.5 + rng() * 1.5);
+    SPAWN_WAYPTS2[team] = [wx2 * flip, wz2 * flip];
+    const gap2Az = legGapAz(wx2, wz2, gx2, gz2);
+    // Cradle arc: hills every ~19°, wrapping past the flanks to ±120° (the
+    // exit roads leave FORWARD, so the rear flanks are free for dirt now —
+    // and they need it: flank-skimming rays used to be blocked by luck and
+    // the validator). Gaps only at the two road gates. Stamps ADD where
+    // they overlap, so amplitude is tuned for a ~4-5m ridge — enough to
+    // hide the pad, low enough to stay a hill, gentle enough to walk over
+    // anywhere (the countdown, not the dirt, keeps campers out). No mounds
+    // INSIDE the ring: the bowl floor stays clear for the roads and the
+    // validator covers whatever the gaps leak.
+    for (let az = -2.09; az <= 2.09; az += 0.34) {
+      // The skip window is barely wider than the road cut itself: the road
+      // grades through the remaining shoulder (a sunken gate), and the
+      // narrow aperture leaves slanting rays nothing to thread.
+      if (Math.abs(az - gapAz) < 0.36 || Math.abs(az - gap2Az) < 0.36) continue;
       const dist = 20 + rng() * 4;
       put(Math.sin(az) * dist, -100 + Math.cos(az) * dist, 15 + rng() * 4, 2.5 + rng() * 0.6);
     }
-    // Gap-covering mounds INSIDE the ring, on the pad→gap axes. The road
-    // dog-legs mean neither mound is crossed by a road; both stand past the
-    // pad fade.
-    for (const [az, d, mr, ma] of [
-      [gapAz, 15, 11.5, 3.2 + rng() * 0.5],
-      [gap2Az, 15, 11.5, 3.2 + rng() * 0.5],
+    // Outside the gate every exit road BENDS once, around an outer waypoint
+    // rotated toward midfield — so the straight in-bowl leg a fresh spawn
+    // looks down is never the same line a distant scope can look up. The
+    // baffle sits ON the vacated exit axis behind the bend, closing the
+    // straight corridor the road itself no longer occupies; a pair of
+    // gatepost mounds hugs the road just outside the gate (a defile), so
+    // rays slanting through the gap at any other angle hit dirt — a far
+    // baffle alone can't cover an aperture it sits 25m behind.
+    for (const [az, sgn, store] of [
+      [gapAz, side, OUTER_WAYPTS],
+      [gap2Az, -side, OUTER_WAYPTS2],
     ] as const) {
-      put(Math.sin(az) * d, -100 + Math.cos(az) * d, mr, ma);
-    }
-    // And baffles outside each gap, offset off the exit lines, so neither
-    // opening can be scoped from across the map.
-    for (const [az, off] of [
-      [gapAz, side > 0 ? 0.5 : -0.5],
-      [gap2Az, side > 0 ? -0.5 : 0.5],
-    ] as const) {
-      const baffleD = 36 + rng() * 4;
-      const perp = az + off;
-      put(Math.sin(perp) * baffleD, -100 + Math.cos(perp) * baffleD, 13, 2.8);
+      const outAz = az - 0.8 * sgn;
+      const outD = 48 + rng() * 6;
+      store[team] = [Math.sin(outAz) * outD * flip, (-100 + Math.cos(outAz) * outD) * flip];
+      const baffleD = 44 + rng() * 4;
+      put(Math.sin(az) * baffleD, -100 + Math.cos(az) * baffleD, 13, 3.0 + rng() * 0.4);
+      for (const lat of [1, -1] as const) {
+        const md = 26 + rng() * 3;
+        const mAz = az + lat * (0.28 + rng() * 0.04);
+        put(Math.sin(mAz) * md, -100 + Math.cos(mAz) * md, 9.5 + rng(), 2.9 + rng() * 0.4);
+      }
     }
   }
   // Wandering hills across the midfield band, wherever they land.
@@ -476,6 +501,11 @@ function reliefAt(x: number, z: number): number {
 // derive from the buildings actually placed (mutable, not hand-authored).
 let FLAT_PADS: Array<[number, number, number, number]> = [];
 
+// Roads never exceed this grade (rise/run): the baked profile cuts bumps and
+// fills dips until every piece complies, so no lane climbs a hill shoulder
+// or dives off the spawn-bowl rim at a wall-like pitch.
+const MAX_ROAD_GRADE = 0.15;
+
 // A straight piece of a road/path centerline, with its surface height baked at
 // each end (sampled from the pre-road terrain) so the road lies flat instead of
 // rippling over the noise.
@@ -535,9 +565,14 @@ export function roadSegments(): readonly RoadSeg[] {
 
 // 1 in the open field, fading to 0 inside any flat pad. The noise relief and
 // crater digging are scaled by this, so buildings never get undermined.
-function padFade(x: number, z: number): number {
+// `skipSpawnPads` ignores the two spawn pads (always FLAT_PADS[0] and [1]):
+// road PAINT uses it so each base's two exit roads run visibly across the
+// (already flat) pad and converge on the spawn point, instead of dying at
+// the pad apron — the terrain shape everywhere still treats them as pads.
+function padFade(x: number, z: number, skipSpawnPads = false): number {
   let f = 1;
-  for (const [cx, cz, hw, hd] of FLAT_PADS) {
+  for (let i = skipSpawnPads ? 2 : 0; i < FLAT_PADS.length; i++) {
+    const [cx, cz, hw, hd] = FLAT_PADS[i];
     const dx = Math.max(0, Math.abs(x - cx) - hw);
     const dz = Math.max(0, Math.abs(z - cz) - hd);
     const dist = Math.hypot(dx, dz);
@@ -625,7 +660,7 @@ export function roadAt(x: number, z: number): { w: number; cobble: boolean } {
   if (!bestSeg) return { w: 0, cobble: false };
   const verge = 0.7;
   const w = best <= bestSeg.half ? 1 : Math.max(0, 1 - (best - bestSeg.half) / verge);
-  return { w: w * padFade(x, z), cobble: bestSeg.half > 3 };
+  return { w: w * padFade(x, z, true), cobble: bestSeg.half > 3 };
 }
 
 // --- Water: usually one meandering river plus lakes, carved into the base
@@ -2320,10 +2355,12 @@ function planLayout(rng: () => number): Layout {
   const sideFacing = (dx: number, dz: number): 0 | 1 | 2 | 3 =>
     Math.abs(dx) >= Math.abs(dz) ? (dx > 0 ? 2 : 3) : dz > 0 ? 0 : 1;
 
-  // Spawns: flat pads + road endpoints (nodes 0 and 1). Each base's road
-  // dog-legs BEHIND the pad: spawn → flank waypoint (nodes 4 and 5) → out
-  // through the cradle's gate (nodes 2 and 3) — the flattened channel never
-  // points from the field into the pad.
+  // Spawns: flat pads + road endpoints (nodes 0 and 1). Each base's roads
+  // run FORWARD: spawn → front-corner waypoint (nodes 4/5, 8/9) → out
+  // through the cradle's gates (nodes 2/3, 6/7) → one bend at the outer
+  // waypoints (nodes 10-13) where they join the field network. A fresh
+  // spawn facing the field sees both exits ahead; a distant scope looking
+  // back up either exit axis meets the on-axis baffle past the bend.
   pads.push([0, -100, 11, 7]);
   pads.push([0, 100, 11, 7]);
   nodes.push([0, -100]);
@@ -2336,6 +2373,10 @@ function planLayout(rng: () => number): Layout {
   nodes.push(GATES2[1]);
   nodes.push(SPAWN_WAYPTS2[0]);
   nodes.push(SPAWN_WAYPTS2[1]);
+  nodes.push(OUTER_WAYPTS[0]);
+  nodes.push(OUTER_WAYPTS[1]);
+  nodes.push(OUTER_WAYPTS2[0]);
+  nodes.push(OUTER_WAYPTS2[1]);
 
   // The fixed center house — the tests anchor to its +z door and west
   // stairwell, so it never moves, whatever the seed.
@@ -2471,22 +2512,28 @@ function planLayout(rng: () => number): Layout {
   // --- Road graph over the nodes, BEFORE lots: lots must reject the road
   // corridors, and the corridors only depend on the node graph.
   const N = nodes.length;
-  // Forced base plumbing: spawn↔its two waypoints, each waypoint↔its gate
+  // Forced base plumbing: spawn↔front waypoint↔gate↔outer bend waypoint
   // (nodes: 0,1 spawns · 2,3 gates · 4,5 waypoints · 6,7 second gates ·
-  // 8,9 second waypoints); nothing else may touch a spawn or waypoint node.
+  // 8,9 second waypoints · 10-13 outer waypoints). Nothing else may touch a
+  // spawn, waypoint, or gate node — the network attaches at the outer
+  // waypoints, past the bend, so no field edge can straighten an exit axis.
   const FORCED: ReadonlyArray<[number, number]> = [
     [0, 4],
     [4, 2],
+    [2, 10],
     [1, 5],
     [5, 3],
+    [3, 11],
     [0, 8],
     [8, 6],
+    [6, 12],
     [1, 9],
     [9, 7],
+    [7, 13],
   ];
   const forced = (i: number, j: number): boolean =>
     FORCED.some(([a, b]) => (a === i && b === j) || (a === j && b === i));
-  const isPlumbing = (n: number): boolean => n < 2 || n === 4 || n === 5 || n === 8 || n === 9;
+  const isPlumbing = (n: number): boolean => n < 10;
   const edgeW = (i: number, j: number): number => {
     if (isPlumbing(i) || isPlumbing(j)) {
       if (!forced(i, j)) return Infinity;
@@ -2804,34 +2851,120 @@ function planLayout(rng: () => number): Layout {
   // Pads are final — publish so terrainBase + road baking flatten correctly.
   FLAT_PADS = pads;
 
-  // Bake the polylines into road segments, sampling heights from the padded
-  // pre-road terrain so every lane lies flat on its own profile.
+  // Bake the polylines into road segments. Heights are sampled from the
+  // padded pre-road terrain and then GRADED to a maximum steepness: a lower
+  // envelope cuts the bumps, an upper envelope fills the dips, and their
+  // midpoint is the profile — balanced cut-and-fill, so a road over a hill
+  // shoulder reads as a graded cutting instead of a climb (roadFieldAt pulls
+  // the terrain to this profile inside the road band, which is what digs the
+  // cuttings and raises the embankments).
+  interface RoadChain {
+    xs: number[];
+    zs: number[];
+    hs: number[];
+    ds: number[]; // ds[i] = run from point i to i+1
+    half: number;
+  }
+  const chains: RoadChain[] = [];
+  const addChain = (pts: Array<[number, number]>, half: number): void => {
+    // Subdivide to <=7m pieces so the profile can bend where the ground does.
+    const xs: number[] = [pts[0][0]];
+    const zs: number[] = [pts[0][1]];
+    for (let i = 0; i < pts.length - 1; i++) {
+      const [ax, az] = pts[i];
+      const [bx, bz] = pts[i + 1];
+      const n = Math.max(1, Math.ceil(Math.hypot(bx - ax, bz - az) / 7));
+      for (let k = 1; k <= n; k++) {
+        xs.push(ax + ((bx - ax) * k) / n);
+        zs.push(az + ((bz - az) * k) / n);
+      }
+    }
+    const hs = xs.map((x, i) => terrainBase(x, zs[i]));
+    const ds: number[] = [];
+    for (let i = 0; i < xs.length - 1; i++) {
+      ds.push(Math.hypot(xs[i + 1] - xs[i], zs[i + 1] - zs[i]) || 0.001);
+    }
+    chains.push({ xs, zs, hs, ds, half });
+  };
+  for (const pl of polylines) addChain(pl.pts, pl.half);
+  for (const [ax, az, bx, bz] of localStreets)
+    addChain(
+      [
+        [ax, az],
+        [bx, bz],
+      ],
+      2.0,
+    );
+
+  // Grade the network as ONE graph, not chain by chain: chain endpoints at
+  // the same node collapse to a single graph point, so every road meeting a
+  // junction agrees on its height there by construction (no lips). The lower
+  // envelope relaxes each point down to the cheapest cap-sloped path from any
+  // ground sample (cutting bumps); the upper envelope is its mirror (filling
+  // dips); their midpoint is the profile — balanced cut-and-fill that never
+  // exceeds MAX_ROAD_GRADE across any piece, junctions included.
+  const nodeKey = (x: number, z: number): number => Math.round(x * 4) * 300000 + Math.round(z * 4);
+  const nodeIds = new Map<number, number>();
+  const h0: number[] = [];
+  const chainIds: number[][] = [];
+  const graphEdges: Array<[number, number, number]> = [];
+  for (const c of chains) {
+    const cids: number[] = [];
+    for (let i = 0; i < c.xs.length; i++) {
+      const isEnd = i === 0 || i === c.xs.length - 1;
+      let id = isEnd ? nodeIds.get(nodeKey(c.xs[i], c.zs[i])) : undefined;
+      if (id === undefined) {
+        id = h0.length;
+        h0.push(c.hs[i]);
+        if (isEnd) nodeIds.set(nodeKey(c.xs[i], c.zs[i]), id);
+      }
+      cids.push(id);
+    }
+    for (let i = 0; i < cids.length - 1; i++) graphEdges.push([cids[i], cids[i + 1], c.ds[i]]);
+    chainIds.push(cids);
+  }
+  const lo = h0.slice();
+  const up = h0.slice();
+  for (let guard = 0; guard < 500; guard++) {
+    let changed = false;
+    for (const [a, b, d] of graphEdges) {
+      const capD = MAX_ROAD_GRADE * d;
+      if (lo[b] > lo[a] + capD + 1e-4) {
+        lo[b] = lo[a] + capD;
+        changed = true;
+      }
+      if (lo[a] > lo[b] + capD + 1e-4) {
+        lo[a] = lo[b] + capD;
+        changed = true;
+      }
+      if (up[b] < up[a] - capD - 1e-4) {
+        up[b] = up[a] - capD;
+        changed = true;
+      }
+      if (up[a] < up[b] - capD - 1e-4) {
+        up[a] = up[b] - capD;
+        changed = true;
+      }
+    }
+    if (!changed) break;
+  }
+
   const roads: RoadSeg[] = [];
-  const pushSeg = (ax: number, az: number, bx: number, bz: number, halfW: number): void => {
-    const len = Math.hypot(bx - ax, bz - az);
-    const n = Math.max(1, Math.ceil(len / 7));
-    for (let k = 0; k < n; k++) {
-      const x0 = ax + (bx - ax) * (k / n);
-      const z0 = az + (bz - az) * (k / n);
-      const x1 = ax + (bx - ax) * ((k + 1) / n);
-      const z1 = az + (bz - az) * ((k + 1) / n);
+  for (let ci = 0; ci < chains.length; ci++) {
+    const c = chains[ci];
+    const cids = chainIds[ci];
+    for (let i = 0; i < cids.length - 1; i++) {
       roads.push({
-        ax: x0,
-        az: z0,
-        bx: x1,
-        bz: z1,
-        ay: terrainBase(x0, z0),
-        by: terrainBase(x1, z1),
-        half: halfW,
+        ax: c.xs[i],
+        az: c.zs[i],
+        bx: c.xs[i + 1],
+        bz: c.zs[i + 1],
+        ay: (lo[cids[i]] + up[cids[i]]) / 2,
+        by: (lo[cids[i + 1]] + up[cids[i + 1]]) / 2,
+        half: c.half,
       });
     }
-  };
-  for (const pl of polylines) {
-    for (let i = 0; i < pl.pts.length - 1; i++) {
-      pushSeg(pl.pts[i][0], pl.pts[i][1], pl.pts[i + 1][0], pl.pts[i + 1][1], pl.half);
-    }
   }
-  for (const [ax, az, bx, bz] of localStreets) pushSeg(ax, az, bx, bz, 2.0);
   ROAD_SEGS = roads;
   rebuildRoadGrid();
 
@@ -2867,13 +3000,25 @@ function planLayout(rng: () => number): Layout {
 // by ray-marching eye-height sightlines from a grid of field positions to a
 // grid of points on each spawn pad, over a coarse sampling of the pristine
 // terrain. Where a view still leaks, an ordinary-looking hill grows where the
-// leaking rays bundle (mirrored, off-road so the baked road profile can't cut
-// a channel back through it) and the check reruns. Terrain-only on purpose:
+// leaking rays bundle (off-road so the baked road profile can't cut a
+// channel back through it) and the check reruns. Terrain-only on purpose:
 // buildings block plenty of views, but they're destructible — the dirt
 // carries the guarantee. Runs BEFORE structures are seated, so everything
 // still lands on the final ground.
+//
+// The greedy pass is order-sensitive: a stamp can raise a distant threat's
+// eye and re-open rays whose good spots are already on the never-reuse list.
+// Restarting with fresh memory (grid resampled, no poisoned spots) reliably
+// seals the last few rays, so the wrapper runs up to three passes.
 
 function validateSpawnCover(): void {
+  for (let pass = 0; pass < 3; pass++) {
+    if (validateSpawnCoverPass()) return;
+  }
+}
+
+// One full greedy pass; true = no leaks remain.
+function validateSpawnCoverPass(): boolean {
   const cell = 1;
   const R = PLAY_HALF;
   const N = Math.floor((R * 2) / cell) + 1;
@@ -2925,7 +3070,7 @@ function validateSpawnCover(): void {
   // instead of a hill under it; the candidate march moves on instead.
   const fixStamps: Array<[number, number]> = [];
 
-  for (let iter = 0; iter < 22; iter++) {
+  for (let iter = 0; iter < 40; iter++) {
     // tx,tz,sx,sz per leaking pair (first leaking pad point per threat).
     const leaks: Array<[number, number, number, number]> = [];
     for (let team = 0; team < 2; team++) {
@@ -2957,7 +3102,7 @@ function validateSpawnCover(): void {
         }
       }
     }
-    if (leaks.length === 0) return;
+    if (leaks.length === 0) return true;
 
     // Bundle the leaks where their rays cross the spawn approach and grow a
     // hill at each of the densest crossings (several per pass — leak fans
@@ -2966,8 +3111,13 @@ function validateSpawnCover(): void {
     interface Bucket {
       x: number;
       z: number;
-      n: number;
+      sx: number; // pad-side anchor sums: the march must follow the TRUE
+      sz: number; // rays (pad corner → threat), not a spawn-center guess —
+      n: number; //  9m of anchor error puts far candidates metres off-ray
       slope: number; // max dY/ddist of its leaking rays (from the pad out)
+      td: number; // nearest threat distance: stamps must stay well short of
+      //             the threats they block, or raising the ground raises the
+      //             THREAT'S EYE and the fix chases its own tail upward
     }
     const buckets = new Map<number, Bucket>();
     for (const [tx, tz, sx, sz] of leaks) {
@@ -2978,11 +3128,14 @@ function validateSpawnCover(): void {
       const px = sx + (dx / dist) * cross;
       const pz = sz + (dz / dist) * cross;
       const key = Math.round(px / 11) * 1000 + Math.round(pz / 11);
-      const b = buckets.get(key) ?? { x: 0, z: 0, n: 0, slope: 0 };
+      const b = buckets.get(key) ?? { x: 0, z: 0, sx: 0, sz: 0, n: 0, slope: 0, td: Infinity };
       b.x += px;
       b.z += pz;
+      b.sx += sx;
+      b.sz += sz;
       b.n++;
       b.slope = Math.max(b.slope, (hAt(tx, tz) - hAt(sx, sz)) / dist);
+      b.td = Math.min(b.td, dist);
       buckets.set(key, b);
     }
     const ranked = [...buckets.values()].sort((a, b) => b.n - a.n);
@@ -2997,51 +3150,69 @@ function validateSpawnCover(): void {
       // until open dirt appears — the answer when the offending corridor is
       // a road running parallel under the rays. Perpendicular side-steps
       // (bigger mound, crest beside the ray) are the fallback.
-      const spawnZ = cz < 0 ? -100 : 100;
-      const d0 = Math.hypot(cx, cz - spawnZ) || 1;
-      const dirX = cx / d0;
-      const dirZ = (cz - spawnZ) / d0;
-      const taken = (qx: number, qz: number): boolean =>
+      const asx = b.sx / b.n;
+      const asz = b.sz / b.n;
+      const d0 = Math.hypot(cx - asx, cz - asz) || 1;
+      const dirX = (cx - asx) / d0;
+      const dirZ = (cz - asz) / d0;
+      const taken = (qx: number, qz: number, poisonOk: boolean): boolean =>
         onRoad(qx, qz) > 0 ||
         padFade(qx, qz) < 0.75 ||
-        fixStamps.some(([fx, fz]) => Math.hypot(fx - qx, fz - qz) < 8);
+        (!poisonOk && fixStamps.some(([fx, fz]) => Math.hypot(fx - qx, fz - qz) < 6.5));
       let px = -1;
       let pz = -1;
       let amp = 0;
-      for (const d of [d0, 17, 21, 25, 29, 33, 37, 41, 45, 50, 55]) {
-        const qx = dirX * d;
-        const qz = spawnZ + dirZ * d;
-        if (taken(qx, qz)) continue;
-        const rayY = EYE + b.slope * d;
-        px = qx;
-        pz = qz;
-        amp = rayY + 1.3 - hAt(qx, qz);
-        break;
-      }
-      if (px === -1) {
-        for (const off of [8, -8, 12, -12]) {
-          const qx = cx - dirZ * off;
-          const qz = cz + dirX * off;
-          if (taken(qx, qz)) continue;
-          px = qx;
-          pz = qz;
-          amp = (EYE + b.slope * d0 + 1.3 - hAt(qx, qz)) * 1.6;
-          break;
+      let rr = 0;
+      // The march runs past the exit roads' outer bends (~55m): a ray that
+      // parallels a road can only be blocked where the road has turned away.
+      // In road-dense seeds the first open dirt can be one lane over, so
+      // every distance also tries side-steps — a wide mound whose SHOULDER
+      // tops the ray, sized by the stamp's smoothstep falloff. Of every
+      // workable candidate, take the CHEAPEST (least added height): small
+      // stamps seal just as well and don't hoist distant threats' eyes,
+      // which is what set off fix-one-open-two cascades.
+      // Pass 2 (densest bundle only, when pass 1 found nothing): TOP-UP a
+      // poisoned spot. `need` is measured against the CURRENT ground, so a
+      // re-stamp adds only the remaining shortfall — it can't stack towers,
+      // and it un-sticks the endgame where every open spot has already been
+      // tried once against a since-raised threat eye.
+      let bestA = Infinity;
+      for (const poisonOk of b === ranked[0] ? [false, true] : [false]) {
+        for (const off of [0, 5, -5, 8, -8]) {
+          for (const d of [d0, 17, 21, 25, 29, 33, 37, 41, 45, 50, 55, 61, 67, 74, 82]) {
+            if (d > b.td - 20) break; // a stamp's skirt must never reach a threat
+            const qx = asx + dirX * d - dirZ * off;
+            const qz = asz + dirZ * d + dirX * off;
+            if (taken(qx, qz, poisonOk)) continue;
+            // +0.15 headroom: an exactly-sized stamp that still leaks (grid
+            // interpolation, a later stamp raising the threat's eye) poisons
+            // its spot, which is worse than a slightly taller hill.
+            const need = EYE + b.slope * d + 1.3 + 0.15 - hAt(qx, qz);
+            if (need < 0.4 && poisonOk) continue; // already tall enough here
+            const a = Math.max(1.6, off === 0 ? need : need / smooth(1 - Math.abs(off) / 17));
+            if (a >= bestA) continue;
+            bestA = a;
+            amp = Math.min(5.4, a);
+            rr = off === 0 ? Math.max(11, Math.min(17, amp * 4.2)) : 17;
+            px = qx;
+            pz = qz;
+          }
         }
+        if (px !== -1) break; // top-ups only when no fresh spot exists at all
       }
       if (px === -1) continue;
-      if (placedNow.some(([qx, qz]) => Math.hypot(qx - px, qz - pz) < 12)) continue;
-      amp = Math.min(4.6, Math.max(1.6, amp));
-      const r = Math.max(11, Math.min(17, amp * 4.2));
+      const spacing = leaks.length <= 8 ? 8 : 12;
+      if (placedNow.some(([qx, qz]) => Math.hypot(qx - px, qz - pz) < spacing)) continue;
       // Single stamp, only where the leak is — the map is asymmetric, so a
       // mirrored twin would be a hill with no job.
-      HILLS.push([px, pz, r, amp]);
-      refreshPatch(px, pz, r);
+      HILLS.push([px, pz, rr, amp]);
+      refreshPatch(px, pz, rr);
       placedNow.push([px, pz]);
       fixStamps.push([px, pz]);
     }
-    if (placedNow.length === 0) return; // nowhere left to raise ground: stop
+    if (placedNow.length === 0) return false; // nowhere left to raise ground
   }
+  return false; // out of iterations with leaks left — the next pass retries
 }
 
 // ---------------------------------------------------------------------------
@@ -3637,8 +3808,9 @@ export function buildSupportIndex(): SupportIndex {
   return { above, below, grounded, plankAdj };
 }
 
-// Deployed cover panels get ids above this; map panel ids stay below it.
-export const BUILT_PANEL_ID_BASE = 10000;
+// Deployed cover, rubble, settled chunks, and falling chunks get ids above
+// this; generated map panel ids must stay below it for the round lifetime.
+export const BUILT_PANEL_ID_BASE = 1_000_000;
 
 export function spawnPoint(team: number, idx: number): [number, number, number] {
   const c = MAP.spawns[team === 0 ? 0 : 1];

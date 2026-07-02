@@ -6,6 +6,7 @@
 import { GRENADE_FUSE_TICKS, RIFLE_COOLDOWN_TICKS, RIFLE_MAG } from "../src/shared/constants.js";
 import {
   addCrater,
+  BUILT_PANEL_ID_BASE,
   buildContactIndex,
   heightAt,
   MAP,
@@ -13,7 +14,12 @@ import {
   slabOfPiece,
   spawnPoint,
 } from "../src/shared/map.js";
-import { quantizeAngle, quantizeMove } from "../src/shared/netCodec.js";
+import {
+  decodeSnapshot,
+  encodeSnapshot,
+  quantizeAngle,
+  quantizeMove,
+} from "../src/shared/netCodec.js";
 import {
   applyCraterBodies,
   type Body,
@@ -22,6 +28,7 @@ import {
   mergeSlabBoxes,
   pieceIdFromHit,
   rebuildSlabBody,
+  removePanelBody,
   rayVsCapsule,
   type CharState,
   createGameWorld,
@@ -69,6 +76,33 @@ function step(r: Rig, input: InputCmd, hooks: StepHooks = {}, locked = false): v
   stepPlayerController(r.gw, r.body, r.s, input, { ...hooks, locked });
   r.gw.world.step(DT);
   readChar(r.body, r.s);
+}
+
+function panelProbe(p: PanelDef): {
+  origin: [number, number, number];
+  delta: [number, number, number];
+} {
+  const ext: [number, number, number] = [p.ex, p.ey, p.ez];
+  let axis: 0 | 1 | 2 = 0;
+  if (ext[1] < ext[axis]) axis = 1;
+  if (ext[2] < ext[axis]) axis = 2;
+  const origin: [number, number, number] = [p.x, p.y, p.z];
+  const delta: [number, number, number] = [0, 0, 0];
+  origin[axis] -= ext[axis] / 2 + 0.08;
+  delta[axis] = ext[axis] + 0.16;
+  return { origin, delta };
+}
+
+function rayPoint(
+  origin: readonly number[],
+  delta: readonly number[],
+  fraction: number,
+): [number, number, number] {
+  return [
+    origin[0] + delta[0] * fraction,
+    origin[1] + delta[1] * fraction,
+    origin[2] + delta[2] * fraction,
+  ];
 }
 
 async function main(): Promise<void> {
@@ -394,6 +428,91 @@ async function main(): Promise<void> {
           (m) => (byMat.get(m) ?? 0) > 0,
         ),
       JSON.stringify([...byMat.entries()]),
+    );
+    const maxMapId = MAP.panels[MAP.panels.length - 1]?.id ?? 0;
+    check(
+      "runtime panel ids start after generated map ids",
+      maxMapId < BUILT_PANEL_ID_BASE,
+      `maxMapId=${maxMapId} base=${BUILT_PANEL_ID_BASE}`,
+    );
+  }
+
+  // --- High-id map panels still rebuild their owning slab when destroyed.
+  // The map has enough pieces that ids exceed the old runtime id threshold;
+  // those must not be routed through runtime-body removal.
+  {
+    const gw = await createGameWorld();
+    const destroyed = new Set<number>();
+    const alive = (id: number): boolean => !destroyed.has(id);
+    let target: PanelDef | null = null;
+
+    for (const p of MAP.panels) {
+      if (p.id <= 10000 || p.rot) continue;
+      const { origin, delta } = panelProbe(p);
+      const hit = gw.world.castRay(origin, delta);
+      const hitId = hit?.body
+        ? pieceIdFromHit(hit.body, rayPoint(origin, delta, hit.fraction), alive)
+        : null;
+      if (hitId !== p.id) continue;
+
+      destroyed.add(p.id);
+      rebuildSlabBody(gw, slabOfPiece(p.id), alive);
+      const after = gw.world.castRay(origin, delta);
+      destroyed.delete(p.id);
+      rebuildSlabBody(gw, slabOfPiece(p.id), alive);
+      if (!after) {
+        target = p;
+        break;
+      }
+    }
+
+    check("finds a high-id map panel for collider removal", target !== null, "");
+    if (target) {
+      const { origin, delta } = panelProbe(target);
+      destroyed.add(target.id);
+      if (target.id < BUILT_PANEL_ID_BASE) rebuildSlabBody(gw, slabOfPiece(target.id), alive);
+      else removePanelBody(gw, target.id);
+      const stale = gw.world.castRay(origin, delta);
+      check(
+        "high-id map panel destruction removes collider",
+        stale === null,
+        `id=${target.id} base=${BUILT_PANEL_ID_BASE}`,
+      );
+    }
+    destroyGameWorld(gw);
+  }
+
+  // --- Snapshot codec keeps high runtime chunk ids intact.
+  {
+    const state = makeChar(spawn);
+    const packet = encodeSnapshot({
+      serverTick: 7,
+      phase: 0,
+      phaseEndTick: 100,
+      tickets: [100, 100],
+      zones: [],
+      self: { ackSeq: 1, ackTick: 7, status: 0, bufferDepth: 0, hp: 100, respawnTicks: 0, state },
+      remotes: [],
+      entities: [],
+      chunks: [
+        {
+          id: BUILT_PANEL_ID_BASE + 123,
+          x: 1,
+          y: 2,
+          z: 3,
+          qx: 0,
+          qy: 0,
+          qz: 0,
+          qw: 1,
+        },
+      ],
+      events: [],
+    });
+    const snap = decodeSnapshot(packet);
+    check(
+      "snapshot codec preserves high chunk ids",
+      snap?.chunks[0]?.id === BUILT_PANEL_ID_BASE + 123,
+      `decoded=${snap?.chunks[0]?.id}`,
     );
   }
 

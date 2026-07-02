@@ -221,7 +221,7 @@ const SELF_FIXED = 4 + 4 + 1 + 1 + 1 + 2; // ack, tick, status, depth, hp, respa
 const SELF_STATE = 6 * 8 + 1 + 9 + 4;
 const REMOTE_BYTES = 1 + 1 + 1 + 3 * 4 + 4 + 2;
 const ENTITY_BYTES = 1 + 6 * 4 + 1;
-const CHUNK_BYTES = 2 + 7 * 4;
+const CHUNK_BYTES = 4 + 7 * 4;
 const ZONE_BYTES = 2;
 const EVENT_BYTES = 2 + 1 + 1 + 3 * 4;
 
@@ -318,14 +318,14 @@ export function encodeSnapshot(snap: Snapshot): Uint8Array {
 
   dv.setUint8(o++, snap.chunks.length);
   for (const c of snap.chunks) {
-    dv.setUint16(o, c.id & 0xffff);
-    dv.setFloat32(o + 2, c.x);
-    dv.setFloat32(o + 6, c.y);
-    dv.setFloat32(o + 10, c.z);
-    dv.setFloat32(o + 14, c.qx);
-    dv.setFloat32(o + 18, c.qy);
-    dv.setFloat32(o + 22, c.qz);
-    dv.setFloat32(o + 26, c.qw);
+    dv.setUint32(o, c.id >>> 0);
+    dv.setFloat32(o + 4, c.x);
+    dv.setFloat32(o + 8, c.y);
+    dv.setFloat32(o + 12, c.z);
+    dv.setFloat32(o + 16, c.qx);
+    dv.setFloat32(o + 20, c.qy);
+    dv.setFloat32(o + 24, c.qz);
+    dv.setFloat32(o + 28, c.qw);
     o += CHUNK_BYTES;
   }
 
@@ -441,14 +441,14 @@ export function decodeSnapshot(bytes: Uint8Array): Snapshot | null {
   if (bytes.length < o + chunkCount * CHUNK_BYTES + 1) return null;
   for (let i = 0; i < chunkCount; i++) {
     chunks.push({
-      id: dv.getUint16(o),
-      x: dv.getFloat32(o + 2),
-      y: dv.getFloat32(o + 6),
-      z: dv.getFloat32(o + 10),
-      qx: dv.getFloat32(o + 14),
-      qy: dv.getFloat32(o + 18),
-      qz: dv.getFloat32(o + 22),
-      qw: dv.getFloat32(o + 26),
+      id: dv.getUint32(o),
+      x: dv.getFloat32(o + 4),
+      y: dv.getFloat32(o + 8),
+      z: dv.getFloat32(o + 12),
+      qx: dv.getFloat32(o + 16),
+      qy: dv.getFloat32(o + 20),
+      qz: dv.getFloat32(o + 24),
+      qw: dv.getFloat32(o + 28),
     });
     o += CHUNK_BYTES;
   }
