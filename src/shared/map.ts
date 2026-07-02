@@ -238,15 +238,25 @@ let GATES: [[number, number], [number, number]] = [
   [24, -92],
   [-24, 92],
 ];
+// Second exit per base, out the opposite flank — a fresh spawn sees a clear
+// road out of the bowl whichever way they turn.
+let GATES2: [[number, number], [number, number]] = [
+  [-24, -92],
+  [24, 92],
+];
 
-// The road leaves each base through a dog-leg BEHIND the pad: spawn → a
+// Every base road leaves through a dog-leg BEHIND the pad: spawn → a
 // waypoint out past the pad's flank (level with the back line) → out through
-// the cradle gap. No flattened road channel ever points from the field into
-// the pad, so the gap can be covered by an interior mound the road never
+// its cradle gap. No flattened road channel ever points from the field into
+// the pad, so each gap can be covered by an interior mound the road never
 // touches.
 let SPAWN_WAYPTS: [[number, number], [number, number]] = [
   [15, -103.5],
   [-15, 103.5],
+];
+let SPAWN_WAYPTS2: [[number, number], [number, number]] = [
+  [-15, -103.5],
+  [15, 103.5],
 ];
 
 function planHills(rng: () => number): void {
@@ -261,46 +271,51 @@ function planHills(rng: () => number): void {
     const put = (x: number, z: number, r: number, amp: number): void => {
       HILLS.push([x * flip, z * flip, r, amp]);
     };
+    // Where a waypoint→gate leg crosses the arc ring — the cradle leaves its
+    // gap there.
+    const ringD = 21;
+    const legGapAz = (wpx: number, gpx: number, gpz: number): number => {
+      const legDx = gpx - wpx;
+      const legDz = -gpz + 103.5;
+      for (let t = 0; t <= 1; t += 0.05) {
+        const px = wpx + legDx * t;
+        const pz = -103.5 + legDz * t;
+        if (Math.hypot(px, pz + 100) >= ringD) return Math.atan2(px, pz + 100);
+      }
+      return Math.atan2(gpx, 100 - gpz);
+    };
     const side = rng() < 0.5 ? 1 : -1;
     const gx = side * (27 + rng() * 6);
     const gz = 86 + rng() * 4;
     GATES[team] = [gx * flip, -gz * flip];
     const wx = side * 15;
     SPAWN_WAYPTS[team] = [wx * flip, -103.5 * flip];
-    // The cradle gap sits where the waypoint→gate leg crosses the arc ring.
-    const ringD = 21;
-    const legDx = gx - wx;
-    const legDz = -gz + 103.5;
-    let gapAz = Math.atan2(gx, 100 - gz);
-    for (let t = 0; t <= 1; t += 0.05) {
-      const px = wx + legDx * t;
-      const pz = -103.5 + legDz * t;
-      if (Math.hypot(px, pz + 100) >= ringD) {
-        gapAz = Math.atan2(px, pz + 100);
-        break;
-      }
-    }
-    // A second sally gap on the opposite flank — the bowl must never be a
-    // one-door trap (the hills are walkable too, but a clean opening reads
-    // as a route). No road: infantry only.
-    const gap2Az = -gapAz;
+    const gapAz = legGapAz(wx, gx, gz);
+    // The second exit road leaves out the OPPOSITE flank through its own
+    // gate — the bowl is never a one-door trap, and both routes read as
+    // roads from the spawn pad.
+    const gx2 = -side * (27 + rng() * 6);
+    const gz2 = 86 + rng() * 4;
+    GATES2[team] = [gx2 * flip, -gz2 * flip];
+    const wx2 = -side * 15;
+    SPAWN_WAYPTS2[team] = [wx2 * flip, -103.5 * flip];
+    const gap2Az = legGapAz(wx2, gx2, gz2);
     // Cradle arc: hills every ~19° across the field-facing side. Gaps only
     // at the road gate and the sally. Stamps ADD where they overlap, so
     // amplitude is tuned for a ~4-5m ridge — enough to hide the pad, low
     // enough to stay a hill, gentle enough to walk over anywhere (the
     // countdown, not the dirt, keeps campers out).
     for (let az = -1.75; az <= 1.75; az += 0.34) {
-      if (Math.abs(az - gapAz) < 0.42 || Math.abs(az - gap2Az) < 0.3) continue;
+      if (Math.abs(az - gapAz) < 0.42 || Math.abs(az - gap2Az) < 0.42) continue;
       const dist = 20 + rng() * 4;
       put(Math.sin(az) * dist, -100 + Math.cos(az) * dist, 15 + rng() * 4, 2.5 + rng() * 0.6);
     }
     // Gap-covering mounds INSIDE the ring, on the pad→gap axes. The road
-    // dog-leg means neither is crossed by a road; both stand past the pad
-    // fade. The sally's mound sits closer and taller: its gap has no road,
-    // so nothing stops it hugging the opening.
+    // dog-legs mean neither mound is crossed by a road; both stand past the
+    // pad fade.
     for (const [az, d, mr, ma] of [
       [gapAz, 15, 11.5, 3.2 + rng() * 0.5],
-      [gap2Az, 14, 12.5, 3.5 + rng() * 0.5],
+      [gap2Az, 15, 11.5, 3.2 + rng() * 0.5],
     ] as const) {
       put(Math.sin(az) * d, -100 + Math.cos(az) * d, mr, ma);
     }
@@ -2317,6 +2332,10 @@ function planLayout(rng: () => number): Layout {
   nodes.push(GATES[1]);
   nodes.push(SPAWN_WAYPTS[0]);
   nodes.push(SPAWN_WAYPTS[1]);
+  nodes.push(GATES2[0]);
+  nodes.push(GATES2[1]);
+  nodes.push(SPAWN_WAYPTS2[0]);
+  nodes.push(SPAWN_WAYPTS2[1]);
 
   // The fixed center house — the tests anchor to its +z door and west
   // stairwell, so it never moves, whatever the seed.
@@ -2452,15 +2471,25 @@ function planLayout(rng: () => number): Layout {
   // --- Road graph over the nodes, BEFORE lots: lots must reject the road
   // corridors, and the corridors only depend on the node graph.
   const N = nodes.length;
-  // Forced base plumbing: spawn↔its waypoint, waypoint↔its gate; nothing
-  // else may touch a spawn or waypoint node.
+  // Forced base plumbing: spawn↔its two waypoints, each waypoint↔its gate
+  // (nodes: 0,1 spawns · 2,3 gates · 4,5 waypoints · 6,7 second gates ·
+  // 8,9 second waypoints); nothing else may touch a spawn or waypoint node.
+  const FORCED: ReadonlyArray<[number, number]> = [
+    [0, 4],
+    [4, 2],
+    [1, 5],
+    [5, 3],
+    [0, 8],
+    [8, 6],
+    [1, 9],
+    [9, 7],
+  ];
   const forced = (i: number, j: number): boolean =>
-    (i === 0 && j === 4) || (i === 4 && j === 2) || (i === 1 && j === 5) || (i === 5 && j === 3);
+    FORCED.some(([a, b]) => (a === i && b === j) || (a === j && b === i));
+  const isPlumbing = (n: number): boolean => n < 2 || n === 4 || n === 5 || n === 8 || n === 9;
   const edgeW = (i: number, j: number): number => {
-    const lo = Math.min(i, j);
-    const hi = Math.max(i, j);
-    if (lo < 2 || hi === 4 || hi === 5 || lo === 4 || lo === 5) {
-      if (!(forced(lo, hi) || forced(hi, lo))) return Infinity;
+    if (isPlumbing(i) || isPlumbing(j)) {
+      if (!forced(i, j)) return Infinity;
       return 1; // always taken
     }
     const [ax, az] = nodes[i];
@@ -2519,7 +2548,7 @@ function planLayout(rng: () => number): Layout {
     return true;
   };
   const loopCand: Array<[number, number, number]> = [];
-  for (let i = 6; i < N; i++) {
+  for (let i = 10; i < N; i++) {
     for (let j = i + 1; j < N; j++) {
       if (adj[i].includes(j)) continue;
       const w = edgeW(i, j);
