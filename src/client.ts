@@ -52,6 +52,7 @@ import {
 import { RUBBLE_HEIGHT } from "./shared/constants.js";
 import { BUILT_PANEL_ID_BASE } from "./shared/map.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
+import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
 import { parseServerMsg, SPAWN_AUTO, SPAWN_HQ, type PlayerInfo } from "./shared/messages.js";
 import {
   decodeSnapshot,
@@ -114,13 +115,28 @@ const TEAM_COLORS_CSS = ["#d23f3f", "#3a7be8"];
 // ---------------------------------------------------------------------------
 // Renderer / scene.
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+const renderer = new THREE.WebGLRenderer({
+  antialias: true,
+  powerPreference: "high-performance", // dual-GPU laptops: use the discrete one
+});
 renderer.setPixelRatio(Math.min(1.5, window.devicePixelRatio));
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.15;
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// The world is mostly static, but with autoUpdate the shadow pass re-renders
+// every caster — tens of thousands of beveled boxes — EVERY frame, the single
+// biggest GPU cost in the scene. Instead: re-render shadows on world changes
+// (markShadowsDirty) plus a ~12Hz heartbeat for the few moving casters
+// (soldiers, tumbling debris), and skip the pass on all other frames.
+renderer.shadowMap.autoUpdate = false;
+renderer.shadowMap.needsUpdate = true;
+let lastShadowHeartbeat = 0;
+
+function markShadowsDirty(): void {
+  renderer.shadowMap.needsUpdate = true;
+}
 document.body.style.cssText =
   "margin:0;overflow:hidden;background:#0c0f14;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;";
 document.body.appendChild(renderer.domElement);
@@ -362,6 +378,7 @@ class LoosePool {
     this.mesh = new THREE.InstancedMesh(geo, voxelMat, this.cap);
     this.mesh.castShadow = true;
     this.mesh.receiveShadow = true;
+    this.mesh.frustumCulled = false; // instances span the map; sphere test is useless
     this.free.length = 0;
     for (let i = this.cap - 1; i >= 0; i--) {
       this.mesh.setMatrixAt(i, ZERO_SCALE);
@@ -747,10 +764,12 @@ function makeTerrainChunkMesh(ci: number, cj: number): THREE.Mesh {
   geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
   const mesh = new THREE.Mesh(geo, terrainMat);
   mesh.receiveShadow = true;
+  mesh.userData.ownGeo = true;
   return mesh;
 }
 
 function rebuildTerrainChunk(ci: number, cj: number): void {
+  markShadowsDirty();
   const key = ci * TERRAIN_CHUNKS + cj;
   const old = terrainChunkVisuals.get(key);
   if (old) {
@@ -793,6 +812,8 @@ function makeRingVisual(inner: number, outer: number, cell: number, fade: boolea
   geo.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
   const mesh = new THREE.Mesh(geo, terrainMat);
   mesh.receiveShadow = !fade;
+  mesh.userData.ownGeo = true;
+  mesh.frustumCulled = false; // the ring always straddles the view
   return mesh;
 }
 
@@ -945,6 +966,10 @@ function buildMapVisuals(): void {
   scene.remove(mapGroup);
   mapGroup.traverse((o) => {
     if (o instanceof THREE.InstancedMesh) o.dispose();
+    // Rebuilt worlds must free their GPU buffers, but ONLY geometry this map
+    // owns (terrain, rings, water, merged ladders): pools and props share
+    // module-scope geometry, and corpse rigs share the GLTF's.
+    if (o instanceof THREE.Mesh && o.userData.ownGeo === true) o.geometry.dispose();
   });
   mapGroup = new THREE.Group();
   scene.add(mapGroup);
@@ -1006,12 +1031,15 @@ function buildMapVisuals(): void {
   const water = new THREE.Mesh(new THREE.PlaneGeometry(MAP.size, MAP.size), waterMat);
   water.rotation.x = -Math.PI / 2;
   water.position.y = WATER_SURFACE_Y;
+  water.userData.ownGeo = true;
+  water.frustumCulled = false; // map-wide sheet: the test never rejects it
   mapGroup.add(water);
   for (const s of MAP.statics) {
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(s.w, s.h, s.d), MAT.wall);
     mesh.position.set(s.x, s.y, s.z);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
+    mesh.userData.ownGeo = true;
     mapGroup.add(mesh);
   }
 
@@ -1035,30 +1063,34 @@ function buildMapVisuals(): void {
     }
     mesh.instanceMatrix.needsUpdate = true;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    // One bounding sphere spans the whole map anyway — skip the test (and
+    // any stale-sphere popping when instances change).
+    mesh.frustumCulled = false;
     mapGroup.add(mesh);
   }
 
   // Ladders: cosmetic rails + rungs over the climb volumes (the climbing
   // itself is shared controller logic on the map data).
   for (const l of MAP.ladders) {
-    const group = new THREE.Group();
-    group.position.set(l.x + l.nx * 0.16, 0, l.z + l.nz * 0.16);
-    group.rotation.y = Math.atan2(l.nx, l.nz);
-    const railGeo = new THREE.BoxGeometry(0.07, l.y1 + 0.25, 0.07);
+    // Rails + rungs merge into ONE mesh per ladder — as separate meshes each
+    // ladder cost ~20 draw calls (double that with the shadow pass).
+    const parts: THREE.BufferGeometry[] = [];
     for (const s of [-1, 1]) {
-      const rail = new THREE.Mesh(railGeo, ladderMat);
-      rail.position.set(s * 0.31, (l.y1 + 0.25) / 2, 0);
-      rail.castShadow = true;
-      group.add(rail);
+      parts.push(
+        new THREE.BoxGeometry(0.07, l.y1 + 0.25, 0.07).translate(s * 0.31, (l.y1 + 0.25) / 2, 0),
+      );
     }
     for (let y = 0.35; y < l.y1; y += 0.38) {
-      const rung = new THREE.Mesh(GEO.box, ladderMat);
-      rung.scale.set(0.62, 0.06, 0.06);
-      rung.position.set(0, y, 0);
-      rung.userData.sharedGeo = true;
-      group.add(rung);
+      parts.push(new THREE.BoxGeometry(0.62, 0.06, 0.06).translate(0, y, 0));
     }
-    mapGroup.add(group);
+    const merged = mergeGeometries(parts);
+    for (const part of parts) part.dispose();
+    const mesh = new THREE.Mesh(merged, ladderMat);
+    mesh.position.set(l.x + l.nx * 0.16, 0, l.z + l.nz * 0.16);
+    mesh.rotation.y = Math.atan2(l.nx, l.nz);
+    mesh.castShadow = true;
+    mesh.userData.ownGeo = true;
+    mapGroup.add(mesh);
   }
 
   looseBoxes.rebuild(GEO.bevel, mapGroup);
@@ -1068,11 +1100,13 @@ function buildMapVisuals(): void {
   }
   recordBootStage("buildMapVisuals:panels+rest", tRest0);
   recordBootStage("buildMapVisuals", tBuild0);
+  markShadowsDirty();
 }
 
 // Runtime pieces (rubble, settled fallen pieces, deployed cover) claim
 // instanced pool slots, falling back to a mesh only if the pool is full.
 function addBuiltPanelVisual(p: PanelDef): void {
+  markShadowsDirty();
   panelDefs.set(p.id, p);
   const cyl = p.material === "log" || p.material === "trunk";
   const pool =
@@ -1119,6 +1153,7 @@ function tintPanelDamage(id: number, hp: number): void {
 }
 
 function addRubbleVisual(buildingId: number): void {
+  markShadowsDirty();
   const b = MAP.buildings[buildingId];
   if (!b) return;
   const mesh = new THREE.Mesh(
@@ -1170,6 +1205,7 @@ function collapseFx(buildingId: number): void {
 }
 
 function removePanelVisual(id: number, withDebris: boolean): void {
+  markShadowsDirty();
   const def = panelDefs.get(id);
   const slot = panelSlots.get(id);
   if (slot) {
@@ -4657,6 +4693,12 @@ function frame(): void {
   updateCrosshairTarget();
   stepEffects(dt);
   updateHud();
+  // Shadow heartbeat: moving casters get fresh shadows at ~12Hz; world edits
+  // force an immediate pass via markShadowsDirty().
+  if (now - lastShadowHeartbeat > 85) {
+    lastShadowHeartbeat = now;
+    renderer.shadowMap.needsUpdate = true;
+  }
   const tr0 = performance.now();
   renderer.render(scene, camera);
   const tEnd = performance.now();
@@ -5449,6 +5491,8 @@ window.__fps = {
     avgRenderMs: perf.avgRenderMs,
     drawCalls: perf.drawCalls,
     triangles: perf.triangles,
+    geometries: renderer.info.memory.geometries,
+    textures: renderer.info.memory.textures,
     pixelRatio: renderer.getPixelRatio(),
     interpDelayMs,
   }),
