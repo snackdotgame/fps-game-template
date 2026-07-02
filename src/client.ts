@@ -1263,6 +1263,12 @@ hud.innerHTML = `
   #scope .shz { position:absolute; top:50%; left:0; height:2px; width:100%; transform:translateY(-1px); background:rgba(8,10,14,.75); }
   #crossname { position:absolute; left:50%; top:54%; transform:translateX(-50%); font-size:14px; font-weight:800; opacity:0; }
   #hitmark { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%) rotate(45deg); font-size:26px; color:#ff5a4a; opacity:0; font-weight:900; }
+  /* Frag banner: pops below the crosshair when YOU down someone. Sits under
+     #crossname so the two never overlap. Opacity 0 at rest; showFrag() drives
+     the pop/hold/fade with a Web Animation. */
+  #fragnote { position:absolute; left:50%; top:60%; transform:translate(-50%,-50%); font-size:19px;
+    font-weight:900; letter-spacing:1.5px; color:#ffd76a; white-space:nowrap; opacity:0;
+    background:rgba(10,14,22,.55); padding:5px 16px; border-radius:9px; text-shadow:0 2px 8px rgba(0,0,0,.9); }
   #scores { position:absolute; top:12px; left:50%; transform:translateX(-50%); font-size:22px; font-weight:900; background:rgba(10,14,22,.55); padding:6px 18px; border-radius:10px; }
   #timer { position:absolute; top:48px; left:50%; transform:translateX(-50%); font-size:14px; font-weight:700; opacity:.85; }
   #zones { position:absolute; top:68px; left:50%; transform:translateX(-50%); display:flex; gap:6px; }
@@ -1395,6 +1401,7 @@ hud.innerHTML = `
   <div id="crossname" class="sh"></div>
   <div id="scope"><div class="sv"></div><div class="shz"></div></div>
   <div id="hitmark">+</div>
+  <div id="fragnote"></div>
   <div id="scores" class="sh"></div>
   <div id="timer" class="sh"></div>
   <div id="zones"></div>
@@ -1446,6 +1453,7 @@ const el = {
   crossname: document.getElementById("crossname")!,
   scope: document.getElementById("scope")!,
   hitmark: document.getElementById("hitmark")!,
+  fragnote: document.getElementById("fragnote")!,
   scores: document.getElementById("scores")!,
   timer: document.getElementById("timer")!,
   zones: document.getElementById("zones")!,
@@ -2562,6 +2570,32 @@ function teamSpan(idx: number): string {
   return `<span style="color:${TEAM_COLORS_CSS[team]}">${escapeHtml(nameOf(idx))}</span>`;
 }
 
+// Frag banner under the crosshair when this client downs someone. Frags
+// landing within one banner's lifetime chain into a streak multiplier;
+// re-triggering cancels the running animation so the pop always reads.
+let fragAnim: Animation | null = null;
+let fragStreak = 0;
+let fragStreakAt = 0;
+const FRAG_BANNER_MS = 2400;
+function showFrag(victimIdx: number, weapon: "rifle" | "grenade" | "melee"): void {
+  const now = performance.now();
+  fragStreak = now - fragStreakAt < FRAG_BANNER_MS ? fragStreak + 1 : 1;
+  fragStreakAt = now;
+  const icon = weapon === "grenade" ? "💥" : weapon === "melee" ? "🔨" : "☠";
+  const streak = fragStreak > 1 ? ` <span style="color:#ff5a4a">×${fragStreak}</span>` : "";
+  el.fragnote.innerHTML = `${icon} FRAGGED ${teamSpan(victimIdx)}${streak}`;
+  fragAnim?.cancel();
+  fragAnim = el.fragnote.animate(
+    [
+      { opacity: 0, transform: "translate(-50%,-50%) scale(1.45)" },
+      { opacity: 1, transform: "translate(-50%,-50%) scale(1)", offset: 0.08 },
+      { opacity: 1, transform: "translate(-50%,-50%) scale(1)", offset: 0.75 },
+      { opacity: 0, transform: "translate(-50%,-50%) scale(1)" },
+    ],
+    { duration: FRAG_BANNER_MS, easing: "ease-out" },
+  );
+}
+
 function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): void {
   switch (msg.type) {
     case "welcome": {
@@ -2628,7 +2662,10 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
         const at = eyeOf(msg.victim);
         if (at) sounds.deathAt(at);
       }
-      if (msg.killer === selfIdx && msg.victim !== selfIdx) sounds.hitmarker();
+      if (msg.killer === selfIdx && msg.victim !== selfIdx) {
+        sounds.hitmarker();
+        showFrag(msg.victim, msg.weapon);
+      }
       break;
     }
     case "panelhp": {
@@ -5392,6 +5429,7 @@ declare global {
       look(yawV: number, pitchV: number): void;
       drive(over: Partial<Omit<InputCmd, "seq">> & { trackIdx?: number }, ticks: number): void;
       stopDrive(): void;
+      fragTest(weapon?: "rifle" | "grenade" | "melee"): void;
     };
   }
 }
@@ -5504,5 +5542,9 @@ window.__fps = {
   },
   stopDrive: () => {
     driven = null;
+  },
+  fragTest: (weapon = "rifle") => {
+    const victim = [...roster.keys()].find((idx) => idx !== selfIdx) ?? 99;
+    showFrag(victim, weapon);
   },
 };
