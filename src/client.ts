@@ -64,6 +64,7 @@ import {
   type GameEvent,
   quantizeAngle,
   quantizeMove,
+  RF_CROUCH,
   RF_DEAD,
   RF_PROTECTED,
   RF_TEAM,
@@ -87,6 +88,7 @@ import {
   createGrenadeBody,
   createPlayerBody,
   destroyGameWorld,
+  CROUCH_EYE_HEIGHT,
   EYE_HEIGHT,
   joltFreeMemory,
   type GameWorld,
@@ -1410,7 +1412,7 @@ hud.innerHTML = `
   <div id="feed"></div>
   <div id="overlay"><div class="panel" id="overlaypanel"></div></div>
   <div id="board"></div>
-  <div id="hint" class="sh">click to play — WASD move · shift sprint · space jump · LMB fire · 1/2 weapons · R reload · G grenade · F sledge · Q build cover · Tab scores</div>
+  <div id="hint" class="sh">click to play — WASD move · shift sprint · Ctrl crouch · space jump · LMB fire · 1/2 weapons · R reload · G grenade · F sledge · Q build cover · Tab scores</div>
   <div id="netinfo" class="sh"></div>
   <div id="intro">
     <div class="ip">
@@ -1985,6 +1987,26 @@ const sounds = {
 // Input.
 
 const keys = new Set<string>();
+// Keys the game owns while pointer-locked: swallow their browser defaults
+// (Ctrl+W closes the tab, Ctrl is a modifier for shortcuts, Tab moves focus).
+const GAME_KEY_CODES = new Set([
+  "KeyW",
+  "KeyA",
+  "KeyS",
+  "KeyD",
+  "Digit1",
+  "Digit2",
+  "ShiftLeft",
+  "ShiftRight",
+  "ControlLeft",
+  "ControlRight",
+  "Space",
+  "KeyR",
+  "KeyG",
+  "KeyF",
+  "KeyQ",
+  "Tab",
+]);
 let yaw = 0;
 let pitch = 0;
 let pointerLocked = false;
@@ -2029,19 +2051,38 @@ document.addEventListener("mousemove", (e) => {
   while (yaw < -Math.PI) yaw += Math.PI * 2;
 });
 window.addEventListener("keydown", (e) => {
-  if (e.code === "Tab") e.preventDefault();
+  if (e.code === "Tab" || (pointerLocked && GAME_KEY_CODES.has(e.code))) e.preventDefault();
   if (e.repeat) return;
   if (e.code === "Digit1") desiredSlot = 0;
   if (e.code === "Digit2") desiredSlot = 1;
   keys.add(e.code);
   ensureAudio();
 });
-window.addEventListener("keyup", (e) => keys.delete(e.code));
+window.addEventListener("keyup", (e) => {
+  if (pointerLocked && GAME_KEY_CODES.has(e.code)) e.preventDefault();
+  keys.delete(e.code);
+});
 window.addEventListener("blur", () => {
   keys.clear();
   fireHeld = false;
   scopeActive = false;
 });
+
+function isCrouchHeld(): boolean {
+  return keys.has("ControlLeft") || keys.has("ControlRight");
+}
+
+function localCrouchActive(): boolean {
+  return phase === "playing" && (selfStatus & SS_DEAD) === 0 && isCrouchHeld();
+}
+
+function localEyeHeight(): number {
+  return localCrouchActive() ? CROUCH_EYE_HEIGHT : EYE_HEIGHT;
+}
+
+function eyeHeightForFlags(flags: number): number {
+  return (flags & RF_CROUCH) !== 0 ? CROUCH_EYE_HEIGHT : EYE_HEIGHT;
+}
 
 // Test hook: scripted input overrides everything for N ticks. trackIdx
 // re-aims at that player's rendered position every tick (human-like tracking).
@@ -2077,6 +2118,7 @@ function sampleInput(seq: number): InputCmd {
   side = Math.max(-1, Math.min(1, side + touchSide));
   const sin = Math.sin(yaw);
   const cos = Math.cos(yaw);
+  const crouch = isCrouchHeld();
   return {
     seq,
     moveX: quantizeMove(fwd * sin + side * cos),
@@ -2084,7 +2126,8 @@ function sampleInput(seq: number): InputCmd {
     yaw: quantizeAngle(yaw),
     pitch: quantizeAngle(pitch),
     jump: keys.has("Space"),
-    sprint: keys.has("ShiftLeft") || keys.has("ShiftRight"),
+    sprint: !crouch && (keys.has("ShiftLeft") || keys.has("ShiftRight")),
+    crouch,
     fire: fireHeld,
     reload: keys.has("KeyR"),
     grenade: keys.has("KeyG"),
@@ -3212,7 +3255,8 @@ function stepSelfFootsteps(dead: boolean): void {
     return;
   }
   const speed = Math.hypot(predState.vx, predState.vz);
-  if (speed < 1.1) {
+  const crouching = localCrouchActive();
+  if (speed < (crouching ? 0.75 : 1.1)) {
     selfLastStepIndex = -1;
     return;
   }
@@ -3220,7 +3264,7 @@ function stepSelfFootsteps(dead: boolean): void {
   const stepIndex = Math.floor(selfWalkPhase / Math.PI);
   if (stepIndex !== selfLastStepIndex) {
     selfLastStepIndex = stepIndex;
-    sounds.footstep(predState.x, predState.y, predState.z, 0.4);
+    sounds.footstep(predState.x, predState.y, predState.z, crouching ? 0.22 : 0.4);
   }
 }
 
@@ -3550,6 +3594,7 @@ function updateCharacterAnim(
   rp: RemotePlayer,
   speed: number,
   vy: number,
+  crouching: boolean,
   now: number,
   dt: number,
 ): void {
@@ -3578,7 +3623,10 @@ function updateCharacterAnim(
   if (hit)
     clip = "HitReact"; // a brief flinch when they take a bullet
   else if (airborne) clip = "Jump_Idle";
-  else if (shooting) clip = running ? "Run_Shoot" : moving ? "Walk_Shoot" : "Idle_Shoot";
+  else if (crouching) {
+    clip = "Duck";
+    timeScale = moving ? 1.05 : 0.75;
+  } else if (shooting) clip = running ? "Run_Shoot" : moving ? "Walk_Shoot" : "Idle_Shoot";
   else if (sprinting) {
     clip = "Run"; // head-down sprint, weapon lowered (and can't fire)
     timeScale = 1.2;
@@ -3594,7 +3642,12 @@ function updateCharacterAnim(
     const idx = Math.floor(rp.stepPhase / Math.PI);
     if (idx !== rp.lastStepIndex) {
       rp.lastStepIndex = idx;
-      sounds.footstepAt(rp.group.position.x, rp.group.position.y, rp.group.position.z, 0.34);
+      sounds.footstepAt(
+        rp.group.position.x,
+        rp.group.position.y,
+        rp.group.position.z,
+        crouching ? 0.18 : 0.34,
+      );
     }
   } else {
     rp.lastStepIndex = -1;
@@ -4088,6 +4141,7 @@ let recoil = 0;
 let meleeSwing = 0;
 let viewBobPhase = 0; // accumulates while moving; drives the weapon bob
 let sprintBlend = 0; // 0..1 eased sprint amount for the view-model sway
+let crouchBlend = 0; // 0..1 eased crouch amount for camera + weapon pose
 let flinch = 0; // 0..1 decaying camera jolt when hit
 let flinchPitch = 0;
 let flinchYaw = 0;
@@ -4403,12 +4457,14 @@ function muzzleOf(idx: number): THREE.Vector3 | null {
 
 function eyeOf(idx: number): THREE.Vector3 | null {
   if (idx === selfIdx) {
-    return predState ? new THREE.Vector3(predState.x, predState.y + EYE_HEIGHT, predState.z) : null;
+    return predState
+      ? new THREE.Vector3(predState.x, predState.y + localEyeHeight(), predState.z)
+      : null;
   }
   const rp = remotes.get(idx);
   if (!rp || rp.buffer.length === 0) return null;
   const last = rp.buffer[rp.buffer.length - 1];
-  return new THREE.Vector3(last.x, last.y + EYE_HEIGHT, last.z);
+  return new THREE.Vector3(last.x, last.y + eyeHeightForFlags(last.flags), last.z);
 }
 
 // --- Grenade views (Kenney frag model; sphere fallback until it loads).
@@ -4478,18 +4534,21 @@ function frame(): void {
   stepCorpses(dt);
   stepFlags(now);
   (waterMat.uniforms.uTime as { value: number }).value = now / 1000;
+  const crouchingThisFrame = localCrouchActive();
+  crouchBlend += ((crouchingThisFrame ? 1 : 0) - crouchBlend) * Math.min(1, dt * 12);
 
   // Camera at the predicted eye, interpolated between the last two ticks so
   // 30 Hz simulation renders smoothly at any frame rate.
   if (predState) {
     const dead = (selfStatus & SS_DEAD) !== 0;
+    const eyeHeight = dead ? 0.4 : EYE_HEIGHT + (CROUCH_EYE_HEIGHT - EYE_HEIGHT) * crouchBlend;
     const alpha = lastTickAt > 0 ? Math.min(1, (now - lastTickAt) / TICK_MS) : 1;
     const ix = prevEyeX + (predState.x - prevEyeX) * alpha;
     const iy = prevEyeY + (predState.y - prevEyeY) * alpha;
     const iz = prevEyeZ + (predState.z - prevEyeZ) * alpha;
     camera.position.set(
       ix + errOffset.x + (Math.random() - 0.5) * shake * 0.12,
-      iy + errOffset.y + (dead ? 0.4 : EYE_HEIGHT) + (Math.random() - 0.5) * shake * 0.1,
+      iy + errOffset.y + eyeHeight + (Math.random() - 0.5) * shake * 0.1,
       iz + errOffset.z,
     );
     camera.rotation.order = "YXZ";
@@ -4557,7 +4616,7 @@ function frame(): void {
   const grounded = !!predState?.onGround && (selfStatus & SS_DEAD) === 0;
   const localSpeed = predState ? Math.hypot(predState.vx, predState.vz) : 0;
   const movingNow = grounded && localSpeed > ANIM_MOVE_SPEED;
-  const sprintingNow = grounded && localSpeed > ANIM_SPRINT_SPEED;
+  const sprintingNow = grounded && !crouchingThisFrame && localSpeed > ANIM_SPRINT_SPEED;
   sprintBlend += ((sprintingNow ? 1 : 0) - sprintBlend) * Math.min(1, dt * 9);
   viewBobPhase += movingNow ? dt * (sprintingNow ? 13 : 8.5) : 0;
   const bobAmt = movingNow ? Math.min(1, localSpeed / 5.2) : 0;
@@ -4571,8 +4630,14 @@ function frame(): void {
   const sway = sprintBlend;
   viewModel.position.set(
     0.2 + bobX + sway * 0.05,
-    -0.3 - meleeSwing * 0.12 + bobY - dip * 0.14 - sway * 0.07 - swapDip * 0.55,
-    -0.34 + recoil * 0.06 + meleeSwing * -0.25 - dip * 0.05 + sway * 0.06,
+    -0.3 -
+      meleeSwing * 0.12 +
+      bobY -
+      dip * 0.14 -
+      sway * 0.07 -
+      swapDip * 0.55 -
+      crouchBlend * 0.04,
+    -0.34 + recoil * 0.06 + meleeSwing * -0.25 - dip * 0.05 + sway * 0.06 + crouchBlend * 0.02,
   );
   // Converge the barrel on the crosshair: aim at a point down the view ray
   // (camera space) so the gun points where bullets land, instead of sitting
@@ -4589,8 +4654,9 @@ function frame(): void {
       meleeSwing * 0.9 -
       dip * 0.55 - // reload: drop the muzzle
       swapDip * 1.2 - // holster/draw: swing the gun down out of view
-      sway * 0.3; // sprint: lower the muzzle, not raise it
-    viewModel.rotation.z = sway * 0.35;
+      sway * 0.3 + // sprint: lower the muzzle, not raise it
+      crouchBlend * 0.12; // crouch: hug the gun in, muzzle up a touch
+    viewModel.rotation.z = sway * 0.35 + crouchBlend * 0.08;
   }
   viewModel.visible = (selfStatus & SS_DEAD) === 0 && scopeBlend < 0.5;
   // Grace fallback: only show the blocky placeholder gun if the AK model never
@@ -4649,15 +4715,21 @@ function frame(): void {
     rp.group.rotation.y = a.yaw + dyaw * u;
     const speed = (Math.hypot(b.x - a.x, b.z - a.z) / span2) * 1000;
     const vy = ((b.y - a.y) / span2) * 1000;
+    const crouching = (b.flags & RF_CROUCH) !== 0;
     const dead = (rp.lastFlags & RF_DEAD) !== 0;
     rp.group.visible = !dead;
     if (!dead) {
       if (rp.anim) {
         // Real Quaternius rig: a clip state machine drives the whole body.
-        updateCharacterAnim(rp, speed, vy, now, dt);
+        updateCharacterAnim(rp, speed, vy, crouching, now, dt);
         rp.anim.mixer.update(dt);
       } else {
         // Blocky fallback rig: procedural walk cycle until the model loads.
+        const fallback = rp.group.userData.visualRoot as THREE.Object3D | undefined;
+        if (fallback) {
+          const targetY = crouching ? 0.68 : 1;
+          fallback.scale.y += (targetY - fallback.scale.y) * Math.min(1, dt * 12);
+        }
         const head = rp.group.getObjectByName("head");
         if (head) head.rotation.x = -(a.pitch + (b.pitch - a.pitch) * u);
         const limbs = rp.group.userData.limbs as {
@@ -4666,7 +4738,7 @@ function frame(): void {
           armL: THREE.Group;
           armR: THREE.Group;
         };
-        const stride = Math.min(1, speed / 5);
+        const stride = Math.min(1, speed / (crouching ? 2.6 : 5));
         rp.group.userData.walkPhase = (rp.group.userData.walkPhase as number) + speed * dt * 2.6;
         const swing = Math.sin(rp.group.userData.walkPhase as number) * 0.62 * stride;
         limbs.legL.rotation.x = swing;
@@ -4762,7 +4834,7 @@ const CROSS_ENEMY = "#ff5a4a";
 function updateCrosshairTarget(): void {
   if (!predState || !gw || !selfBody) return;
   const dir = [Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
-  const eye = [predState.x, predState.y + EYE_HEIGHT, predState.z];
+  const eye = [predState.x, predState.y + localEyeHeight(), predState.z];
   const hit = castLocal(eye, dir, 60);
   const tag = (hit?.body.userData ?? {}) as { playerIdx?: number };
   const idx = tag.playerIdx !== undefined && tag.playerIdx >= 1000 ? tag.playerIdx - 1000 : -1;
@@ -5452,7 +5524,7 @@ window.__fps = {
   aimPanel: () => {
     if (!predState || !gw || !selfBody) return null;
     const dir = [Math.sin(yaw) * Math.cos(pitch), Math.sin(pitch), Math.cos(yaw) * Math.cos(pitch)];
-    const eye = [predState.x, predState.y + EYE_HEIGHT, predState.z];
+    const eye = [predState.x, predState.y + localEyeHeight(), predState.z];
     const hit = castLocal(eye, dir, 30);
     return hit ? hitPieceId(hit.body, hit.point) : null;
   },

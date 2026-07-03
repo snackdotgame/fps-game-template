@@ -6,7 +6,7 @@
 //
 //   npm run test:controller
 
-import { heightAt, MAP } from "../src/shared/map.js";
+import { heightAt, MAP, spawnPoint } from "../src/shared/map.js";
 import {
   type Body,
   type CharState,
@@ -14,6 +14,7 @@ import {
   createPlayerBody,
   GRAVITY,
   type GameWorld,
+  type InputCmd,
   makeChar,
   readChar,
   stepPlayerController,
@@ -23,8 +24,14 @@ import {
 const DT = 1 / 30;
 let failures = 0;
 
-function tick(gw: GameWorld, body: Body, s: CharState, seq: number, jump = false): void {
-  stepPlayerController(gw, body, s, { ...ZERO_INPUT, seq, jump });
+function tick(
+  gw: GameWorld,
+  body: Body,
+  s: CharState,
+  seq: number,
+  over: Partial<InputCmd> = {},
+): void {
+  stepPlayerController(gw, body, s, { ...ZERO_INPUT, seq, ...over });
   gw.world.step(DT);
   readChar(body, s);
 }
@@ -57,6 +64,29 @@ async function main(): Promise<void> {
     gw.world.dispose();
   }
 
+  // --- Crouch locomotion speed ---
+  {
+    const gw = await createGameWorld();
+    const spawn = spawnPoint(0, 0);
+    const body = createPlayerBody(gw, 0, spawn);
+    const s = makeChar(spawn);
+    for (let t = 0; t < 90; t++) tick(gw, body, s, t); // settle on the ground
+    // Peak speed over the run: the walker eventually leaves the flat spawn
+    // pad and slows on the cradle-hill climb, so the tail sample is terrain
+    // luck — the flat-ground cruise (and the cap) is what crouch tunes.
+    let peak = 0;
+    for (let t = 90; t < 170; t++) {
+      tick(gw, body, s, t, { moveZ: 1, crouch: true });
+      peak = Math.max(peak, Math.hypot(s.vx, s.vz));
+    }
+    console.log("\n== crouch locomotion (real game path) ==");
+    console.log(`  peak crouch speed = ${peak.toFixed(2)} m/s`);
+    const ok = peak > 2.2 && peak < 3.0;
+    if (!ok) failures++;
+    console.log(`  ${ok ? "PASS" : "FAIL"} (want ~2.6 m/s cruise, well under the 5.2 walk)`);
+    gw.world.dispose();
+  }
+
   // --- Fall acceleration (the "gravity feels heavy" bug) ---
   {
     const gw = await createGameWorld();
@@ -85,7 +115,7 @@ async function main(): Promise<void> {
     const s = makeChar(spawn);
     for (let t = 0; t < 90; t++) tick(gw, body, s, t); // settle on the ground
     const groundFeet = s.y;
-    tick(gw, body, s, 90, true); // press jump for one tick
+    tick(gw, body, s, 90, { jump: true }); // press jump for one tick
     let apex = s.y;
     for (let t = 91; t < 140; t++) {
       tick(gw, body, s, t); // release; ride the arc back down

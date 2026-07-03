@@ -379,11 +379,13 @@ function makeBotInput(sim: GameSim, p: SimPlayer, b: BotBrain, lastSeq: number):
     pitch: b.aimPitch,
     jump: b.jumpIntent,
     sprint: b.sprintIntent,
+    crouch: false,
     fire: b.fireIntent && aligned && tick < b.burstUntil && tick <= b.targetVisibleUntilTick,
     reload: b.reloadIntent,
     grenade: b.grenadeIntent,
     melee: b.meleeIntent,
     build: false,
+    slot2: false,
   };
   b.jumpIntent = false;
   b.grenadeIntent = false;

@@ -24,9 +24,11 @@ export function quantizeAngle(v: number): number {
 
 // --- Input packets -----------------------------------------------------------
 // [u8 type][u8 count] then per input:
-// [u32 seq][i8 mx][i8 mz][i16 yaw][i16 pitch][u8 buttons][u16 viewTick]
-// (13 bytes). viewTick is the low 16 bits of the server tick of the world the
+// [u32 seq][i8 mx][i8 mz][i16 yaw][i16 pitch][u16 buttons][u16 viewTick]
+// (14 bytes). viewTick is the low 16 bits of the server tick of the world the
 // client was RENDERING at sample time — the server rewinds hit tests to it.
+// Client and server always ship as one bundle, so the record can grow without
+// a version field: decodeInputs length-checks and drops mismatched packets.
 
 const BTN_JUMP = 1;
 const BTN_SPRINT = 2;
@@ -36,9 +38,12 @@ const BTN_GRENADE = 16;
 const BTN_MELEE = 32;
 const BTN_BUILD = 64;
 const BTN_SLOT2 = 128; // desired weapon slot: set = sidearm
+const BTN_CROUCH = 256;
+
+const INPUT_BYTES = 14;
 
 export function encodeInputs(cmds: readonly InputCmd[]): Uint8Array {
-  const buf = new ArrayBuffer(2 + cmds.length * 13);
+  const buf = new ArrayBuffer(2 + cmds.length * INPUT_BYTES);
   const dv = new DataView(buf);
   dv.setUint8(0, PKT_INPUT);
   dv.setUint8(1, cmds.length);
@@ -49,7 +54,7 @@ export function encodeInputs(cmds: readonly InputCmd[]): Uint8Array {
     dv.setInt8(o + 5, Math.round(c.moveZ * 127));
     dv.setInt16(o + 6, Math.round(c.yaw * ANGLE_SCALE) | 0);
     dv.setInt16(o + 8, Math.round(c.pitch * ANGLE_SCALE) | 0);
-    dv.setUint8(
+    dv.setUint16(
       o + 10,
       (c.jump ? BTN_JUMP : 0) |
         (c.sprint ? BTN_SPRINT : 0) |
@@ -58,10 +63,11 @@ export function encodeInputs(cmds: readonly InputCmd[]): Uint8Array {
         (c.grenade ? BTN_GRENADE : 0) |
         (c.melee ? BTN_MELEE : 0) |
         (c.build ? BTN_BUILD : 0) |
-        (c.slot2 ? BTN_SLOT2 : 0),
+        (c.slot2 ? BTN_SLOT2 : 0) |
+        (c.crouch ? BTN_CROUCH : 0),
     );
-    dv.setUint16(o + 11, c.viewTick & 0xffff);
-    o += 13;
+    dv.setUint16(o + 12, c.viewTick & 0xffff);
+    o += INPUT_BYTES;
   }
   return new Uint8Array(buf);
 }
@@ -69,12 +75,12 @@ export function encodeInputs(cmds: readonly InputCmd[]): Uint8Array {
 export function decodeInputs(bytes: Uint8Array): InputCmd[] | null {
   if (bytes.length < 2 || bytes[0] !== PKT_INPUT) return null;
   const count = bytes[1];
-  if (bytes.length < 2 + count * 13) return null;
+  if (bytes.length < 2 + count * INPUT_BYTES) return null;
   const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
   const out: InputCmd[] = [];
   let o = 2;
   for (let i = 0; i < count; i++) {
-    const b = dv.getUint8(o + 10);
+    const b = dv.getUint16(o + 10);
     out.push({
       seq: dv.getUint32(o),
       moveX: dv.getInt8(o + 4) / 127,
@@ -89,9 +95,10 @@ export function decodeInputs(bytes: Uint8Array): InputCmd[] | null {
       melee: (b & BTN_MELEE) !== 0,
       build: (b & BTN_BUILD) !== 0,
       slot2: (b & BTN_SLOT2) !== 0,
-      viewTick: dv.getUint16(o + 11),
+      crouch: (b & BTN_CROUCH) !== 0,
+      viewTick: dv.getUint16(o + 12),
     });
-    o += 13;
+    o += INPUT_BYTES;
   }
   return out;
 }
@@ -114,6 +121,7 @@ export const RF_DEAD = 4;
 export const RF_SPRINT = 8;
 export const RF_RELOADING = 16;
 export const RF_PROTECTED = 32;
+export const RF_CROUCH = 64;
 
 // Self status bits.
 export const SS_DEAD = 1;
