@@ -614,7 +614,13 @@ function roadFieldAt(x: number, z: number): { w: number; targetY: number } {
   if (bestD > bestSeg.half + band) return { w: 0, targetY: 0 };
   const targetY = bestSeg.ay + (bestSeg.by - bestSeg.ay) * bestT;
   const edge = bestD <= bestSeg.half ? 1 : smooth(1 - (bestD - bestSeg.half) / band);
-  return { w: edge * padFade(x, z), targetY }; // pads win over roads
+  // The road keeps its pull across pad aprons — killing it there let the raw
+  // relief poke through a 2.5m ring around every pad, turning each exit road
+  // into a wall right where it left the spawn pad. Building pads still stay
+  // flat: their target blends to pad height (0) inside the fade ring, and the
+  // baked profile is already cone-clamped to meet them at grade. Spawn pads
+  // are skipped so the exit ramps rise smoothly across the pad itself.
+  return { w: edge, targetY: targetY * padFade(x, z, true) };
 }
 
 // Road surface at (x,z): 0 = off-road, else the nearest road's half-width
@@ -2906,6 +2912,8 @@ function planLayout(rng: () => number): Layout {
   const nodeKey = (x: number, z: number): number => Math.round(x * 4) * 300000 + Math.round(z * 4);
   const nodeIds = new Map<number, number>();
   const h0: number[] = [];
+  const nodeXs: number[] = [];
+  const nodeZs: number[] = [];
   const chainIds: number[][] = [];
   const graphEdges: Array<[number, number, number]> = [];
   for (const c of chains) {
@@ -2916,6 +2924,8 @@ function planLayout(rng: () => number): Layout {
       if (id === undefined) {
         id = h0.length;
         h0.push(c.hs[i]);
+        nodeXs.push(c.xs[i]);
+        nodeZs.push(c.zs[i]);
         if (isEnd) nodeIds.set(nodeKey(c.xs[i], c.zs[i]), id);
       }
       cids.push(id);
@@ -2949,6 +2959,29 @@ function planLayout(rng: () => number): Layout {
     if (!changed) break;
   }
 
+  // Roads must LAND on the pads they serve, at pad height. The balanced
+  // midpoint is free to float above a pad node (the upper envelope fills it
+  // to soften a climb beyond), which reads as a dirt wall where the graded
+  // embankment meets the flat clearing. Clamp the profile into the
+  // MAX_ROAD_GRADE cone of every pad surface (all pads sit at height 0):
+  // inside a pad the profile IS the pad, and it may only rise at road grade
+  // with distance from the pad rectangle. Spawn pads are exempt — their exit
+  // ramps are meant to rise across the pad (padFade's skipSpawnPads
+  // contract). The clamp is the median of three functions that each respect
+  // the grade cap, so the result still respects it everywhere.
+  const prof: number[] = [];
+  for (let i = 0; i < h0.length; i++) {
+    let cone = Infinity;
+    for (let pi = 2; pi < FLAT_PADS.length; pi++) {
+      const [cx, cz, hw, hd] = FLAT_PADS[pi];
+      const dx = Math.max(0, Math.abs(nodeXs[i] - cx) - hw);
+      const dz = Math.max(0, Math.abs(nodeZs[i] - cz) - hd);
+      const reach = MAX_ROAD_GRADE * Math.hypot(dx, dz);
+      if (reach < cone) cone = reach;
+    }
+    prof.push(Math.max(-cone, Math.min(cone, (lo[i] + up[i]) / 2)));
+  }
+
   const roads: RoadSeg[] = [];
   for (let ci = 0; ci < chains.length; ci++) {
     const c = chains[ci];
@@ -2959,8 +2992,8 @@ function planLayout(rng: () => number): Layout {
         az: c.zs[i],
         bx: c.xs[i + 1],
         bz: c.zs[i + 1],
-        ay: (lo[cids[i]] + up[cids[i]]) / 2,
-        by: (lo[cids[i + 1]] + up[cids[i + 1]]) / 2,
+        ay: prof[cids[i]],
+        by: prof[cids[i + 1]],
         half: c.half,
       });
     }
