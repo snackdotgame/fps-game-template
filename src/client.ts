@@ -1242,7 +1242,7 @@ hud.innerHTML = `
   #audioTrigger { width:36px; height:36px; display:grid; align-items:center; justify-items:center; padding:0; cursor:pointer; color:rgba(255,255,255,.7); background:rgba(0,0,0,.2); border:1px solid rgba(255,255,255,.2); border-radius:8px; box-shadow:0 12px 32px -18px rgba(0,0,0,1); backdrop-filter:blur(12px); transition:background 120ms ease,border-color 120ms ease,color 120ms ease; }
   #audioTrigger:hover, #audioTrigger:focus-visible, #audioMenu[data-open="true"] #audioTrigger { background:rgba(0,0,0,.6); border-color:rgba(255,255,255,.35); color:#fff; outline:2px solid rgba(255,255,255,.6); outline-offset:2px; }
   #audioTrigger svg { width:17px; height:17px; pointer-events:none; }
-  #audioPanel { position:absolute; top:44px; left:0; width:260px; box-sizing:border-box; display:none; padding:16px; background:rgba(18,18,20,.92); border:1px solid rgba(255,255,255,.1); border-radius:12px; box-shadow:0 30px 110px -35px rgba(0,0,0,.95); backdrop-filter:blur(12px); }
+  #audioPanel { position:absolute; top:44px; left:0; width:260px; max-width:calc(100vw - 16px); max-height:calc(100dvh - 110px); overflow-y:auto; touch-action:pan-y; box-sizing:border-box; display:none; padding:16px; background:rgba(18,18,20,.92); border:1px solid rgba(255,255,255,.1); border-radius:12px; box-shadow:0 30px 110px -35px rgba(0,0,0,.95); backdrop-filter:blur(12px); }
   #audioMenu[data-open="true"] #audioPanel { display:block; }
   #audioPanel header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin:0 0 14px; }
   #audioPanel h2 { margin:0; font-size:16px; line-height:1.25; font-weight:650; letter-spacing:0; }
@@ -1286,10 +1286,12 @@ hud.innerHTML = `
   #feed { position:absolute; top:14px; right:14px; text-align:right; font-size:14px; font-weight:700; }
   #feed div { margin:2px 0; background:rgba(10,14,22,.5); padding:3px 9px; border-radius:7px; }
   #overlay { position:absolute; inset:0; display:none; align-items:center; justify-content:center; text-align:center; background:rgba(8,10,16,.45); }
-  #overlay .panel { background:rgba(12,16,26,.9); border-radius:16px; padding:26px 44px; }
+  #overlay .panel { background:rgba(12,16,26,.9); border-radius:16px; padding:26px 44px; box-sizing:border-box;
+    max-width:calc(100vw - 20px); max-height:calc(100dvh - 20px); overflow-y:auto; touch-action:pan-y; }
   #overlay h1 { margin:0 0 6px; font-size:40px; }
   #overlay p { margin:4px 0; font-size:17px; }
-  #board { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); display:none; background:rgba(12,16,26,.92); border-radius:14px; padding:18px 30px; font-size:15px; }
+  #board { position:absolute; left:50%; top:50%; transform:translate(-50%,-50%); display:none; background:rgba(12,16,26,.92); border-radius:14px; padding:18px 30px; font-size:15px;
+    box-sizing:border-box; max-width:calc(100vw - 16px); max-height:calc(100dvh - 16px); overflow:auto; touch-action:pan-x pan-y; }
   #board table { border-collapse:collapse; }
   #board td, #board th { padding:3px 14px; text-align:left; }
   #hint { position:absolute; bottom:6px; left:50%; transform:translateX(-50%); font-size:12px; opacity:.75; }
@@ -1304,9 +1306,12 @@ hud.innerHTML = `
      so the world (and any placeholder assets) never shows before deploy. */
   #intro { position:fixed; inset:0; z-index:100; display:flex; align-items:center; justify-content:center; pointer-events:auto;
     background:radial-gradient(1100px 620px at 50% 30%, #1a2434 0%, #0d1220 55%, #070a12 100%); }
-  #intro .ip { width:min(520px, calc(100vw - 40px)); max-height:calc(100vh - 24px); overflow-y:auto; box-sizing:border-box; text-align:center;
+  /* dvh (not vh): mobile URL bars shrink the visual viewport, and the panel
+     must stay inside it to scroll. touch-action:pan-y because the body sets
+     touch-action:none for gameplay — the panels must opt back in to scroll. */
+  #intro .ip { width:min(520px, calc(100vw - 40px)); max-height:calc(100dvh - 24px); overflow-y:auto; box-sizing:border-box; text-align:center;
     padding:18px 32px 16px; background:rgba(12,16,26,.78); border:1px solid rgba(255,255,255,.09); border-radius:18px;
-    box-shadow:0 40px 120px -30px rgba(0,0,0,.9); }
+    box-shadow:0 40px 120px -30px rgba(0,0,0,.9); touch-action:pan-y; -webkit-overflow-scrolling:touch; overscroll-behavior:contain; }
   #intro h1 { margin:0; font-size:30px; letter-spacing:5px; }
   #intro .isub { font-size:12px; font-weight:700; letter-spacing:4px; opacity:.6; margin-top:2px; }
   #introTeam { display:inline-block; margin:10px 0 0; padding:7px 24px; border-radius:10px; font-weight:900; font-size:14px;
@@ -1359,11 +1364,35 @@ hud.innerHTML = `
   #introMap { width:min(204px, 52vw); margin:0 auto; }
   #respawn { position:fixed; inset:0; z-index:120; display:none; align-items:center; justify-content:center;
     pointer-events:auto; background:rgba(6,9,15,.55); }
-  #respawn .rp { width:min(440px, 94vw); max-height:calc(100vh - 24px); overflow-y:auto; box-sizing:border-box;
+  #respawn .rp { width:min(440px, 94vw); max-height:calc(100dvh - 24px); overflow-y:auto; box-sizing:border-box;
     text-align:center; padding:16px 24px 16px; background:rgba(12,16,26,.92);
-    border:1px solid rgba(255,255,255,.09); border-radius:16px; }
+    border:1px solid rgba(255,255,255,.09); border-radius:16px;
+    touch-action:pan-y; -webkit-overflow-scrolling:touch; overscroll-behavior:contain; }
   #respawn h2 { margin:0; font-size:24px; letter-spacing:2px; }
   #respawnMap { width:min(380px, 84vw); margin:0 auto; }
+  /* Narrow (portrait phone) tuning: tighter panel padding, smaller title,
+     class cards in a 2x2 grid instead of a cramped 4-across row. */
+  @media (max-width: 480px) {
+    #intro .ip { padding:14px 16px 12px; }
+    #intro h1 { font-size:24px; letter-spacing:3px; }
+    #respawn .rp { padding:12px 14px 12px; }
+    .classrow { display:grid; grid-template-columns:1fr 1fr; }
+    #overlay .panel { padding:18px 20px; }
+    #overlay h1 { font-size:28px; }
+    #board { font-size:13px; padding:12px 14px; }
+    #board td, #board th { padding:3px 8px; }
+  }
+  /* Short (landscape phone) tuning: the panel already scrolls, but trim the
+     chrome so more of it fits on a ~390px-tall screen. */
+  @media (max-height: 480px) {
+    #intro .ip { padding:12px 20px 12px; }
+    #intro h1 { font-size:22px; letter-spacing:3px; }
+    #intro .isub { display:none; }
+    #introTeam { margin-top:6px; padding:5px 18px; }
+    #intro .igoal { margin-top:6px; font-size:13px; }
+    #introMap { width:min(160px, 40vw); }
+    #respawnMap { width:min(220px, 50vw); }
+  }
 </style>
 <div id="hud">
   <div id="audioMenu" data-open="false">
@@ -2066,6 +2095,7 @@ window.addEventListener("blur", () => {
   keys.clear();
   fireHeld = false;
   scopeActive = false;
+  document.getElementById("b-crouch")?.classList.remove("pressed"); // touch crouch toggle
 });
 
 function isCrouchHeld(): boolean {
@@ -2162,6 +2192,7 @@ function setupTouchControls(): void {
     nade: '<circle cx="11.5" cy="14" r="6.3"/><rect x="8.5" y="3.8" width="6" height="3.7" rx="1"/><circle cx="6.5" cy="5.2" r="2"/>',
     melee: '<path d="M2 22l8.5-8.5"/><path d="M17 2l5 5-4 4-5-5z"/><path d="M9 11l4 4"/>',
     swap: '<path d="M4 7h12l-3-3"/><path d="M20 17H8l3 3"/>',
+    crouch: '<path d="M6 6l6 6 6-6"/><path d="M6 13l6 6 6-6"/>',
   };
   const icon = (n: string): string =>
     `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n]}</svg>`;
@@ -2171,6 +2202,11 @@ function setupTouchControls(): void {
 <style>
   #touch { position:fixed; inset:0; z-index:50; pointer-events:none;
     font-family:"Trebuchet MS",system-ui,sans-serif; -webkit-user-select:none; user-select:none; }
+  /* #hud is a fixed-position stacking context at z:auto, so the intro/respawn
+     panels' z-index never escapes it — this later-DOM layer would paint (and
+     hit-test) ABOVE them, eating their taps. Hide the whole touch layer while
+     a full-screen panel is up instead of fighting the stacking order. */
+  body.ui-modal #touch { display:none; }
   #touchsurface { position:absolute; inset:0; pointer-events:auto; touch-action:none; }
   #joybase { position:absolute; width:${JOY_RADIUS * 2}px; height:${JOY_RADIUS * 2}px;
     margin:${-JOY_RADIUS}px 0 0 ${-JOY_RADIUS}px; border-radius:50%; display:none; pointer-events:none;
@@ -2183,24 +2219,25 @@ function setupTouchControls(): void {
     background:rgba(18,22,32,.42); border:2px solid rgba(255,255,255,.26); }
   .tbtn svg { width:46%; height:46%; display:block; }
   .tbtn.pressed { background:rgba(120,160,255,.55); }
-  /* Compact thumb cluster: big FIRE in the corner, 2x3 grid of actions to its left. */
-  #b-fire { right:22px; bottom:36px; width:88px; height:88px;
+  /* Compact thumb cluster: big FIRE in the corner, grid of actions to its
+     left. Offsets ride the safe-area insets so the home indicator / notch
+     never covers a button. Works in portrait and landscape unchanged: the
+     cluster hugs the bottom-right corner in both. */
+  #b-fire { right:calc(22px + env(safe-area-inset-right, 0px)); bottom:calc(36px + env(safe-area-inset-bottom, 0px)); width:88px; height:88px;
     background:rgba(150,40,32,.42); border-color:rgba(255,130,110,.5); }
   #b-fire svg { width:52%; height:52%; }
-  #b-jump { right:122px; bottom:44px; width:52px; height:52px; }
-  #b-build { right:180px; bottom:44px; width:52px; height:52px; }
-  #b-sprint { right:122px; bottom:102px; width:52px; height:52px; }
-  #b-reload { right:180px; bottom:102px; width:52px; height:52px; }
-  #b-grenade { right:122px; bottom:160px; width:52px; height:52px; }
-  #b-melee { right:180px; bottom:160px; width:52px; height:52px; }
-  #b-swap { right:238px; bottom:44px; width:52px; height:52px; }
+  #b-jump { right:calc(122px + env(safe-area-inset-right, 0px)); bottom:calc(44px + env(safe-area-inset-bottom, 0px)); width:52px; height:52px; }
+  #b-build { right:calc(180px + env(safe-area-inset-right, 0px)); bottom:calc(44px + env(safe-area-inset-bottom, 0px)); width:52px; height:52px; }
+  #b-sprint { right:calc(122px + env(safe-area-inset-right, 0px)); bottom:calc(102px + env(safe-area-inset-bottom, 0px)); width:52px; height:52px; }
+  #b-reload { right:calc(180px + env(safe-area-inset-right, 0px)); bottom:calc(102px + env(safe-area-inset-bottom, 0px)); width:52px; height:52px; }
+  #b-grenade { right:calc(122px + env(safe-area-inset-right, 0px)); bottom:calc(160px + env(safe-area-inset-bottom, 0px)); width:52px; height:52px; }
+  #b-melee { right:calc(180px + env(safe-area-inset-right, 0px)); bottom:calc(160px + env(safe-area-inset-bottom, 0px)); width:52px; height:52px; }
+  #b-swap { right:calc(238px + env(safe-area-inset-right, 0px)); bottom:calc(44px + env(safe-area-inset-bottom, 0px)); width:52px; height:52px; }
   #b-swap.pistol { background:rgba(220,170,60,.5); }
+  #b-crouch { right:calc(238px + env(safe-area-inset-right, 0px)); bottom:calc(102px + env(safe-area-inset-bottom, 0px)); width:52px; height:52px; }
+  #b-crouch.pressed { background:rgba(120,160,255,.55); }
   /* Lift the ammo readout above the button cluster on touch. */
-  #ammo { right:16px; bottom:226px; }
-  #rotate { position:fixed; inset:0; z-index:200; display:none; background:#0c0f14; color:#fff;
-    flex-direction:column; align-items:center; justify-content:center; text-align:center;
-    font-family:"Trebuchet MS",system-ui,sans-serif; }
-  @media (hover:none) and (pointer:coarse) and (orientation:portrait) { #rotate { display:flex; } }
+  #ammo { right:calc(16px + env(safe-area-inset-right, 0px)); bottom:calc(226px + env(safe-area-inset-bottom, 0px)); }
 </style>
 <div id="touch">
   <div id="touchsurface"></div>
@@ -2213,11 +2250,7 @@ function setupTouchControls(): void {
   <div id="b-grenade" class="tbtn">${icon("nade")}</div>
   <div id="b-melee" class="tbtn">${icon("melee")}</div>
   <div id="b-swap" class="tbtn">${icon("swap")}</div>
-</div>
-<div id="rotate">
-  <div style="font-size:34px">\u{1F504}</div>
-  <div style="font-size:18px;font-weight:800;margin-top:10px">Rotate your device</div>
-  <div style="opacity:.7;margin-top:4px">landscape works best</div>
+  <div id="b-crouch" class="tbtn">${icon("crouch")}</div>
 </div>`;
   document.body.appendChild(root);
   document.getElementById("hint")?.style.setProperty("display", "none");
@@ -2357,6 +2390,18 @@ function setupTouchControls(): void {
     ensureAudio();
     desiredSlot = desiredSlot === 1 ? 0 : 1;
     swapBtn.classList.toggle("pistol", desiredSlot === 1);
+  });
+
+  // Crouch is a toggle too — a hold would pin a thumb the whole time. It
+  // drives the same key the keyboard uses, so sampleInput needs no changes.
+  const crouchBtn = document.getElementById("b-crouch")!;
+  crouchBtn.addEventListener("pointerdown", (e: PointerEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    ensureAudio();
+    if (keys.has("ControlLeft")) keys.delete("ControlLeft");
+    else keys.add("ControlLeft");
+    crouchBtn.classList.toggle("pressed", keys.has("ControlLeft"));
   });
 }
 
@@ -5260,6 +5305,13 @@ makeClassPicker(el.respawnClasses);
 // the usual click-to-lock).
 let respawnShown = false;
 let deployRequested = false;
+
+// A full-screen panel (intro/respawn) is up: flag it on <body> so the touch
+// layer hides itself — it would otherwise paint and hit-test ABOVE the panel
+// (see the stacking note in the touch CSS) and eat the panel's taps.
+function updateModalClass(): void {
+  document.body.classList.toggle("ui-modal", introVisible || respawnShown);
+}
 let lastMinimapRefresh = 0;
 
 el.respawnDeploy.addEventListener("click", () => {
@@ -5273,6 +5325,7 @@ function updateRespawnOverlay(dead: boolean, now: number): void {
   if (show !== respawnShown) {
     respawnShown = show;
     (el.respawn as HTMLElement).style.display = show ? "flex" : "none";
+    updateModalClass();
     if (show) {
       deployRequested = false;
       document.exitPointerLock();
@@ -5399,6 +5452,7 @@ function dismissIntro(): void {
   introVisible = false;
   clearInterval(introTimer);
   el.intro.style.display = "none";
+  updateModalClass();
   ensureAudio();
   // Deploy into the fight, not staring at the map edge.
   if (predState) faceTheAction(predState.x, predState.z);
@@ -5412,6 +5466,7 @@ function tryDeploy(): void {
 // Clicks on the DEPLOY button bubble here too; tryDeploy gates on readiness.
 el.intro.addEventListener("click", tryDeploy);
 updateIntroPanel();
+updateModalClass(); // intro starts visible — hide the touch layer under it
 // The intro has taken over the viewport — retire index.html's boot splash.
 document.getElementById("boot")?.remove();
 
