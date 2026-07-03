@@ -47,6 +47,7 @@ export interface InputCmd {
   pitch: number;
   jump: boolean;
   sprint: boolean;
+  crouch: boolean;
   fire: boolean;
   reload: boolean;
   grenade: boolean;
@@ -67,6 +68,7 @@ export const ZERO_INPUT: Omit<InputCmd, "seq"> = {
   pitch: 0,
   jump: false,
   sprint: false,
+  crouch: false,
   fire: false,
   reload: false,
   grenade: false,
@@ -142,6 +144,7 @@ export const PLAYER_HALF_CYL = 0.45;
 export const PLAYER_HALF_HEIGHT = PLAYER_RADIUS + PLAYER_HALF_CYL; // 0.8
 export const PLAYER_HEIGHT = PLAYER_HALF_HEIGHT * 2; // 1.6
 export const EYE_HEIGHT = 1.45; // above feet
+export const CROUCH_EYE_HEIGHT = 0.95; // above feet while holding crouch
 // ecctrl floats the capsule this far above ground contact (the controller's
 // `floatHeight`). The collision capsule hovers here; feet-space CharState
 // subtracts it back out (see FLOAT_OFFSET) so gameplay still measures true feet.
@@ -154,6 +157,7 @@ export const DT = 1 / TICK_RATE;
 export const GRAVITY = 14;
 const WALK_SPEED = 5.2;
 const SPRINT_SPEED = 7.6;
+const CROUCH_SPEED = 2.6;
 const JUMP_VEL = 5.6;
 const COYOTE_TICKS = 4;
 export const STEP_MAX = 0.55; // kept for importers; stair step-up handled by the controller now
@@ -741,8 +745,8 @@ export function writeChar(body: Body, s: CharState): void {
 }
 
 // View ray helpers (aim from the eye).
-export function eyePosition(s: CharState): [number, number, number] {
-  return [s.x, s.y + EYE_HEIGHT, s.z];
+export function eyePosition(s: CharState, crouching = false): [number, number, number] {
+  return [s.x, s.y + (crouching ? CROUCH_EYE_HEIGHT : EYE_HEIGHT), s.z];
 }
 
 export function aimDirection(yaw: number, pitch: number): [number, number, number] {
@@ -810,7 +814,8 @@ export function stepPlayerController(
   const ndz = moving ? mz / mag : 0;
   // Sprint only when moving roughly toward where the player is looking.
   const forwardness = ndx * Math.sin(input.yaw) + ndz * Math.cos(input.yaw);
-  const sprinting = !locked && input.sprint && moving && forwardness > 0.5;
+  const crouching = !locked && input.crouch;
+  const sprinting = !crouching && !locked && input.sprint && moving && forwardness > 0.5;
   const jumpPressed = !locked && input.jump && !s.jumpHeld;
 
   // Ladders: the controller has no ladder concept, so handle them here. Climb
@@ -854,8 +859,22 @@ export function stepPlayerController(
     s.onGround = false;
   } else if (controller) {
     if (moving) controller.setForwardDirection({ x: ndx, y: 0, z: ndz });
+    // Crouch caps locomotion by temporarily lowering the controller's speed
+    // options for this step only — the controller keeps no per-tick speed
+    // input, and restoring the options right after keeps reconciliation
+    // replays (which re-run this function) deterministic.
+    const walkVel = controller.options.maxWalkVel;
+    const runVel = controller.options.maxRunVel;
+    if (crouching) {
+      controller.options.maxWalkVel = CROUCH_SPEED;
+      controller.options.maxRunVel = CROUCH_SPEED;
+    }
     controller.setMovement({ forward: moving, run: sprinting, jump: !locked && input.jump });
     controller.step(DT);
+    if (crouching) {
+      controller.options.maxWalkVel = walkVel;
+      controller.options.maxRunVel = runVel;
+    }
     s.onGround = controller.getSyncState().onGround;
   } else {
     s.onGround = false;
@@ -903,7 +922,7 @@ export function stepPlayerController(
   const activeAmmo = (): number => (s.slot === 1 ? s.ammo2 : s.ammo);
 
   readChar(body, s); // refresh pos before aiming from the eye
-  const eye = eyePosition(s);
+  const eye = eyePosition(s, crouching);
   // Recoil climbs the barrel — the real flight path, not just a view kick.
   const dir = aimDirection(input.yaw, input.pitch + recoilPitch(s));
 
@@ -1077,11 +1096,13 @@ export function perturb(
   return [ox / l, oy / l, oz / l];
 }
 
-// Current spread of the ACTIVE weapon (radians) — worse moving or airborne.
-export function spreadFor(s: CharState): number {
+// Current spread of the ACTIVE weapon (radians) — worse moving or airborne,
+// tighter crouched on the ground.
+export function spreadFor(s: CharState, crouching = false): number {
   const w = activeWeapon(s);
   const moveFactor = Math.min(1, Math.hypot(s.vx, s.vz) / WALK_SPEED);
   let spread = w.spreadBase + moveFactor * w.spreadMove;
+  if (crouching && s.onGround) spread *= 0.65;
   if (!s.onGround) spread += w.spreadAir;
   return spread;
 }

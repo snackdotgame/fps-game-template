@@ -34,6 +34,7 @@ import {
   type EntitySnap,
   type RemoteSnap,
   type ZoneSnap,
+  RF_CROUCH,
   RF_DEAD,
   RF_GROUND,
   RF_PROTECTED,
@@ -565,6 +566,7 @@ function makeBotInput(p: SimPlayer, b: BotBrain, lastSeq: number): InputCmd {
     pitch: b.aimPitch,
     jump: b.jumpIntent,
     sprint: b.sprintIntent,
+    crouch: false, // bots don't crouch (yet)
     fire: b.fireIntent && aligned && tick < b.burstUntil && tick <= b.targetVisibleUntilTick,
     reload: b.reloadIntent,
     grenade: b.grenadeIntent,
@@ -973,7 +975,8 @@ function broadcastSnapshots(): void {
       if (sq.team === 1) flags |= RF_TEAM;
       if (sq.state.onGround) flags |= RF_GROUND;
       if (sq.dead) flags |= RF_DEAD;
-      if (sq.lastCmd.sprint) flags |= RF_SPRINT;
+      if (sq.lastCmd.crouch) flags |= RF_CROUCH;
+      else if (sq.lastCmd.sprint) flags |= RF_SPRINT;
       if (sq.state.reloadTicks > 0) flags |= RF_RELOADING;
       if (sim.tick < sq.protectUntilTick) flags |= RF_PROTECTED;
       remotes.push({

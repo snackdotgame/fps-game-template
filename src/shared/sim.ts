@@ -504,7 +504,7 @@ export class GameSim {
       { dmg: number; hits: number; point: [number, number, number]; minDistSq: number }
     >();
     for (let i = 0; i < pellets; i++) {
-      const spread = spreadFor(p.state);
+      const spread = spreadFor(p.state, p.lastCmd.crouch);
       const d = perturb(baseDir, (this.rng() - 0.5) * 2 * spread, (this.rng() - 0.5) * 2 * spread);
       const hit = this.resolveAttack(p, origin, d, w.range, rewind);
       if (tracersLeft-- > 0) this.pushEvent(EV_TRACER, p.idx, hit.point);
