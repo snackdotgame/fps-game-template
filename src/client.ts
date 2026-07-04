@@ -4732,9 +4732,8 @@ function frame(): void {
       meleeSwing * 0.9 -
       dip * 0.55 - // reload: drop the muzzle
       swapDip * 1.2 - // holster/draw: swing the gun down out of view
-      sway * 0.3 + // sprint: lower the muzzle, not raise it
-      crouchBlend * 0.12; // crouch: hug the gun in, muzzle up a touch
-    viewModel.rotation.z = sway * 0.35 + crouchBlend * 0.08;
+      sway * 0.3; // sprint: lower the muzzle, not raise it
+    viewModel.rotation.z = sway * 0.35;
   }
   viewModel.visible = (selfStatus & SS_DEAD) === 0 && scopeBlend < 0.5;
   // Grace fallback: only show the blocky placeholder gun if the AK model never
