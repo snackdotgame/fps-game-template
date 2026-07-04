@@ -1323,8 +1323,14 @@ hud.innerHTML = `
   #introKeys kbd { flex:0 0 auto; min-width:32px; text-align:center; padding:3px 7px; border-radius:6px; background:rgba(255,255,255,.12);
     border:1px solid rgba(255,255,255,.18); border-bottom-width:2px; font:700 12px/1.2 ui-monospace,monospace; }
   #introKeys span { opacity:.85; }
+  /* The column wrappers are layout-neutral on desktop (display:contents) and
+     become a side-by-side split on short (landscape phone) screens. */
+  .ipcols, .ipcol { display:contents; }
+  /* Deploy/respawn are sticky at the panel's scrollport bottom: on phones the
+     spawn button must ALWAYS be above the fold, even when the panel scrolls. */
   #deploy, #respawnDeploy { margin-top:12px; width:100%; padding:13px 0; font:900 16px/1 "Trebuchet MS",system-ui,sans-serif; letter-spacing:2px;
-    color:#fff; background:#2f6fe0; border:0; border-radius:12px; cursor:pointer; transition:background 120ms ease, transform 80ms ease; }
+    color:#fff; background:#2f6fe0; border:0; border-radius:12px; cursor:pointer; transition:background 120ms ease, transform 80ms ease;
+    position:sticky; bottom:0; z-index:2; box-shadow:0 -8px 18px -10px rgba(0,0,0,.75); }
   #deploy:hover:not(:disabled), #respawnDeploy:hover:not(:disabled) { background:#3f7ff0; }
   #deploy:active:not(:disabled), #respawnDeploy:active:not(:disabled) { transform:scale(.98); }
   #deploy:disabled, #respawnDeploy:disabled { background:rgba(255,255,255,.12); color:rgba(255,255,255,.55); cursor:default; }
@@ -1382,16 +1388,26 @@ hud.innerHTML = `
     #board { font-size:13px; padding:12px 14px; }
     #board td, #board th { padding:3px 8px; }
   }
-  /* Short (landscape phone) tuning: the panel already scrolls, but trim the
-     chrome so more of it fits on a ~390px-tall screen. */
+  /* Short (landscape phone) layout: a purpose-built two-column split — kit
+     picker left, spawn map right, compact header, hints dropped — so the
+     whole panel (deploy included) fits a ~390px-tall screen without
+     scrolling. */
   @media (max-height: 480px) {
-    #intro .ip { padding:12px 20px 12px; }
-    #intro h1 { font-size:22px; letter-spacing:3px; }
-    #intro .isub { display:none; }
-    #introTeam { margin-top:6px; padding:5px 18px; }
-    #intro .igoal { margin-top:6px; font-size:13px; }
-    #introMap { width:min(160px, 40vw); }
-    #respawnMap { width:min(220px, 50vw); }
+    #intro .ip { width:min(680px, calc(100vw - 32px)); padding:10px 20px 10px; }
+    #respawn .rp { width:min(600px, calc(100vw - 32px)); padding:10px 18px 10px; }
+    #intro h1 { font-size:20px; letter-spacing:3px; }
+    #respawn h2 { font-size:18px; letter-spacing:1.5px; }
+    #intro .isub, #intro .igoal, #introKeys { display:none; }
+    #introTeam { margin-top:4px; padding:4px 16px; font-size:12px; }
+    .ipcols { display:flex; gap:16px; align-items:flex-start; margin-top:2px; }
+    .ipcol { display:block; flex:1 1 0; min-width:0; }
+    .ipcols .mapcap { margin-top:4px; }
+    .classrow { display:grid; grid-template-columns:1fr 1fr; margin-top:4px; }
+    .classbtn { padding:5px 2px 5px; }
+    .classbtn .ci { height:26px; }
+    .classbtn .ci img { max-height:26px; }
+    #introMap, #respawnMap { width:min(190px, 100%); }
+    #deploy, #respawnDeploy { margin-top:8px; padding:11px 0; }
   }
 </style>
 <div id="hud">
@@ -1449,11 +1465,17 @@ hud.innerHTML = `
       <div class="isub">CAPTURE · CONTROL · CONQUER</div>
       <div id="introTeam">ASSIGNING TEAM…</div>
       <div class="igoal"><b>Capture and hold the flags.</b></div>
-      <div class="mapcap">pick your kit</div>
-      <div id="introClasses"></div>
-      <div class="mapcap">pick a spawn point — your HQ or any flag your team holds</div>
-      <div id="introMap"></div>
-      <div id="introKeys"></div>
+      <div class="ipcols">
+        <div class="ipcol">
+          <div class="mapcap">pick your kit</div>
+          <div id="introClasses"></div>
+        </div>
+        <div class="ipcol">
+          <div class="mapcap">pick a spawn point — your HQ or any flag your team holds</div>
+          <div id="introMap"></div>
+          <div id="introKeys"></div>
+        </div>
+      </div>
       <button id="deploy" type="button" disabled>LOADING…</button>
       <div id="introStatus"></div>
     </div>
@@ -1461,9 +1483,16 @@ hud.innerHTML = `
   <div id="respawn">
     <div class="rp">
       <h2>YOU'RE DOWN</h2>
-      <div id="respawnClasses"></div>
-      <div class="mapcap">pick a spawn point — your HQ or any flag your team holds</div>
-      <div id="respawnMap"></div>
+      <div class="ipcols">
+        <div class="ipcol">
+          <div class="mapcap">pick your kit</div>
+          <div id="respawnClasses"></div>
+        </div>
+        <div class="ipcol">
+          <div class="mapcap">pick a spawn point — your HQ or any flag your team holds</div>
+          <div id="respawnMap"></div>
+        </div>
+      </div>
       <button id="respawnDeploy" type="button" disabled></button>
     </div>
   </div>
@@ -2254,6 +2283,10 @@ function setupTouchControls(): void {
 </div>`;
   document.body.appendChild(root);
   document.getElementById("hint")?.style.setProperty("display", "none");
+  // The settings gear lives in #hud, which stacks UNDER this layer — the look
+  // surface would eat its taps. Adopt it into the touch layer (above the
+  // surface); it also hides with the layer while a full-screen panel is up.
+  document.getElementById("touch")!.appendChild(document.getElementById("audioMenu")!);
 
   const surface = document.getElementById("touchsurface")!;
   const joybase = document.getElementById("joybase")!;

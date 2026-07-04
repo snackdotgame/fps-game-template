@@ -29,7 +29,7 @@
     "three": "^0.184.0"
   },
   "devDependencies": {
-    "@snack-game/cli": "^0.1.9",
+    "@snack-game/cli": "^0.1.10",
     "@types/three": "^0.184.1",
     "@typescript/native-preview": "7.0.0-dev.20260513.1",
     "esbuild": "0.27.3",
