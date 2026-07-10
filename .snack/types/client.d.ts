@@ -9,6 +9,17 @@ declare module "snack:client" {
 
   export type Payload = NetworkMessage | Uint8Array | ArrayBuffer | ArrayBufferView | string;
 
+  export type JsonValue =
+    | null
+    | boolean
+    | number
+    | string
+    | JsonValue[]
+    | { readonly [key: string]: JsonValue };
+
+  export type JsonObject = { readonly [key: string]: JsonValue };
+  export type ChatPayload = string | JsonObject;
+
   export interface CertificateHash {
     readonly algorithm: "sha-256";
     readonly value: readonly number[];
@@ -67,6 +78,32 @@ declare module "snack:client" {
     readonly type: "stream";
   }
 
+  export interface ChatSender {
+    readonly connectionId: string;
+    readonly userId: string;
+    readonly userName: string;
+    readonly isGuest: boolean;
+  }
+
+  export interface ChatMessage {
+    readonly messageId: string;
+    readonly sequence: number;
+    readonly source: "player" | "server";
+    readonly sender: ChatSender | null;
+    readonly payload: ChatPayload;
+    readonly sentAt: number;
+    readonly deliveredAt: number;
+  }
+
+  export interface ClientChat extends AsyncIterable<ChatMessage> {
+    readonly maxTextLength: number;
+    readonly maxStructuredPayloadBytes: number;
+    drain(): ChatMessage[];
+    drainInto(target: ChatMessage[]): number;
+    recv(): Promise<ChatMessage>;
+    send(payload: ChatPayload): Promise<void>;
+  }
+
   export interface ClientDatagrams extends AsyncIterable<DatagramEvent> {
     readonly maxSize: number;
     drain(): DatagramEvent[];
@@ -89,6 +126,7 @@ declare module "snack:client" {
     readonly net: NetStats;
     readonly ready: Promise<void>;
     readonly closed: Promise<void>;
+    readonly chat: ClientChat;
     readonly datagrams: ClientDatagrams;
     readonly streams: ClientStreams;
   }

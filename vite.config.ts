@@ -11,7 +11,6 @@ const snackClientModuleId = "snack:client";
 const userClientEntryId = "/src/client.ts";
 const resolvedSnackClientEntryId = `\0${snackClientEntryId}`;
 const resolvedSnackClientModuleId = `\0${snackClientModuleId}`;
-const joltRawShim = path.join(projectRoot, "src/shared/joltRawStatic.ts");
 const clientDevHost = process.env.SNACK_CLIENT_HOST ?? "127.0.0.1";
 // port resolution matches `snack dev`: env > snack.json dev.clientPort > 3031
 const clientDevPort = portFromEnv("SNACK_CLIENT_PORT", manifestDevClientPort() ?? 3031);
@@ -91,32 +90,6 @@ function snackClientRuntime(): Plugin {
   };
 }
 
-function joltStaticRawRuntime(): Plugin {
-  const isJoltRawModule = (value: string) => {
-    const normalized = path.normalize(value).replaceAll("\\", "/").split("?")[0];
-    return (
-      normalized.endsWith("jolt-ts/dist/raw.js") ||
-      normalized.endsWith("jolt-ts/src/raw.js") ||
-      normalized.endsWith("jolt-ts/src/raw.ts")
-    );
-  };
-
-  return {
-    name: "jolt-static-raw-runtime",
-    enforce: "pre",
-    resolveId(id, importer) {
-      const normalizedImporter = importer ? path.normalize(importer) : "";
-      if (id === "./raw.js" && normalizedImporter.includes(path.normalize("jolt-ts/"))) {
-        return joltRawShim;
-      }
-      if (isJoltRawModule(id)) {
-        return joltRawShim;
-      }
-      return null;
-    },
-  };
-}
-
 async function assertNoAssetSymlinks(root: string, current = root): Promise<void> {
   const stat = await fs.lstat(current);
   if (stat.isSymbolicLink()) {
@@ -166,10 +139,7 @@ function snackAssets(): Plugin {
             return;
           }
 
-          const contentType = contentTypeFor(candidate);
-          if (contentType) {
-            response.setHeader("Content-Type", contentType);
-          }
+          response.setHeader("Content-Type", contentTypeFor(candidate));
           response.end(await fs.readFile(candidate));
         } catch (error) {
           if (isNotFound(error)) {
@@ -192,7 +162,7 @@ function snackAssets(): Plugin {
   };
 }
 
-function contentTypeFor(filePath: string): string | undefined {
+function contentTypeFor(filePath: string): string {
   const extension = path.extname(filePath).toLowerCase();
 
   if (extension === ".svg") {
@@ -207,8 +177,32 @@ function contentTypeFor(filePath: string): string | undefined {
     return "text/plain; charset=utf-8";
   }
 
+  if (extension === ".md") {
+    return "text/markdown; charset=utf-8";
+  }
+
   if (extension === ".wasm") {
     return "application/wasm";
+  }
+
+  if (extension === ".gltf") {
+    return "model/gltf+json";
+  }
+
+  if (extension === ".glb") {
+    return "model/gltf-binary";
+  }
+
+  if (extension === ".bin") {
+    return "application/octet-stream";
+  }
+
+  if (extension === ".ktx2") {
+    return "image/ktx2";
+  }
+
+  if (extension === ".hdr") {
+    return "image/vnd.radiance";
   }
 
   if (extension === ".png") {
@@ -239,7 +233,7 @@ function contentTypeFor(filePath: string): string | undefined {
     return "audio/wav";
   }
 
-  return undefined;
+  return "application/octet-stream";
 }
 
 function isNotFound(error: unknown): boolean {
@@ -256,13 +250,17 @@ export default defineConfig({
     outDir: "dist/client",
     emptyOutDir: true,
   },
-  plugins: [joltStaticRawRuntime(), snackClientRuntime(), snackAssets()],
+  plugins: [snackClientRuntime(), snackAssets()],
 });
 
 const SNACK_CLIENT_RUNTIME_SOURCE = String.raw`
 const READY_MESSAGE = Object.freeze({ type: "snack.ready", version: 1 });
 const STREAM_KIND_CONTROL = 0;
 const STREAM_KIND_MESSAGE = 1;
+const STREAM_KIND_CHAT = 2;
+const CHAT_PROTOCOL_VERSION = 1;
+const CHAT_OPCODE_SEND = 0;
+const CHAT_OPCODE_MESSAGE = 1;
 const LAUNCH_TIMEOUT_MS = 15000;
 const NETWORK_RTT_PING_INTERVAL_MS = 1000;
 const MAX_PENDING_RTT_SAMPLES = 32;
@@ -270,6 +268,9 @@ const RTT_EMA_ALPHA = 0.1;
 const RTT_JITTER_EMA_ALPHA = 1 / 16;
 const MAX_DATAGRAM_BYTES = 65536;
 const MAX_STREAM_BYTES = 1048576;
+const MAX_CHAT_FRAME_BYTES = 4096;
+const MAX_CHAT_PAYLOAD_BYTES = 2048;
+const MAX_CHAT_TEXT_SCALARS = 500;
 const MAX_QUEUED_MESSAGES = 1024;
 const DATAGRAM_COMPATIBILITY_ERROR = "This browser does not expose the WebTransport datagram API required by Snack.Game. Update your browser or use a current Safari, Chrome, Edge, or Firefox build with WebTransport datagram support.";
 
@@ -287,16 +288,23 @@ function createRuntime() {
   const transportReady = deferred();
   const launchReady = deferred();
   const connectionReady = deferred();
+  const chatCapabilityReady = deferred();
   const publicReady = transportReady.promise.then(() => undefined);
   const closed = transportReady.promise.then(
     (transport) => transport.closed.then(() => undefined, () => undefined),
     () => undefined,
   );
-  const datagrams = createClientChannel(MAX_DATAGRAM_BYTES, (payload) => {
+  const datagrams = createClientChannel({ maxSize: MAX_DATAGRAM_BYTES }, (payload) => {
     return sendDatagram(transportReady.promise, payload);
   });
-  const streams = createClientChannel(MAX_STREAM_BYTES, (payload) => {
+  const streams = createClientChannel({ maxSize: MAX_STREAM_BYTES }, (payload) => {
     return sendStream(transportReady.promise, payload);
+  });
+  const chat = createClientChannel({
+    maxTextLength: MAX_CHAT_TEXT_SCALARS,
+    maxStructuredPayloadBytes: MAX_CHAT_PAYLOAD_BYTES,
+  }, (payload) => {
+    return sendChat(transportReady.promise, chatCapabilityReady.promise, payload);
   });
 
   const client = Object.freeze({
@@ -305,22 +313,27 @@ function createRuntime() {
     net: networkStats.view,
     ready: publicReady,
     closed,
+    chat: chat.channel,
     datagrams: datagrams.channel,
     streams: streams.channel,
   });
 
   void closed.then(() => {
     const error = new Error("Snack client connection closed");
+    chatCapabilityReady.resolve(false);
     datagrams.close(error);
     streams.close(error);
+    chat.close(error);
   });
   void connect({
     datagrams,
+    chat,
     streams,
     networkStats,
     transportReady,
     launchReady,
     connectionReady,
+    chatCapabilityReady,
   });
 
   return {
@@ -344,7 +357,24 @@ async function connect(state) {
       })),
     });
 
-    void readStreams(transport, state.streams, state.connectionReady, transport, state.networkStats).catch(reportRuntimeError);
+    void readStreams(
+      transport,
+      state.streams,
+      state.chat,
+      state.connectionReady,
+      state.chatCapabilityReady,
+      transport,
+      state.networkStats,
+    ).catch(reportRuntimeError);
+    void readBidirectionalStreams(
+      transport,
+      state.streams,
+      state.chat,
+      state.connectionReady,
+      state.chatCapabilityReady,
+      transport,
+      state.networkStats,
+    ).catch(reportRuntimeError);
 
     await transport.ready;
     assertUnreliableTransportAvailable(transport);
@@ -356,6 +386,7 @@ async function connect(state) {
     state.launchReady.reject(error);
     state.transportReady.reject(error);
     state.connectionReady.reject(error);
+    state.chatCapabilityReady.resolve(false);
     reportRuntimeStartupError(error);
   }
 }
@@ -480,20 +511,75 @@ function createNetworkStats() {
   };
 }
 
+// Keep-alive pings must keep flowing while the tab is backgrounded: page
+// timers throttle to once a minute under intensive throttling, but worker
+// timers and worker message delivery are exempt, so the ping cadence comes
+// from a Worker. Falls back to page timers when workers are unavailable
+// (e.g. a worker-src CSP).
+function createPingTicker(intervalMs) {
+  try {
+    const source = "setInterval(() => postMessage(0), " + intervalMs + ");";
+    // the URL must outlive worker startup (it is fetched asynchronously);
+    // it is revoked in stop()
+    const url = URL.createObjectURL(new Blob([source], { type: "application/javascript" }));
+    const worker = new Worker(url);
+    let workerFailed = false;
+    worker.addEventListener("error", () => {
+      workerFailed = true;
+    });
+    return {
+      next() {
+        if (workerFailed) {
+          return sleep(intervalMs);
+        }
+        return new Promise((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (!settled) {
+              settled = true;
+              resolve();
+            }
+          };
+          worker.addEventListener("message", finish, { once: true });
+          // a silently-dead worker must never stall the ping loop; this
+          // page timer may be throttled, which only degrades cadence
+          window.setTimeout(finish, intervalMs * 4);
+        });
+      },
+      stop() {
+        worker.terminate();
+        URL.revokeObjectURL(url);
+      },
+    };
+  } catch {
+    return {
+      next() {
+        return sleep(intervalMs);
+      },
+      stop() {},
+    };
+  }
+}
+
 async function sampleNetworkRtt(transport, networkStats) {
   const closed = transport.closed.then(() => true, () => true);
+  const ticker = createPingTicker(NETWORK_RTT_PING_INTERVAL_MS);
 
-  while (true) {
-    const pingId = networkStats.nextPingId();
-    await sendControlMessage(transport, { type: "ping", id: pingId });
-    networkStats.recordPing(pingId, performance.now());
-    const isClosed = await Promise.race([
-      sleep(NETWORK_RTT_PING_INTERVAL_MS).then(() => false),
-      closed,
-    ]);
-    if (isClosed) {
-      return;
+  try {
+    while (true) {
+      const pingId = networkStats.nextPingId();
+      await sendControlMessage(transport, { type: "ping", id: pingId });
+      networkStats.recordPing(pingId, performance.now());
+      const isClosed = await Promise.race([
+        ticker.next().then(() => false),
+        closed,
+      ]);
+      if (isClosed) {
+        return;
+      }
     }
+  } finally {
+    ticker.stop();
   }
 }
 
@@ -588,6 +674,21 @@ async function sendStream(transportReady, payload) {
   await sendFramedStream(transport, STREAM_KIND_MESSAGE, bytes);
 }
 
+async function sendChat(transportReady, chatCapabilityReady, payload) {
+  const validatedPayload = validateChatPayload(payload);
+  const bytes = textEncoder().encode(JSON.stringify([
+    CHAT_PROTOCOL_VERSION,
+    CHAT_OPCODE_SEND,
+    validatedPayload,
+  ]));
+  assertPayloadSize(bytes, MAX_CHAT_FRAME_BYTES);
+  const transport = await transportReady;
+  if (!(await chatCapabilityReady)) {
+    throw new Error("This Snack host does not support chat protocol version 1");
+  }
+  await sendFramedStream(transport, STREAM_KIND_CHAT, bytes);
+}
+
 async function sendFramedStream(transport, kind, bytes) {
   if (typeof transport.createUnidirectionalStream !== "function") {
     throw new Error("WebTransport unidirectional streams are not available in this browser");
@@ -625,7 +726,15 @@ async function readDatagrams(transport, channel) {
   }
 }
 
-async function readStreams(transport, streamChannel, connectionReady, controlTransport, networkStats) {
+async function readStreams(
+  transport,
+  streamChannel,
+  chatChannel,
+  connectionReady,
+  chatCapabilityReady,
+  controlTransport,
+  networkStats,
+) {
   if (!transport.incomingUnidirectionalStreams) {
     return;
   }
@@ -640,7 +749,9 @@ async function readStreams(transport, streamChannel, connectionReady, controlTra
       const shouldContinue = await readStream(
         result.value,
         streamChannel,
+        chatChannel,
         connectionReady,
+        chatCapabilityReady,
         controlTransport,
         networkStats,
       );
@@ -653,16 +764,79 @@ async function readStreams(transport, streamChannel, connectionReady, controlTra
   }
 }
 
-async function readStream(stream, streamChannel, connectionReady, controlTransport, networkStats) {
+async function readBidirectionalStreams(
+  transport,
+  streamChannel,
+  chatChannel,
+  connectionReady,
+  chatCapabilityReady,
+  controlTransport,
+  networkStats,
+) {
+  if (!transport.incomingBidirectionalStreams) {
+    return;
+  }
+
+  const reader = transport.incomingBidirectionalStreams.getReader();
+  try {
+    while (true) {
+      const result = await reader.read();
+      if (result.done) {
+        return;
+      }
+      const shouldContinue = await readStream(
+        result.value.readable,
+        streamChannel,
+        chatChannel,
+        connectionReady,
+        chatCapabilityReady,
+        controlTransport,
+        networkStats,
+      );
+      if (!shouldContinue) {
+        return;
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+async function readStream(
+  stream,
+  streamChannel,
+  chatChannel,
+  connectionReady,
+  chatCapabilityReady,
+  controlTransport,
+  networkStats,
+) {
   const bytes = await readAllBytes(stream);
   const kind = bytes[0];
   const payload = bytes.slice(1);
   if (kind === STREAM_KIND_CONTROL) {
-    handleControlMessage(payload, connectionReady, controlTransport, networkStats);
+    handleControlMessage(
+      payload,
+      connectionReady,
+      chatCapabilityReady,
+      controlTransport,
+      networkStats,
+    );
     return true;
   }
   if (kind === STREAM_KIND_MESSAGE) {
     return await streamChannel.enqueue(messageEvent("stream", payload));
+  }
+  if (kind === STREAM_KIND_CHAT) {
+    try {
+      if (payload.byteLength > MAX_CHAT_FRAME_BYTES) {
+        throw new RangeError("chat frame exceeds the maximum size");
+      }
+      return chatChannel.enqueueDroppingOldest(chatMessage(payload));
+    } catch (error) {
+      reportRuntimeError(error);
+      return true;
+    }
   }
   return true;
 }
@@ -693,7 +867,13 @@ async function readAllBytes(stream) {
   return bytes;
 }
 
-function handleControlMessage(bytes, connectionReady, transport, networkStats) {
+function handleControlMessage(
+  bytes,
+  connectionReady,
+  chatCapabilityReady,
+  transport,
+  networkStats,
+) {
   const text = textDecoder().decode(bytes);
   let message;
   try {
@@ -715,15 +895,37 @@ function handleControlMessage(bytes, connectionReady, transport, networkStats) {
     return;
   }
 
-  if (message.type !== "welcome" || typeof message.connectionId !== "string") {
+  if (message.type !== "welcome") {
     return;
   }
 
+  if (
+    typeof message.connectionId !== "string" ||
+    message.connectionId.trim().length === 0 ||
+    typeof message.userId !== "string" ||
+    message.userId.trim().length === 0 ||
+    typeof message.userName !== "string" ||
+    message.userName.trim().length === 0 ||
+    typeof message.isGuest !== "boolean"
+  ) {
+    const error = new Error("Snack welcome message is missing required connection identity");
+    reportRuntimeError(error);
+    connectionReady.reject(error);
+    chatCapabilityReady.resolve(false);
+    try {
+      transport.close({ closeCode: 1008, reason: "invalid welcome identity" });
+    } catch {
+      // The rejected connection promise and console error carry the failure.
+    }
+    return;
+  }
+
+  chatCapabilityReady.resolve(message.chatProtocolVersion === CHAT_PROTOCOL_VERSION);
   connectionReady.resolve(Object.freeze({
     connectionId: message.connectionId,
-    userId: typeof message.userId === "string" ? message.userId : message.connectionId,
-    userName: typeof message.userName === "string" ? message.userName : message.connectionId,
-    isGuest: Boolean(message.isGuest),
+    userId: message.userId,
+    userName: message.userName,
+    isGuest: message.isGuest,
   }));
 }
 
@@ -759,6 +961,227 @@ function toBytes(payload) {
   return textEncoder().encode(json);
 }
 
+function chatMessage(bytes) {
+  let frame;
+  try {
+    frame = JSON.parse(chatTextDecoder().decode(bytes));
+  } catch {
+    throw new TypeError("received chat frame is not valid JSON");
+  }
+  if (
+    !Array.isArray(frame)
+    || frame.length !== 9
+    || frame[0] !== CHAT_PROTOCOL_VERSION
+    || frame[1] !== CHAT_OPCODE_MESSAGE
+    || typeof frame[2] !== "string"
+    || frame[2].length === 0
+    || !Number.isSafeInteger(frame[3])
+    || frame[3] < 0
+    || (frame[4] !== 0 && frame[4] !== 1)
+    || !Number.isSafeInteger(frame[7])
+    || frame[7] < 0
+    || !Number.isSafeInteger(frame[8])
+    || frame[8] < 0
+  ) {
+    throw new TypeError("received chat frame has an invalid shape");
+  }
+
+  const sender = frame[4] === 0 ? chatSender(frame[5]) : null;
+  if (frame[4] === 1 && frame[5] !== null) {
+    throw new TypeError("server chat frame must not include a player sender");
+  }
+  const payload = freezeChatValue(validateChatPayload(frame[6], false));
+  return Object.freeze({
+    messageId: frame[2],
+    sequence: frame[3],
+    source: frame[4] === 0 ? "player" : "server",
+    sender,
+    payload,
+    sentAt: frame[7],
+    deliveredAt: frame[8],
+  });
+}
+
+function chatSender(value) {
+  if (
+    !isRecord(value)
+    || typeof value.connectionId !== "string"
+    || value.connectionId.length === 0
+    || typeof value.userId !== "string"
+    || value.userId.length === 0
+    || typeof value.userName !== "string"
+    || value.userName.length === 0
+    || typeof value.isGuest !== "boolean"
+  ) {
+    throw new TypeError("player chat frame has an invalid sender");
+  }
+  return Object.freeze({
+    connectionId: value.connectionId,
+    userId: value.userId,
+    userName: value.userName,
+    isGuest: value.isGuest,
+  });
+}
+
+function validateChatPayload(payload, enforcePayloadSize = true) {
+  if (typeof payload !== "string" && !isPlainChatObject(payload)) {
+    throw new TypeError("chat payload must be a string or JSON object");
+  }
+  if (typeof payload === "string" && payload.trim().length === 0) {
+    throw new TypeError("chat text must not be empty");
+  }
+
+  const limits = { items: 0, keyBytes: 0, textScalars: 0 };
+  const payloadBytes = validateChatValue(payload, 0, limits);
+  if (enforcePayloadSize && payloadBytes > MAX_CHAT_PAYLOAD_BYTES) {
+    throw new RangeError(
+      "payload exceeds maximum size of " + MAX_CHAT_PAYLOAD_BYTES + " bytes",
+    );
+  }
+  return payload;
+}
+
+function validateChatValue(value, depth, limits) {
+  if (depth > 16) {
+    throw new RangeError("chat payload exceeds the maximum depth");
+  }
+  if (value == null) {
+    return 4;
+  }
+  if (typeof value === "boolean") {
+    return value ? 4 : 5;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || (Number.isInteger(value) && !Number.isSafeInteger(value))) {
+      throw new TypeError("chat numbers must be finite safe JavaScript numbers");
+    }
+    return String(Object.is(value, -0) ? 0 : value).length;
+  }
+  if (typeof value === "string") {
+    assertChatString(value);
+    limits.textScalars += Array.from(value).length;
+    if (limits.textScalars > MAX_CHAT_TEXT_SCALARS) {
+      throw new RangeError("chat payload contains too much text");
+    }
+    return chatJsonStringByteLength(value);
+  }
+  if (Array.isArray(value)) {
+    if (Object.getPrototypeOf(value) !== Array.prototype || value.length > 128) {
+      throw new TypeError("chat arrays must be plain arrays with at most 128 items");
+    }
+    if (
+      Object.getOwnPropertySymbols(value).length !== 0
+      || Object.getOwnPropertyNames(value).length !== value.length + 1
+    ) {
+      throw new TypeError("chat arrays must not contain extra properties");
+    }
+    limits.items += value.length;
+    if (limits.items > 256) {
+      throw new RangeError("chat payload contains too many values");
+    }
+    let bytes = 2 + Math.max(0, value.length - 1);
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (descriptor == null || !descriptor.enumerable || !("value" in descriptor)) {
+        throw new TypeError("chat arrays must not be sparse or contain accessors");
+      }
+      bytes += validateChatValue(descriptor.value, depth + 1, limits);
+    }
+    return bytes;
+  }
+  if (!isPlainChatObject(value)) {
+    throw new TypeError("chat payload values must be JSON-compatible");
+  }
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new TypeError("chat values must not contain symbol keys");
+  }
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  const keys = Object.keys(descriptors);
+  if (keys.length > 64) {
+    throw new RangeError("chat objects must contain at most 64 properties");
+  }
+  limits.items += keys.length;
+  if (limits.items > 256) {
+    throw new RangeError("chat payload contains too many values");
+  }
+  let bytes = 2 + Math.max(0, keys.length - 1);
+  for (const key of keys) {
+    assertChatString(key);
+    if (key === "__proto__" || key === "prototype" || key === "constructor") {
+      throw new TypeError("chat payload contains a reserved object key");
+    }
+    const keyBytes = textEncoder().encode(key).byteLength;
+    limits.keyBytes += keyBytes;
+    if (keyBytes > 128 || limits.keyBytes > 1024) {
+      throw new RangeError("chat payload object keys are too large");
+    }
+    const descriptor = descriptors[key];
+    if (!descriptor.enumerable || !("value" in descriptor)) {
+      throw new TypeError("chat payload must contain only enumerable data properties");
+    }
+    bytes += chatJsonStringByteLength(key) + 1;
+    bytes += validateChatValue(descriptor.value, depth + 1, limits);
+  }
+  return bytes;
+}
+
+function chatJsonStringByteLength(value) {
+  let bytes = 2;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code === 0x22 || code === 0x5c || code === 0x08 || code === 0x09
+      || code === 0x0a || code === 0x0c || code === 0x0d) {
+      bytes += 2;
+    } else if (code <= 0x1f) {
+      bytes += 6;
+    } else if (code >= 0xd800 && code <= 0xdbff) {
+      bytes += 4;
+      index += 1;
+    } else if (code <= 0x7f) {
+      bytes += 1;
+    } else if (code <= 0x7ff) {
+      bytes += 2;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+function assertChatString(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        throw new TypeError("chat strings must not contain lone UTF-16 surrogates");
+      }
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      throw new TypeError("chat strings must not contain lone UTF-16 surrogates");
+    }
+  }
+}
+
+function isPlainChatObject(value) {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function freezeChatValue(value) {
+  if (value == null || typeof value !== "object" || Object.isFrozen(value)) {
+    return value;
+  }
+  Object.freeze(value);
+  for (const child of Object.values(value)) {
+    freezeChatValue(child);
+  }
+  return value;
+}
+
 function messageEvent(type, bytes) {
   const eventBytes = Uint8Array.from(bytes);
   let text;
@@ -778,7 +1201,7 @@ function messageEvent(type, bytes) {
   });
 }
 
-function createClientChannel(maxSize, send) {
+function createClientChannel(properties, send) {
   const state = {
     queue: [],
     recvWaiters: [],
@@ -787,7 +1210,7 @@ function createClientChannel(maxSize, send) {
   };
   return {
     channel: Object.freeze({
-      maxSize,
+      ...properties,
       drain() {
         const events = state.queue.splice(0);
         notifyQueueSpace(state);
@@ -838,6 +1261,21 @@ function createClientChannel(maxSize, send) {
         }
         await waitForQueueSpace(state);
       }
+    },
+    enqueueDroppingOldest(event) {
+      if (state.closeError != null) {
+        return false;
+      }
+      const waiter = state.recvWaiters.shift();
+      if (waiter != null) {
+        waiter.resolve(event);
+        return true;
+      }
+      if (state.queue.length === MAX_QUEUED_MESSAGES) {
+        state.queue.shift();
+      }
+      state.queue.push(event);
+      return true;
     },
     close(error) {
       if (state.closeError != null) {
@@ -911,6 +1349,7 @@ function sleep(ms) {
 
 let encoder;
 let decoder;
+let chatDecoder;
 
 function textEncoder() {
   encoder ??= new TextEncoder();
@@ -920,6 +1359,11 @@ function textEncoder() {
 function textDecoder() {
   decoder ??= new TextDecoder();
   return decoder;
+}
+
+function chatTextDecoder() {
+  chatDecoder ??= new TextDecoder("utf-8", { fatal: true });
+  return chatDecoder;
 }
 
 function reportRuntimeError(error) {
