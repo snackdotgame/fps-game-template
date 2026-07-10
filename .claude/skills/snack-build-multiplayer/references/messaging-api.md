@@ -125,7 +125,9 @@ for (const event of client.datagrams.drain()) {
 Reuse an array to reduce allocations:
 
 ```ts
-const events: import("snack:client").DatagramEvent[] = [];
+import type { DatagramEvent } from "snack:client";
+
+const events: DatagramEvent[] = [];
 events.length = 0;
 client.datagrams.drainInto(events);
 ```
