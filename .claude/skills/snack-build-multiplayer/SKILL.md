@@ -91,6 +91,8 @@ flowchart TD
   than newer data.
 - Keep encoded Internet datagrams within a conservative 1,000-byte budget; `maxSize` is only the
   Snack validation ceiling.
+- Use binary gameplay packets from the first implementation. Keep shared encode/decode functions,
+  stable byte-level test vectors, and human-readable debug formatters in `src/shared/`.
 - Add application sequence, acknowledgement, idempotency, and ordering rules when game semantics
   require them; transport delivery alone is not enough.
 - Give each receive queue one owner. When combining leaf examples, merge their parsers into one
@@ -98,7 +100,7 @@ flowchart TD
   messages.
 
 Read [references/protocol-design.md](references/protocol-design.md) when defining message shapes,
-validation, JSON/binary encoding, retries, or ordering.
+binary encoding, validation, debug formatting, retries, or ordering.
 
 ## Record The Decision
 
@@ -109,6 +111,7 @@ Before implementation, state:
 - deterministic versus non-deterministic simulation boundary
 - selected approach per subsystem
 - datagram versus stream choice per message family
+- binary packet layouts, codec ownership, debug formatters, and golden byte vectors
 - required sequence, tick, revision, acknowledgement, and idempotency fields
 - bootstrap, disconnect, fresh-launch rejoin, and recovery behavior
 - network conditions that must pass
