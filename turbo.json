@@ -3,10 +3,17 @@
   "tasks": {
     "dev:client": {
       "cache": false,
+      "env": ["SNACK_CLIENT_HOST", "SNACK_CLIENT_PORT"],
       "persistent": true
     },
     "dev:server": {
       "cache": false,
+      "env": [
+        "SNACK_CLIENT_HOST",
+        "SNACK_CLIENT_PORT",
+        "SNACK_DEV_PERSIST_GUEST_IDENTITY",
+        "SNACK_DEV_PORT"
+      ],
       "persistent": true
     },
     "tc": {
