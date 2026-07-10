@@ -3,8 +3,8 @@
 ## Contents
 
 - Channel choice
-- Message shape and validation
-- JSON versus binary
+- Binary message shape
+- Validation and debug formatting
 - Delivery semantics
 
 ## Channel Choice
@@ -22,129 +22,128 @@ independent message and may complete before or after another send. Do not treat 
 as an application acknowledgement. Include sequence/order fields and reject stale messages when
 application order matters.
 
-## Message Shape
+## Binary Message Shape
 
-Keep discriminated `type` aliases in `src/shared/`. Do not use `interface` for sent object payloads:
-interfaces lack the implicit string index signature required by Snack's recursive `NetworkMessage`
-type.
+Use binary for gameplay messages from the first networked implementation. Do not build a temporary
+JSON wire protocol that must be replaced after the message shapes spread through client and server
+code. Keep logical decoded types plus their binary codecs together in `src/shared/`.
 
-```ts
-export type ClientMessage =
-  | {
-      v: 1;
-      type: "input";
-      seq: number;
-      moveX: number;
-      moveY: number;
-      buttons: number;
-    }
-  | {
-      v: 1;
-      type: "ready";
-      requestId: string;
-    };
-
-export type ServerMessage =
-  | {
-      v: 1;
-      type: "snapshot";
-      tick: number;
-      ackInputSeq: number;
-      players: readonly PlayerSnapshot[];
-    }
-  | {
-      v: 1;
-      type: "ready-accepted";
-      requestId: string;
-    };
-```
-
-Use the smallest fields that express required semantics:
-
-- `v`: protocol version
-- `type`: discriminant
-- `seq`: per-sender monotonic input/message sequence
-- `tick` or server time: authoritative ordering
-- `ackInputSeq`: newest client input included in server state
-- `requestId` or event id: retry/idempotency key
-- entity generation/version: reject updates for recycled entities
-
-Do not trust a client timestamp as server time. Do not let client-provided identity override
-`event.connection`.
-
-## Validation
-
-Decode to `unknown` and prove every field before use:
-
-`event.json()` calls `JSON.parse` and can throw on malformed bytes. Catch decoding errors at each
-queue owner before invoking a validator so one hostile message cannot reject `main()` and stop the
-authoritative runtime.
+Start every packet with an explicit protocol version and message-kind byte. Assign stable numeric
+tags rather than relying on enum declaration order. Define byte order, field widths, quantization,
+string encoding, collection limits, and whether trailing bytes are allowed. Include the smallest
+fields needed for sequence, tick, acknowledgement, idempotency, and entity-generation semantics.
 
 ```ts
-export function parseInput(value: unknown): Extract<ClientMessage, { type: "input" }> | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return undefined;
-  }
+// src/shared/input-protocol.ts
+export type InputMessage = {
+  seq: number;
+  moveX: number;
+  moveY: number;
+  buttons: number;
+};
 
-  const record = value as Record<string, unknown>;
+const PROTOCOL_VERSION = 1;
+const INPUT_MESSAGE = 1;
+const INPUT_BYTES = 12;
+const MOVE_SCALE = 32_767;
+const ALLOWED_BUTTON_MASK = 0b1111;
+
+export function encodeInput(message: InputMessage): Uint8Array {
   if (
-    record.v !== 1 ||
-    record.type !== "input" ||
-    !Number.isSafeInteger(record.seq) ||
-    typeof record.moveX !== "number" ||
-    typeof record.moveY !== "number" ||
-    !Number.isSafeInteger(record.buttons)
+    !Number.isInteger(message.seq) ||
+    message.seq < 0 ||
+    message.seq > 0xffff_ffff ||
+    !Number.isFinite(message.moveX) ||
+    !Number.isFinite(message.moveY) ||
+    Math.abs(message.moveX) > 1 ||
+    Math.abs(message.moveY) > 1 ||
+    !Number.isInteger(message.buttons) ||
+    message.buttons < 0 ||
+    message.buttons > ALLOWED_BUTTON_MASK
   ) {
+    throw new Error("Invalid local input message");
+  }
+
+  const bytes = new Uint8Array(INPUT_BYTES);
+  const view = new DataView(bytes.buffer);
+  view.setUint8(0, PROTOCOL_VERSION);
+  view.setUint8(1, INPUT_MESSAGE);
+  view.setUint32(2, message.seq, true);
+  view.setInt16(6, Math.round(message.moveX * MOVE_SCALE), true);
+  view.setInt16(8, Math.round(message.moveY * MOVE_SCALE), true);
+  view.setUint16(10, message.buttons, true);
+  return bytes;
+}
+
+export function decodeInput(bytes: Uint8Array): InputMessage | undefined {
+  if (bytes.byteLength !== INPUT_BYTES) return undefined;
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (view.getUint8(0) !== PROTOCOL_VERSION || view.getUint8(1) !== INPUT_MESSAGE) {
     return undefined;
   }
 
-  if (
-    !Number.isFinite(record.moveX) ||
-    !Number.isFinite(record.moveY) ||
-    Math.abs(record.moveX) > 1 ||
-    Math.abs(record.moveY) > 1
-  ) {
-    return undefined;
-  }
+  const rawMoveX = view.getInt16(6, true);
+  const rawMoveY = view.getInt16(8, true);
+  const buttons = view.getUint16(10, true);
+  if (rawMoveX < -MOVE_SCALE || rawMoveY < -MOVE_SCALE) return undefined;
+  if ((buttons & ~ALLOWED_BUTTON_MASK) !== 0) return undefined;
+  return {
+    seq: view.getUint32(2, true),
+    moveX: rawMoveX / MOVE_SCALE,
+    moveY: rawMoveY / MOVE_SCALE,
+    buttons,
+  };
+}
 
-  return record as Extract<ClientMessage, { type: "input" }>;
+export function formatInputForLog(bytes: Uint8Array): string {
+  const message = decodeInput(bytes);
+  return message
+    ? `input seq=${message.seq} move=(${message.moveX.toFixed(3)},${message.moveY.toFixed(3)}) buttons=0x${message.buttons.toString(16)}`
+    : `invalid input packet (${bytes.byteLength} bytes)`;
 }
 ```
 
-Also enforce:
+Pass the encoded `Uint8Array` to Snack and decode `event.bytes` at the queue owner. Use `DataView`
+for numeric fields and `TextEncoder`/`TextDecoder` for bounded strings. Prefer fixed-width packets
+for frequent inputs and transforms; use explicit length prefixes and hard collection limits for
+variable state.
 
-- allowed message types by connection/game state
-- monotonic sequence windows
-- per-connection rate and work limits
-- numeric finiteness and domain ranges
-- maximum collection/string sizes
-- ownership and cooldown rules
-- idempotency for retried reliable actions
+## Validation And Debug Formatting
 
-Unknown or malformed input should be ignored or rejected without panicking the runtime.
+Treat every decoder as an untrusted-input boundary. Validate the complete packet before changing
+authority:
 
-## JSON Versus Binary
+- exact or minimum packet length before every read
+- protocol version and allowed message tags
+- declared string/collection lengths before allocating or iterating
+- numeric finiteness, quantized ranges, enum values, and bit masks
+- monotonic sequence windows and allowed messages for the current game state
+- ownership, cooldown, per-connection rate/work limits, and retry idempotency
+- trailing bytes unless that message explicitly permits an extension section
 
-Start with JSON-compatible objects because they are debuggable and Snack encodes them directly.
-Move a hot message to binary only after measuring meaningful bandwidth, allocation, or parse cost.
+Return `undefined` or a small result type for malformed remote bytes; do not let a decoder throw out
+of the authoritative loop. Local encoders may throw for programmer errors before a packet is sent.
+Do not trust a client timestamp as server time or let packet fields override `event.connection`.
 
-For binary messages:
+Make binary debugging a first-class part of the codec. Provide a formatter such as
+`formatInputForLog()` that calls the real decoder and renders a compact human-readable line. This
+keeps logs and devtools understandable without maintaining a second parser. Enable packet logging
+only for explicit debugging, and sample or filter hot message families rather than flooding the
+runtime log budget.
 
-- define an explicit byte order
-- reserve a protocol version and message type in the header
-- validate length before every read
-- use `DataView` for integers/floats and `TextEncoder`/`TextDecoder` for strings
-- keep a shared encode/decode implementation or shared test vectors
-- reject trailing or truncated bytes unless the protocol explicitly permits them
+Test round trips, malformed/truncated packets, boundary values, and stable golden byte vectors. A
+golden vector makes an accidental field-width, byte-order, or tag change visible in review.
+
+Snack also accepts JSON-compatible payloads, but do not use them as the default gameplay wire
+format. Structured chat through `client.chat` / `server.chat` is a separate host-owned capability.
 
 Channel `maxSize` is Snack's validation ceiling, not the deliverable WebTransport datagram size.
 Client transports negotiate a separate path-dependent datagram maximum, and server creator code does
 not receive that number. Keep Internet datagrams at or below a conservative 1,000 encoded bytes
 unless testing establishes a lower limit.
 
-Measure JSON payloads with `new TextEncoder().encode(JSON.stringify(value)).byteLength`. Top-level
-strings use their raw UTF-8 byte length. If a message can exceed the budget, compact it, split it into
-independently useful updates, send deltas, or move it to a reliable stream.
+Measure the final `Uint8Array.byteLength`. If a message can exceed the budget, compact or quantize
+it, split it into independently useful updates, send deltas, or move it to a reliable stream.
 
 ## Delivery Semantics
 
