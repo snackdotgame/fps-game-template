@@ -143,7 +143,9 @@ not receive that number. Keep Internet datagrams at or below a conservative 1,00
 unless testing establishes a lower limit.
 
 Measure the final `Uint8Array.byteLength`. If a message can exceed the budget, compact or quantize
-it, split it into independently useful updates, send deltas, or move it to a reliable stream.
+it, split it into independently useful updates, send deltas, or move it to a reliable stream. For
+bitpacking, quantization grids, delta baselines, and priority accumulators, use
+[`snack-design-binary-protocol`](../../snack-design-binary-protocol/SKILL.md).
 
 ## Delivery Semantics
 
