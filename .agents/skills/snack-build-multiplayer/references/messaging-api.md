@@ -148,7 +148,7 @@ routing are explicit; one consumer may drain messages another expects.
 Use these terms precisely:
 
 - **disconnect**: the current transport closes and `client.closed` resolves
-- **rejoin**: a fresh shell/iframe launch creates a new transport and a new `connection.id`
+- **rejoin**: a fresh shell/iframe launch creates a new transport and a new `connection.connectionId`
 - **bootstrap**: the server sends the full recoverable state required by that new connection
 
 Do not show an indefinite automatic “reconnecting” state; automatic in-place reconnect is not a

@@ -67,13 +67,14 @@ Load only the skill needed for the current task:
 - `snack-design-game-ux` for HUDs, menus, responsive layout, controls, and accessibility.
 - `snack-build-text-chat` for human-visible global, team, proximity, lobby, spectator, or system
   chat using `client.chat` and `server.chat`.
-- `snack-build-multiplayer` to choose a netcode approach before implementing networking.
-- `snack-multiplayer-turn-based` for reliable command/state-machine games.
-- `snack-multiplayer-snapshot-interpolation` for continuous authoritative state and remote motion.
-- `snack-multiplayer-client-prediction` for immediate local response plus reconciliation.
-- `snack-multiplayer-rollback` only for proven deterministic replay.
-- `snack-multiplayer-lag-compensation` for bounded server-side historical hit validation when a
-  latency-sensitive shooter or action game warrants it.
+- `snack-build-multiplayer` to select and implement turn-based, snapshot interpolation, client
+  prediction, rollback, or lag compensation.
+- `snack-3d-physics` for 3D physics, rigid bodies, collision, character movement, or any physical
+  simulation via `jolt-ts`; load it alongside `snack-build-multiplayer` for deterministic networked
+  simulation.
+- `snack-design-binary-protocol` for binary wire formats, bitpacking, quantization, delta
+  compression, priority accumulators, and the ~1,000-byte datagram budget; load it alongside the
+  selected multiplayer approach.
 - `snack-threejs-rendering` for Three.js rendering, assets, cameras, lighting, and cleanup.
 - `snack-debug-performance` for measured client, server, render, memory, and network diagnosis.
 - `snack-playtest-game` for host-shell multiplayer, network simulation, device, and completion
