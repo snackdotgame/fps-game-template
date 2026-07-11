@@ -20,6 +20,17 @@ declare module "snack:server" {
 
   export type StreamPayload = DatagramPayload;
 
+  export type JsonValue =
+    | null
+    | boolean
+    | number
+    | string
+    | JsonValue[]
+    | { readonly [key: string]: JsonValue };
+
+  export type JsonObject = { readonly [key: string]: JsonValue };
+  export type ChatPayload = string | JsonObject;
+
   export interface BroadcastOptions {
     only?: readonly string[];
     except?: readonly string[];
@@ -45,6 +56,25 @@ declare module "snack:server" {
 
   export interface StreamEvent extends NetworkEvent {
     readonly type: "stream";
+  }
+
+  export interface ServerChatMessage {
+    readonly messageId: string;
+    readonly connection: Connection;
+    readonly payload: ChatPayload;
+    readonly receivedAt: number;
+  }
+
+  export type ChatSendOptions = BroadcastOptions;
+
+  export interface ServerChat extends AsyncIterable<ServerChatMessage> {
+    readonly maxTextLength: number;
+    readonly maxStructuredPayloadBytes: number;
+    drain(): ServerChatMessage[];
+    drainInto(target: ServerChatMessage[]): number;
+    recv(): Promise<ServerChatMessage>;
+    /** Relayed messages must remain within Snack's bounded recent-attribution window. */
+    send(payload: ChatPayload | ServerChatMessage, options?: ChatSendOptions): void;
   }
 
   export interface ServerDatagrams extends AsyncIterable<DatagramEvent> {
@@ -97,6 +127,7 @@ declare module "snack:server" {
     readonly config: ServerConfig;
     readonly running: boolean;
     readonly connections: readonly Connection[];
+    readonly chat: ServerChat;
     readonly datagrams: ServerDatagrams;
     readonly streams: ServerStreams;
     end(): void;
