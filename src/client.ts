@@ -105,9 +105,8 @@ import {
   writeChar,
   ZERO_INPUT,
 } from "./shared/physics.js";
-import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
+import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
 import { clone as cloneSkeleton } from "three/examples/jsm/utils/SkeletonUtils.js";
 
 const TEAM_COLORS = [0xd23f3f, 0x3a7be8]; // red vs blue
@@ -741,7 +740,14 @@ const waterMat = new THREE.ShaderMaterial({
   `,
 });
 (waterMat.uniforms as { uHeight?: { value: THREE.Texture } }).uHeight = {
-  value: makeWaterHeightTexture(),
+  // The server announces the real randomized map after connection. Keep
+  // module evaluation cheap and replace this dry 1px placeholder when that
+  // map is built instead of baking the throwaway fixture map first.
+  value: (() => {
+    const texture = new THREE.DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+    texture.needsUpdate = true;
+    return texture;
+  })(),
 };
 
 function makeTerrainChunkMesh(ci: number, cj: number): THREE.Mesh {
@@ -959,11 +965,8 @@ function recordBootStage(stage: string, t0: number): void {
   console.log(`[fps] ${stage}: ${ms.toFixed(0)}ms (at ${performance.now().toFixed(0)}ms)`);
 }
 
-let mapVisualsBuilt = false;
-
 function buildMapVisuals(): void {
   const tBuild0 = performance.now();
-  mapVisualsBuilt = true;
   scene.remove(mapGroup);
   mapGroup.traverse((o) => {
     if (o instanceof THREE.InstancedMesh) o.dispose();
@@ -2479,20 +2482,24 @@ const remotes = new Map<number, RemotePlayer>();
 const kd = new Map<number, { k: number; d: number }>();
 let selfStatus = 0;
 let selfHp = MAX_HP;
-let zoneState: ZoneSnap[] = ZONES.map(() => ({ owner: -1, v: 0 }));
+let zoneState: ZoneSnap[] = [];
 const zonePips: HTMLElement[] = [];
 const zoneFills: HTMLElement[] = [];
-for (const def of ZONES) {
-  const pip = document.createElement("div");
-  pip.className = "zp";
-  const fill = document.createElement("div");
-  fill.className = "fill";
-  const label = document.createElement("span");
-  label.textContent = def.letter;
-  pip.append(fill, label);
-  el.zones.appendChild(pip);
-  zonePips.push(pip);
-  zoneFills.push(fill);
+
+function ensureZoneHud(): void {
+  if (zonePips.length > 0) return;
+  for (const def of ZONES) {
+    const pip = document.createElement("div");
+    pip.className = "zp";
+    const fill = document.createElement("div");
+    fill.className = "fill";
+    const label = document.createElement("span");
+    label.textContent = def.letter;
+    pip.append(fill, label);
+    el.zones.appendChild(pip);
+    zonePips.push(pip);
+    zoneFills.push(fill);
+  }
 }
 let respawnTicks = 0;
 // Out-of-bounds feedback: when this client first strayed past the boundary
@@ -2620,11 +2627,13 @@ function copyCtrl(into: CharState, from: CharState): void {
 // every client-side cache derived from the old terrain drops here. The scene
 // itself rebuilds in buildWorlds(), which callers trigger right after.
 function applyMapSeed(seed: number): void {
-  if (seed >>> 0 === mapSeed()) return;
+  if (seed >>> 0 === mapSeed() && MAP.panels.length > 0) return;
   initMap(seed);
   baseHGrid = null;
   mmBase = null;
   warmBaseHeightGrid(); // one exact pass; minimap + face coloring read it
+  zoneState = ZONES.map(() => ({ owner: -1, v: 0 }));
+  ensureMapUi();
   for (const m of minimaps) m.repaint();
 }
 
@@ -2662,6 +2671,7 @@ async function buildWorlds(): Promise<void> {
   }
   for (const [id, hp] of welcomeHp) tintPanelDamage(id, hp);
   welcomeHp = [];
+  scheduleDeferredVisualAssets();
 }
 
 // --- Streams.
@@ -3347,14 +3357,7 @@ function stepSelfFootsteps(dead: boolean): void {
 }
 
 // ---------------------------------------------------------------------------
-// Optional Quaternius Toon Shooter models.
-
-interface ToonShooterManifest {
-  characters?: string[];
-  weapons?: string[];
-  environment?: string[];
-  vehicles?: string[];
-}
+// Deferred Quaternius Toon Shooter models.
 
 interface CharacterTemplate {
   scene: THREE.Group;
@@ -3383,13 +3386,15 @@ interface CharacterAnim {
 const characterTemplates: Array<CharacterTemplate | null> = [null];
 // First-person weapon templates by WEAPON_LIST index (rifle..pistol).
 const viewWeaponTemplates: Array<THREE.Group | null> = WEAPON_LIST.map(() => null);
-const VIEW_WEAPON_FILES: RegExp[] = [
-  /\/AK\.gltf$/i,
-  /\/SMG\.gltf$/i,
-  /\/Shotgun\.gltf$/i,
-  /\/Sniper\.gltf$/i,
-  /\/Pistol\.gltf$/i,
-  /\/Revolver\.gltf$/i,
+const RUNTIME_MODEL_ROOT = "/assets/runtime-models";
+const CHARACTER_MODEL_URL = `${RUNTIME_MODEL_ROOT}/Character_Soldier.glb`;
+const VIEW_WEAPON_URLS = [
+  `${RUNTIME_MODEL_ROOT}/AK.glb`,
+  `${RUNTIME_MODEL_ROOT}/SMG.glb`,
+  `${RUNTIME_MODEL_ROOT}/Shotgun.glb`,
+  `${RUNTIME_MODEL_ROOT}/Sniper.glb`,
+  `${RUNTIME_MODEL_ROOT}/Pistol.glb`,
+  `${RUNTIME_MODEL_ROOT}/Revolver.glb`,
 ];
 // Bounding-height each view weapon is scaled to (the models' proportions
 // differ wildly; a pistol scaled to rifle height fills the screen).
@@ -3419,48 +3424,33 @@ const CHARACTER_WEAPON_NODES = new Set([
 function loadExternalVisualAssets(): void {
   if (externalAssetsRequested) return;
   externalAssetsRequested = true;
-  void fetch("/assets/vendor/quaternius-toon-shooter/manifest.json", { cache: "no-cache" })
-    .then((response) => (response.ok ? response.json() : null))
-    .then((manifest: ToonShooterManifest | null) => {
-      const charUrls = manifest?.characters ?? [];
-      const soldierUrl = charUrls.find((u) => /soldier/i.test(u)) ?? charUrls[0];
-      if (soldierUrl) {
-        void loadCharacterTemplate(soldierUrl)
-          .then((t) => {
-            characterTemplates[0] = t;
-          })
-          .catch(() => {});
-      }
-      const weaponUrls = manifest?.weapons ?? [];
-      for (let w = 0; w < VIEW_WEAPON_FILES.length; w++) {
-        const url = weaponUrls.find((u) => VIEW_WEAPON_FILES[w].test(u));
-        if (!url) continue;
-        const idx = w;
-        void loadModel(url)
-          .then(({ scene }) => {
-            prepareExternalModel(scene, VIEW_WEAPON_HEIGHT[idx]);
-            viewWeaponTemplates[idx] = scene;
-          })
-          .catch(() => {});
-      }
+  void loadCharacterTemplate(CHARACTER_MODEL_URL)
+    .then((template) => {
+      characterTemplates[0] = template;
+      recordDeferredVisualAssetsReady();
     })
     .catch(() => {});
+  for (let idx = 0; idx < VIEW_WEAPON_URLS.length; idx++) {
+    void loadModel(VIEW_WEAPON_URLS[idx])
+      .then(({ scene }) => {
+        prepareExternalModel(scene, VIEW_WEAPON_HEIGHT[idx]);
+        viewWeaponTemplates[idx] = scene;
+        refreshClassPickers();
+        recordDeferredVisualAssetsReady();
+      })
+      .catch(() => {});
+  }
 }
+
+const gltfLoader = new GLTFLoader().setMeshoptDecoder(MeshoptDecoder);
 
 async function loadModel(
   url: string,
 ): Promise<{ scene: THREE.Group; animations: THREE.AnimationClip[] }> {
   const clean = url.split("?")[0].toLowerCase();
   if (clean.endsWith(".glb") || clean.endsWith(".gltf")) {
-    const result = await new GLTFLoader().loadAsync(url);
+    const result = await gltfLoader.loadAsync(url);
     return { scene: result.scene, animations: result.animations };
-  }
-  if (clean.endsWith(".fbx")) {
-    const obj = await new FBXLoader().loadAsync(url);
-    return { scene: obj, animations: obj.animations };
-  }
-  if (clean.endsWith(".obj")) {
-    return { scene: await new OBJLoader().loadAsync(url), animations: [] };
   }
   throw new Error(`Unsupported model format: ${url}`);
 }
@@ -3809,8 +3799,6 @@ function updateViewWeapon(dt: number): void {
     swapDip = Math.max(0, swapDip - dt * 6.5); // draw: rise back up
   }
 }
-
-loadExternalVisualAssets();
 
 // ---------------------------------------------------------------------------
 // Soldiers (blocky humanoids).
@@ -4547,25 +4535,61 @@ function eyeOf(idx: number): THREE.Vector3 | null {
 
 // --- Grenade views (Kenney frag model; sphere fallback until it loads).
 
-const GRENADE_MODEL_URL = "/assets/vendor/kenney/grenade.glb";
+const GRENADE_MODEL_URL = `${RUNTIME_MODEL_ROOT}/grenade.glb`;
 let grenadeTemplate: THREE.Group | null = null;
 const grenadeViews = new Map<number, THREE.Object3D>();
+let grenadeAssetRequested = false;
 
-void loadModel(GRENADE_MODEL_URL)
-  .then(({ scene }) => {
-    // Size to the physics grenade and recentre on its bbox so it tumbles about
-    // its middle (the model's pivot is at its base).
-    scene.updateWorldMatrix(true, true);
-    const size = new THREE.Box3().setFromObject(scene).getSize(new THREE.Vector3());
-    scene.scale.multiplyScalar(0.3 / (Math.max(size.x, size.y, size.z) || 1));
-    scene.updateWorldMatrix(true, true);
-    scene.position.sub(new THREE.Box3().setFromObject(scene).getCenter(new THREE.Vector3()));
-    scene.traverse((o) => {
-      if (o instanceof THREE.Mesh) o.castShadow = true;
-    });
-    grenadeTemplate = scene;
-  })
-  .catch(() => {});
+function loadGrenadeVisualAsset(): void {
+  if (grenadeAssetRequested) return;
+  grenadeAssetRequested = true;
+  void loadModel(GRENADE_MODEL_URL)
+    .then(({ scene }) => {
+      // Size to the physics grenade and recentre on its bbox so it tumbles about
+      // its middle (the model's pivot is at its base).
+      scene.updateWorldMatrix(true, true);
+      const size = new THREE.Box3().setFromObject(scene).getSize(new THREE.Vector3());
+      scene.scale.multiplyScalar(0.3 / (Math.max(size.x, size.y, size.z) || 1));
+      scene.updateWorldMatrix(true, true);
+      scene.position.sub(new THREE.Box3().setFromObject(scene).getCenter(new THREE.Vector3()));
+      scene.traverse((o) => {
+        if (o instanceof THREE.Mesh) o.castShadow = true;
+      });
+      grenadeTemplate = scene;
+      recordDeferredVisualAssetsReady();
+    })
+    .catch(() => {});
+}
+
+let deferredVisualAssetsScheduled = false;
+let deferredVisualAssetsReadyLogged = false;
+
+function recordDeferredVisualAssetsReady(): void {
+  if (
+    deferredVisualAssetsReadyLogged ||
+    characterTemplates[0] === null ||
+    viewWeaponTemplates.some((template) => template === null) ||
+    grenadeTemplate === null
+  ) {
+    return;
+  }
+  deferredVisualAssetsReadyLogged = true;
+  const readyAt = performance.now();
+  bootPerf.deferredVisualAssetsReadyAt = Math.round(readyAt);
+  console.log(`[fps] deferredVisualAssetsReady: ${readyAt.toFixed(0)}ms`);
+}
+
+function scheduleDeferredVisualAssets(): void {
+  if (deferredVisualAssetsScheduled) return;
+  deferredVisualAssetsScheduled = true;
+  // Let the first playable frame and initial input win the main thread and
+  // network. Procedural soldiers, weapons, and grenades cover this interval.
+  window.setTimeout(() => {
+    bootPerf.deferredVisualAssetsRequestedAt = Math.round(performance.now());
+    loadExternalVisualAssets();
+    loadGrenadeVisualAsset();
+  }, 1000);
+}
 
 function makeGrenadeView(): THREE.Object3D {
   if (grenadeTemplate) return grenadeTemplate.clone();
@@ -5110,6 +5134,7 @@ interface Minimap {
   repaint(): void; // new map: base image + flag positions
 }
 const minimaps: Minimap[] = [];
+let mapUiInitialized = false;
 
 function makeMinimap(container: HTMLElement): void {
   const root = document.createElement("div");
@@ -5212,8 +5237,13 @@ function refreshMinimaps(): void {
   for (const m of minimaps) m.refresh();
 }
 
-makeMinimap(el.introMap);
-makeMinimap(el.respawnMap);
+function ensureMapUi(): void {
+  ensureZoneHud();
+  if (mapUiInitialized) return;
+  makeMinimap(el.introMap);
+  makeMinimap(el.respawnMap);
+  mapUiInitialized = true;
+}
 
 // --- Class picker (intro + respawn overlay). The pick is sent as a reliable
 // message; the server applies it at the next spawn (or immediately while
@@ -5392,16 +5422,12 @@ function updateRespawnOverlay(dead: boolean, now: number): void {
 
 // ---------------------------------------------------------------------------
 // Intro / deploy screen: the opaque first-connect UI. It tells the player
-// their team, the goal, and the controls, and doubles as the loading gate —
-// DEPLOY only unlocks once the visual assets and the welcome message are in,
-// so neither the world nor placeholder models are ever seen early.
+// their team, the goal, and the controls, and doubles as the critical loading
+// gate. DEPLOY unlocks once the connected visual/physics world is complete;
+// procedural fallbacks cover the cosmetic models that stream in afterward.
 
 let introVisible = true;
-let introAssetsTimedOut = false;
-const INTRO_BORN_AT = performance.now();
-// Past this, stop holding the door for missing/failed assets — deploy with
-// the procedural fallbacks rather than blocking play forever.
-const INTRO_ASSET_TIMEOUT_MS = 12_000;
+let introReadyLogged = false;
 
 const keyRow = (k: string, label: string): string =>
   `<div class="krow"><kbd>${k}</kbd><span>${label}</span></div>`;
@@ -5422,20 +5448,11 @@ el.introKeys.innerHTML = wantsTouch
     keyRow("Q", "build cover") +
     keyRow("Tab", "scoreboard");
 
-function introAssetsLoaded(): { loaded: number; total: number } {
-  const parts = [
-    ...characterTemplates.map((t) => t !== null),
-    ...viewWeaponTemplates.map((t) => t !== null),
-    grenadeTemplate !== null,
-  ];
-  return { loaded: parts.filter(Boolean).length, total: parts.length };
-}
-
 function introReady(): boolean {
-  const { loaded, total } = introAssetsLoaded();
   // gw != null means buildWorlds finished: the scene + physics mirror are in
   // place, so deploying drops into a live world instead of a blocked frame.
-  return (introAssetsTimedOut || loaded >= total) && connected && selfIdx >= 0 && gw !== null;
+  // Cosmetic models stream in afterward over complete procedural fallbacks.
+  return connected && selfIdx >= 0 && gw !== null;
 }
 
 function updateIntroPanel(): void {
@@ -5444,18 +5461,20 @@ function updateIntroPanel(): void {
     el.introTeam.textContent = `YOU'RE ON TEAM ${TEAM_NAMES[info.team].toUpperCase()}`;
     el.introTeam.style.background = TEAM_COLORS_CSS[info.team];
   }
-  const { loaded, total } = introAssetsLoaded();
-  const assetsReady = introAssetsTimedOut || loaded >= total;
-  if (introReady()) {
+  const ready = introReady();
+  if (ready && !introReadyLogged) {
+    introReadyLogged = true;
+    const readyAt = performance.now();
+    bootPerf.playableReadyAt = Math.round(readyAt);
+    console.log(`[fps] playableReady: ${readyAt.toFixed(0)}ms`);
+  }
+  if (ready) {
     el.deploy.disabled = false;
     el.deploy.textContent = "DEPLOY";
     el.introStatus.textContent = wantsTouch ? "tap to enter the battlefield" : "good hunting";
   } else {
     el.deploy.disabled = true;
-    if (!assetsReady) {
-      el.deploy.textContent = `LOADING ASSETS ${loaded}/${total}…`;
-      el.introStatus.textContent = "fetching models…";
-    } else if (!connected || selfIdx < 0) {
+    if (!connected || selfIdx < 0) {
       el.deploy.textContent = "CONNECTING…";
       el.introStatus.textContent = "waiting for the server…";
     } else {
@@ -5467,13 +5486,6 @@ function updateIntroPanel(): void {
 
 const introTimer = setInterval(() => {
   if (!introVisible) return;
-  if (performance.now() - INTRO_BORN_AT > INTRO_ASSET_TIMEOUT_MS) {
-    introAssetsTimedOut = true;
-    // No server in sight (e.g. the bare Vite client in dev): build the world
-    // anyway so a forced deploy / free-cam inspection has something to show.
-    // With a connection this never runs — the welcome triggers buildWorlds().
-    if (!connected && !mapVisualsBuilt) buildMapVisuals();
-  }
   updateIntroPanel();
   refreshMinimaps(); // live zone ownership on the deploy map
   refreshClassPickers(); // fills weapon thumbnails in as models load

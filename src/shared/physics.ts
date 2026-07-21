@@ -28,6 +28,8 @@ import {
   type BuildingDef,
   type Crater,
   chunksTouching,
+  DEFAULT_MAP_SEED,
+  initMap,
   MAP,
   type PanelDef,
   ringMesh,
@@ -316,6 +318,10 @@ function syncStateFromChar(s: CharState): SyncState {
 export type AliveFn = (pieceId: number) => boolean;
 
 export async function createGameWorld(destroyed?: ReadonlySet<number>): Promise<GameWorld> {
+  // Runtime entrypoints initialize their announced seed first. Tests and
+  // offline tools may create a world directly, so lazily provide the stable
+  // fixture instead of rebuilding it at module evaluation for every client.
+  if (MAP.panels.length === 0) initMap(DEFAULT_MAP_SEED);
   const raw = await joltModule();
   const world = await World.create({
     raw: raw as never,
