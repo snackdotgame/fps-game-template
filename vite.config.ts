@@ -11,6 +11,7 @@ const snackClientModuleId = "snack:client";
 const userClientEntryId = "/src/client.ts";
 const resolvedSnackClientEntryId = `\0${snackClientEntryId}`;
 const resolvedSnackClientModuleId = `\0${snackClientModuleId}`;
+const staticJoltRawModuleId = path.join(projectRoot, "src/shared/joltRawStatic.ts");
 const clientDevHost = process.env.SNACK_CLIENT_HOST ?? "127.0.0.1";
 // port resolution matches `snack dev`: env > snack.json dev.clientPort > 3031
 const clientDevPort = portFromEnv("SNACK_CLIENT_PORT", manifestDevClientPort() ?? 3031);
@@ -86,6 +87,24 @@ function snackClientRuntime(): Plugin {
         return SNACK_CLIENT_RUNTIME_SOURCE;
       }
       return null;
+    },
+  };
+}
+
+function staticJoltRuntime(): Plugin {
+  return {
+    name: "static-jolt-runtime",
+    enforce: "pre",
+    resolveId(source, importer) {
+      if (source !== "./raw.js" || importer == null) return null;
+      const normalizedImporter = importer.replaceAll("\\", "/");
+      if (!normalizedImporter.includes("/node_modules/jolt-ts/dist/")) return null;
+
+      // jolt-ts's generic loader dynamically references every native build,
+      // which makes Vite emit unused debug and multithreaded artifacts. The
+      // game supplies its one selected raw module in shared/physics.ts, so the
+      // wrapper only needs this static runtime implementation.
+      return staticJoltRawModuleId;
     },
   };
 }
@@ -250,7 +269,7 @@ export default defineConfig({
     outDir: "dist/client",
     emptyOutDir: true,
   },
-  plugins: [snackClientRuntime(), snackAssets()],
+  plugins: [staticJoltRuntime(), snackClientRuntime(), snackAssets()],
 });
 
 const SNACK_CLIENT_RUNTIME_SOURCE = String.raw`
