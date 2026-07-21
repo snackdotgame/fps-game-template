@@ -3593,8 +3593,9 @@ function buildMap(): MapDef {
 
 // The live map. A stable object identity — initMap REPLACES its contents so
 // every importer (client renderer, sim, physics, bot nav, tools) sees the new
-// world without re-importing anything. Built at module load from the default
-// seed, so tests and offline tools get the fixture map with no ceremony.
+// world without re-importing anything. It starts lightweight: runtime owners
+// initialize the authoritative seed before building physics or presentation,
+// avoiding a throwaway default-map build during every game launch.
 export const MAP: MapDef = {
   size: SIZE,
   statics: [],
@@ -3864,6 +3865,3 @@ export function inEnemyBase(team: number, x: number, z: number): boolean {
   const base = MAP.spawns[team === 0 ? 1 : 0];
   return Math.hypot(x - base[0], z - base[2]) < ENEMY_BASE_RADIUS;
 }
-
-// Module-load build from the default seed (after every declaration above).
-rebuildMap();
