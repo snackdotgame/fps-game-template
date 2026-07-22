@@ -1682,6 +1682,11 @@ interface SoundManifest {
 
 let audioCtx: AudioContext | null = null;
 let masterGain: GainNode | null = null;
+let audioResumeAttempt: Promise<boolean> | null = null;
+function syncAudioStateDiagnostic(): void {
+  document.documentElement.dataset.audioState = audioCtx?.state ?? "uninitialized";
+}
+syncAudioStateDiagnostic();
 const MASTER_VOLUME_KEY = "breachpoint.masterVolume";
 const DEFAULT_MASTER_VOLUME = 0.7;
 let masterVolume = loadMasterVolume();
@@ -1728,9 +1733,11 @@ function setMasterVolume(value: number): void {
 }
 updateAudioMenu();
 
-function ensureAudio(): void {
+function ensureAudio(): Promise<boolean> {
   if (!audioCtx) {
     audioCtx = new AudioContext();
+    audioCtx.addEventListener("statechange", syncAudioStateDiagnostic);
+    syncAudioStateDiagnostic();
     masterGain = audioCtx.createGain();
     masterGain.gain.value = masterVolume;
     masterGain.connect(audioCtx.destination);
@@ -1739,8 +1746,33 @@ function ensureAudio(): void {
     }
     loadSoundManifest();
   }
-  if (audioCtx.state === "suspended") void audioCtx.resume();
+  if (audioCtx.state === "running") return Promise.resolve(true);
+  if (audioCtx.state === "closed") return Promise.resolve(false);
+  if (audioResumeAttempt) return audioResumeAttempt;
+
+  const context = audioCtx;
+  const attempt = context
+    .resume()
+    .then(() => context.state === "running")
+    .catch(() => false);
+  audioResumeAttempt = attempt;
+  void attempt.then(() => {
+    if (audioResumeAttempt === attempt) audioResumeAttempt = null;
+  });
+  return attempt;
 }
+
+// Audio contexts created before browser activation start suspended. Retry from
+// every trusted gameplay gesture so a rejected/interrupting resume cannot
+// leave the match permanently silent. Capture sees clicks inside UI controls
+// even when their handlers stop propagation.
+async function unlockAudioFromGesture(event: Event): Promise<void> {
+  if (!event.isTrusted) return;
+  await ensureAudio();
+}
+window.addEventListener("pointerdown", unlockAudioFromGesture, { capture: true });
+window.addEventListener("touchend", unlockAudioFromGesture, { capture: true });
+window.addEventListener("keydown", unlockAudioFromGesture, { capture: true });
 
 function loadSoundManifest(): void {
   if (soundManifestRequested) return;
@@ -1807,7 +1839,7 @@ function connectAudioNode(source: AudioNode, volume: number, at?: THREE.Vector3)
 }
 
 function playSound(family: string, volume = 1, pitch = 1): boolean {
-  if (!audioCtx) return false;
+  if (!audioCtx || audioCtx.state !== "running") return false;
   const buffers = soundBuffers.get(family);
   if (!buffers || buffers.length === 0) return false;
   const source = audioCtx.createBufferSource();
@@ -1826,7 +1858,7 @@ function playSoundAt(
   pitch = 1,
   varyPitch = true,
 ): boolean {
-  if (!audioCtx) return false;
+  if (!audioCtx || audioCtx.state !== "running") return false;
   const buffers = soundBuffers.get(family);
   if (!buffers || buffers.length === 0) return false;
   const source = audioCtx.createBufferSource();
@@ -1842,7 +1874,7 @@ function playSoundAt(
 // matches a fixed gameplay duration. No random pitch jitter. Positional when
 // `at` is given.
 function playSoundFit(family: string, seconds: number, volume = 1, at?: THREE.Vector3): boolean {
-  if (!audioCtx) return false;
+  if (!audioCtx || audioCtx.state !== "running") return false;
   const buffers = soundBuffers.get(family);
   if (!buffers || buffers.length === 0) return false;
   const buffer = buffers[Math.floor(Math.random() * buffers.length)];
@@ -1861,7 +1893,7 @@ function logSound(family: string): void {
 }
 
 function noiseBurst(dur: number, vol: number, low = false, at?: THREE.Vector3): void {
-  if (!audioCtx) return;
+  if (!audioCtx || audioCtx.state !== "running") return;
   const t = audioCtx.currentTime;
   const len = Math.floor(audioCtx.sampleRate * dur);
   const buf = audioCtx.createBuffer(1, len, audioCtx.sampleRate);
@@ -1884,7 +1916,7 @@ function blip(
   type: OscillatorType = "square",
   at?: THREE.Vector3,
 ): void {
-  if (!audioCtx) return;
+  if (!audioCtx || audioCtx.state !== "running") return;
   const t = audioCtx.currentTime;
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();
@@ -5737,6 +5769,7 @@ declare global {
       joltFree(): number;
       soundFamilies(): Record<string, number>;
       soundLog(): string[];
+      audioState(): string;
       externalAssets(): {
         soldierLoaded: boolean;
         enemyLoaded: boolean;
@@ -5746,7 +5779,7 @@ declare global {
         corpseCount: number;
         viewWeaponLoaded: boolean;
       };
-      forceAudio(): void;
+      forceAudio(): Promise<boolean>;
       audioVolume(): number;
       setAudioVolume(value: number): void;
       introVisible(): boolean;
@@ -5814,6 +5847,7 @@ window.__fps = {
       [...soundBuffers.entries()].map(([family, buffers]) => [family, buffers.length]),
     ),
   soundLog: () => [...soundLog],
+  audioState: () => audioCtx?.state ?? "uninitialized",
   externalAssets: () => ({
     soldierLoaded: characterTemplates[0] !== null,
     enemyLoaded: false, // single Soldier model for both teams
