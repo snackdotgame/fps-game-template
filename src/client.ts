@@ -1673,6 +1673,7 @@ const BUILT_IN_SOUND_FILES: Record<string, string[]> = {
   impactSoft_heavy: kenneyVariants("impactSoft_heavy"),
   impactWood_medium: kenneyVariants("impactWood_medium"),
   impactMetal_medium: kenneyVariants("impactMetal_medium"),
+  frag_explosion: ["/assets/sounds/cc0-explosion-options/explosion-4.ogg"],
 };
 
 interface SoundManifest {
@@ -1818,13 +1819,19 @@ function playSound(family: string, volume = 1, pitch = 1): boolean {
   return true;
 }
 
-function playSoundAt(family: string, at: THREE.Vector3, volume = 1, pitch = 1): boolean {
+function playSoundAt(
+  family: string,
+  at: THREE.Vector3,
+  volume = 1,
+  pitch = 1,
+  varyPitch = true,
+): boolean {
   if (!audioCtx) return false;
   const buffers = soundBuffers.get(family);
   if (!buffers || buffers.length === 0) return false;
   const source = audioCtx.createBufferSource();
   source.buffer = buffers[Math.floor(Math.random() * buffers.length)];
-  source.playbackRate.value = pitch * (0.94 + Math.random() * 0.12);
+  source.playbackRate.value = pitch * (varyPitch ? 0.94 + Math.random() * 0.12 : 1);
   connectAudioNode(source, volume, at);
   source.start();
   logSound(family);
@@ -1974,12 +1981,12 @@ const sounds = {
   },
   shotFar: (d: number) => noiseBurst(0.12, Math.max(0.02, 0.14 - d * 0.002), true),
   explosionAt: (at: THREE.Vector3) => {
-    // A big, LOUD blast — should dominate gunfire: a sharp crack, a longer
-    // low rumble for body, the heavy impact sample, and a deep sub boom.
-    noiseBurst(0.3, 1.4, false, at); // sharp crack
-    noiseBurst(0.6, 1.0, true, at); // low rumble body
-    void playSoundAt("impactSoft_heavy", at, 1.5, 0.9); // blast body
-    blip(70, 0.5, 0.5, "sine", at); // deep sub boom
+    // Play the selected CC0 recording without pitch variation. Keep a compact
+    // synthesized fallback for the first blast if its sample has not decoded.
+    if (!playSoundAt("frag_explosion", at, 1, 1, false)) {
+      noiseBurst(0.35, 1, true, at);
+      blip(70, 0.45, 0.4, "sine", at);
+    }
   },
   hitmarker: () => blip(1450, 0.07, 0.2),
   // Landed a bullet on an enemy: a meaty flesh thwack plus the confirm tick.

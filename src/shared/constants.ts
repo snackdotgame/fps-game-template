@@ -57,10 +57,26 @@ export const GRENADE_FUSE_TICKS = 66; // ~2.2s
 export const GRENADE_THROW_SPEED = 24;
 export const GRENADE_RADIUS = 0.14;
 export const EXPLOSION_RADIUS = 4.5;
-export const EXPLOSION_MAX_DAMAGE = 120; // a direct blast is a guaranteed kill
-export const EXPLOSION_MIN_DAMAGE = 32; // even the edge hurts
+// Player damage stays lethal through the near-direct zone, then falls linearly
+// from a full health bar to half a health bar at the blast edge.
+export const EXPLOSION_FULL_DAMAGE_RADIUS = 1.5;
+export const EXPLOSION_MAX_DAMAGE = MAX_HP;
+export const EXPLOSION_MIN_DAMAGE = MAX_HP * 0.5;
 export const EXPLOSION_PANEL_RADIUS = 3.0; // pieces vaporized outright
 export const EXPLOSION_IMPULSE = 11;
+
+export function explosionPlayerDamage(distance: number): number {
+  if (!Number.isFinite(distance) || distance > EXPLOSION_RADIUS) return 0;
+  const falloff = Math.max(
+    0,
+    Math.min(
+      1,
+      (Math.max(0, distance) - EXPLOSION_FULL_DAMAGE_RADIUS) /
+        (EXPLOSION_RADIUS - EXPLOSION_FULL_DAMAGE_RADIUS),
+    ),
+  );
+  return EXPLOSION_MAX_DAMAGE + (EXPLOSION_MIN_DAMAGE - EXPLOSION_MAX_DAMAGE) * falloff;
+}
 
 // Sledgehammer (melee, demolition).
 export const MELEE_COOLDOWN_TICKS = 18;
