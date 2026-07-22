@@ -59,6 +59,9 @@ interface BotBrain {
   desiredPitch: number;
   moveX: number;
   moveZ: number;
+  combatSteerX: number;
+  combatSteerZ: number;
+  combatSteerUntilTick: number;
   fireIntent: boolean;
   meleeIntent: boolean;
   jumpIntent: boolean;
@@ -138,6 +141,9 @@ function makeBot(sim: GameSim, slot: number, team: number): BenchPlayer {
       desiredPitch: 0,
       moveX: 0,
       moveZ: 0,
+      combatSteerX: 0,
+      combatSteerZ: 0,
+      combatSteerUntilTick: 0,
       fireIntent: false,
       meleeIntent: false,
       jumpIntent: false,
@@ -185,10 +191,11 @@ function botSteerDestination(
 ): { x: number; y: number; z: number } {
   const nav = navForBots();
   if (nav) {
-    const navVersion = nav.sync(sim);
+    nav.sync(sim);
+    const routeVersion = nav.routeVersion;
     const targetShift = Math.hypot(b.pathTargetX - b.wanderX, b.pathTargetZ - b.wanderZ);
     const shouldRetryMissingPath = b.path.length === 0 && sim.tick >= b.pathRefreshAtTick;
-    if (shouldRetryMissingPath || b.pathVersion !== navVersion || targetShift > 1.2) {
+    if (shouldRetryMissingPath || b.pathVersion !== routeVersion || targetShift > 1.2) {
       const route = nav.findRoute(sim, [x, y, z], [b.wanderX, b.wanderY, b.wanderZ]);
       b.path = route ?? [];
       b.pathIdx = b.path.length > 1 ? 1 : 0;
@@ -197,7 +204,7 @@ function botSteerDestination(
       b.pathTargetZ = b.wanderZ;
       b.pathRefreshAtTick =
         b.path.length > 0 ? Number.MAX_SAFE_INTEGER : sim.tick + 90 + Math.floor(rng() * 90);
-      b.pathVersion = navVersion;
+      b.pathVersion = routeVersion;
     }
     while (b.pathIdx < b.path.length - 1) {
       const point = b.path[b.pathIdx];
@@ -429,21 +436,28 @@ function refreshCombatIntent(sim: GameSim, p: SimPlayer, b: BotBrain): void {
     Math.atan2(target.state.y + 1.0 - eye[1], dist) + Math.cos(phase * 0.7) * wobble * 0.5;
   const nx = dx / (dist || 1);
   const nz = dz / (dist || 1);
-  b.moveX = -nz * b.strafeSign;
-  b.moveZ = nx * b.strafeSign;
+  let moveX = -nz * b.strafeSign;
+  let moveZ = nx * b.strafeSign;
   if (dist > 22) {
-    b.moveX += nx * 0.8;
-    b.moveZ += nz * 0.8;
+    moveX += nx * 0.8;
+    moveZ += nz * 0.8;
   } else if (dist < 7) {
-    b.moveX -= nx * 0.8;
-    b.moveZ -= nz * 0.8;
+    moveX -= nx * 0.8;
+    moveZ -= nz * 0.8;
   }
   const nav = navForBots();
   if (nav) {
-    const steer = nav.steer(sim, [p.state.x, p.state.y, p.state.z], b.moveX, b.moveZ, b.strafeSign);
-    b.moveX = steer.x;
-    b.moveZ = steer.z;
+    if (sim.tick >= b.combatSteerUntilTick) {
+      const steer = nav.steer(sim, [p.state.x, p.state.y, p.state.z], moveX, moveZ, b.strafeSign);
+      b.combatSteerX = steer.x;
+      b.combatSteerZ = steer.z;
+      b.combatSteerUntilTick = sim.tick + BOT_DECISION_INTERVAL;
+    }
+    moveX = b.combatSteerX;
+    moveZ = b.combatSteerZ;
   }
+  b.moveX = moveX;
+  b.moveZ = moveZ;
 }
 
 function initialBotStuckCheckTick(sim: GameSim, slot: number): number {

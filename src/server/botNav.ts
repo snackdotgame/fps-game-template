@@ -18,6 +18,16 @@ const SEARCH_LIMIT = Math.min(GRID_COUNT, 10_000);
 const CLEARANCE = PLAYER_RADIUS + 0.18;
 const STEER_LOOKAHEAD = 3.2;
 export const BOT_NAV_WAYPOINT_RADIUS = 0.8;
+const STEER_ROTATIONS: ReadonlyArray<readonly [number, number]> = [
+  [1, 0],
+  [Math.SQRT1_2, Math.SQRT1_2],
+  [Math.SQRT1_2, -Math.SQRT1_2],
+  [0, 1],
+  [0, -1],
+  [-Math.SQRT1_2, Math.SQRT1_2],
+  [-Math.SQRT1_2, -Math.SQRT1_2],
+  [-1, 0],
+];
 const CARDINALS: ReadonlyArray<readonly [number, number]> = [
   [-1, 0],
   [1, 0],
@@ -40,15 +50,31 @@ export class BotNav {
   private walkable: Uint8Array | null = null;
   private heights: Float32Array | null = null;
   private blockers: Uint16Array | null = null;
-  private readonly knownDestroyed = new Set<number>();
   private readonly knownBuilt = new Map<number, PanelDef>();
+  private destroyedCursor: Iterator<number> | null = null;
+  private destroyedCount = 0;
   private versionValue = 0;
+  private routeVersionValue = 0;
   private sourceRevision = -1;
   private sourceMapSeed = -1;
   private sourceGeneration = -1;
+  private readonly searchCosts = new Float32Array(GRID_COUNT);
+  private readonly searchCameFrom = new Int32Array(GRID_COUNT);
+  private readonly searchSeen = new Uint32Array(GRID_COUNT);
+  private readonly searchClosed = new Uint32Array(GRID_COUNT);
+  private readonly searchOpen = new MinHeap();
+  private searchId = 0;
 
   get version(): number {
     return this.versionValue;
+  }
+
+  // Dynamic cover changes update the occupancy grid immediately, but they do
+  // not invalidate every cached route. Short-horizon steering and the stuck
+  // detector repair only the bots whose paths are actually affected. Full map
+  // regeneration still advances this route version.
+  get routeVersion(): number {
+    return this.routeVersionValue;
   }
 
   warm(sim: GameSim): void {
@@ -73,21 +99,24 @@ export class BotNav {
     if (startCell < 0 || endCell < 0) return null;
     if (startCell === endCell) return [cellPoint(endCell, heights)];
 
-    const costs = new Float32Array(GRID_COUNT);
-    costs.fill(Number.POSITIVE_INFINITY);
+    const searchId = this.beginSearch();
+    const costs = this.searchCosts;
+    const cameFrom = this.searchCameFrom;
+    const seen = this.searchSeen;
+    const closed = this.searchClosed;
+    const open = this.searchOpen;
     costs[startCell] = 0;
-    const cameFrom = new Int32Array(GRID_COUNT);
-    cameFrom.fill(-1);
-    const closed = new Uint8Array(GRID_COUNT);
-    const open = new MinHeap();
+    cameFrom[startCell] = -1;
+    seen[startCell] = searchId;
+    open.reset();
     open.push(startCell, heuristic(startCell, endCell));
     let visited = 0;
 
     while (open.size > 0 && visited++ < SEARCH_LIMIT) {
       const current = open.pop();
-      if (current < 0 || closed[current]) continue;
+      if (current < 0 || closed[current] === searchId) continue;
       if (current === endCell) return reconstructPath(cameFrom, endCell, heights);
-      closed[current] = 1;
+      closed[current] = searchId;
       const cx = current % GRID_SIZE;
       const cz = Math.floor(current / GRID_SIZE);
       for (const [dx, dz] of NEIGHBORS) {
@@ -95,7 +124,7 @@ export class BotNav {
         const nz = cz + dz;
         if (nx < 0 || nx >= GRID_SIZE || nz < 0 || nz >= GRID_SIZE) continue;
         const next = nz * GRID_SIZE + nx;
-        if (!walkable[next] || closed[next]) continue;
+        if (!walkable[next] || closed[next] === searchId) continue;
         if (!canStep(heights, current, next)) continue;
         // Do not squeeze diagonally through two blocked corners.
         if (dx !== 0 && dz !== 0) {
@@ -113,9 +142,10 @@ export class BotNav {
         const planar = dx === 0 || dz === 0 ? 1 : Math.SQRT2;
         const rise = Math.abs(heights[next] - heights[current]);
         const nextCost = costs[current] + planar + rise * 0.35;
-        if (nextCost >= costs[next]) continue;
+        if (seen[next] === searchId && nextCost >= costs[next]) continue;
         costs[next] = nextCost;
         cameFrom[next] = current;
+        seen[next] = searchId;
         open.push(next, nextCost + heuristic(next, endCell));
       }
     }
@@ -139,11 +169,8 @@ export class BotNav {
     const nx = desiredX / magnitude;
     const nz = desiredZ / magnitude;
     const side = sidePreference < 0 ? -1 : 1;
-    const turns = [0, side, -side, side * 2, -side * 2, side * 3, -side * 3, 4];
-    for (const turn of turns) {
-      const angle = turn * (Math.PI / 4);
-      const cos = Math.cos(angle);
-      const sin = Math.sin(angle);
+    for (const [cos, baseSin] of STEER_ROTATIONS) {
+      const sin = baseSin * side;
       const x = nx * cos - nz * sin;
       const z = nx * sin + nz * cos;
       if (this.canAdvance(position[0], position[2], x, z, STEER_LOOKAHEAD)) {
@@ -173,7 +200,8 @@ export class BotNav {
       this.walkable = null;
       this.heights = null;
       this.blockers = null;
-      this.knownDestroyed.clear();
+      this.destroyedCursor = null;
+      this.destroyedCount = 0;
       this.knownBuilt.clear();
     }
     if (!this.walkable) {
@@ -196,7 +224,6 @@ export class BotNav {
     this.heights = heights;
     this.walkable = walkable;
     this.blockers = blockers;
-    this.knownDestroyed.clear();
     this.knownBuilt.clear();
 
     for (const box of MAP.statics) {
@@ -211,10 +238,14 @@ export class BotNav {
       );
     }
     for (const panel of MAP.panels) this.adjustPanel(panel, 1);
-    for (const panelId of sim.destroyedPanels) {
+    this.destroyedCursor = sim.destroyedPanels.values();
+    this.destroyedCount = sim.destroyedPanels.size;
+    for (let i = 0; i < this.destroyedCount; i++) {
+      const next = this.destroyedCursor.next();
+      if (next.done) break;
+      const panelId = next.value;
       const panel = MAP.panels[panelId - 1];
       if (panel?.id === panelId) this.adjustPanel(panel, -1);
-      this.knownDestroyed.add(panelId);
     }
     for (const panel of sim.builtPanels.values()) {
       this.adjustPanel(panel, 1);
@@ -224,14 +255,21 @@ export class BotNav {
     this.sourceMapSeed = mapSeed();
     this.sourceGeneration = sim.navGeneration;
     this.versionValue++;
+    this.routeVersionValue++;
   }
 
   private syncTopology(sim: GameSim): void {
-    for (const panelId of sim.destroyedPanels) {
-      if (this.knownDestroyed.has(panelId)) continue;
-      this.knownDestroyed.add(panelId);
+    // destroyedPanels only grows during a round. Keep its insertion-order
+    // iterator parked at the last consumed entry so each revision applies only
+    // the newly destroyed pieces instead of rescanning hundreds of old ones.
+    const destroyedToApply = sim.destroyedPanels.size - this.destroyedCount;
+    for (let i = 0; i < destroyedToApply; i++) {
+      const next = this.destroyedCursor?.next();
+      if (!next || next.done) break;
+      const panelId = next.value;
       const panel = MAP.panels[panelId - 1];
       if (panel?.id === panelId) this.adjustPanel(panel, -1);
+      this.destroyedCount++;
     }
     for (const [panelId, panel] of this.knownBuilt) {
       if (sim.builtPanels.has(panelId)) continue;
@@ -292,6 +330,16 @@ export class BotNav {
       previous = cell;
     }
     return true;
+  }
+
+  private beginSearch(): number {
+    this.searchId = (this.searchId + 1) >>> 0;
+    if (this.searchId === 0) {
+      this.searchSeen.fill(0);
+      this.searchClosed.fill(0);
+      this.searchId = 1;
+    }
+    return this.searchId;
   }
 }
 
@@ -449,6 +497,11 @@ class MinHeap {
 
   get size(): number {
     return this.cells.length;
+  }
+
+  reset(): void {
+    this.cells.length = 0;
+    this.priorities.length = 0;
   }
 
   push(cell: number, priority: number): void {
