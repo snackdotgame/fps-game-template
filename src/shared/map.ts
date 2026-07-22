@@ -232,6 +232,110 @@ function fbm2(x: number, z: number, octaves: number, freq: number): number {
 // and the sightline validator appends extras wherever a view still leaks.
 let HILLS: Array<[number, number, number, number]> = [];
 
+// Runtime maps rotate through seeds whose spawn-cover repair hills were
+// exhaustively ray-marched offline. Applying these few stamps is effectively
+// free; running the repair search on every client and server took 1-8 seconds.
+export const CURATED_MAP_SEEDS = [3549999080, 27918196, 2029103397, 3317136582] as const;
+const CURATED_SPAWN_REPAIRS: Readonly<
+  Record<number, ReadonlyArray<readonly [number, number, number, number]>>
+> = {
+  3549999080: [
+    [37.887596, -80.755703, 11, 1.6],
+    [-37.625255, 80.809979, 11, 1.6],
+    [-36.03837, -84.103349, 17, 1.6],
+    [-21.156178, -82.78198, 17, 1.6],
+    [19.649196, -85.525656, 17, 1.6],
+    [-20.221121, 85.504208, 17, 1.6],
+    [43.053663, 88.017085, 11, 1.6],
+    [31.046212, -79.156003, 11, 1.6],
+    [-24.642188, 95.474152, 17, 1.6],
+    [22.060005, 97.096912, 17, 1.6],
+    [27.950592, -90.988571, 11, 1.6],
+    [-36.370034, -76.248344, 11, 1.6],
+    [-31.596949, 94.676549, 17, 1.6],
+    [35.922317, 87.661446, 11, 1.6],
+    [22.327805, -96.817699, 17, 1.6],
+    [-35.773721, 87.886593, 11, 1.6],
+    [28.909163, 92.499066, 17, 1.6],
+    [33.00637, 78.466737, 11, 1.6],
+    [-14.147477, 88.477117, 17, 1.6],
+  ],
+  27918196: [
+    [-17.048371, 84.570464, 17, 1.6],
+    [38.041276, -81.35569, 11, 1.6],
+    [-37.537212, -75.128293, 11, 1.6],
+    [-24.77797, -92.432481, 17, 1.6],
+    [-38.578176, 78.672047, 17, 1.6],
+    [23.258218, 95.247278, 17, 1.6],
+    [-32.08, -88.72, 11, 1.6],
+    [21.527181, -85.332005, 17, 1.6],
+    [-23.212102, 92.859848, 17, 1.6],
+    [-37.158044, 86.53339, 17, 1.6],
+    [29.568178, 93.41295, 17, 1.6],
+    [36.484549, -90.008466, 11, 1.6],
+    [-30.325824, 77.852456, 11, 1.6],
+    [-41.197009, 72.211064, 17, 1.6],
+    [33.116829, 87.927596, 17, 1.6],
+    [-20.209322, -81.280779, 17, 1.6],
+    [-37.307946, -82.852281, 17, 1.6],
+    [24.873214, -93.110047, 11, 1.6],
+    [23.524717, 85.85846, 11, 1.6],
+    [-43.739442, -72.202656, 17, 2.007905],
+    [14.4745, -88.783627, 17, 1.6],
+    [46.254605, -85.683129, 17, 1.6],
+  ],
+  2029103397: [
+    [20.158941, -83.176425, 17, 1.6],
+    [17.770196, 97.879308, 17, 1.6],
+    [-36.542968, 84.630215, 11, 1.6],
+    [-21.401357, 84.687785, 17, 1.6],
+    [12.248216, -89.099932, 17, 1.6],
+    [36.755376, 83.249954, 11, 1.6],
+    [-37.986003, -85.580639, 11, 1.6],
+    [40.326237, -78.578816, 11, 1.6],
+    [18.996268, -96.941396, 17, 1.6],
+    [23.893431, 95.359344, 17, 1.6],
+    [-28.373094, -93.289936, 11, 1.6],
+    [-47.524858, -86.243976, 11, 1.6],
+    [39.65055, -85.759949, 17, 1.6],
+    [27.952947, -94.579375, 17, 1.6],
+    [43.508631, 87.079062, 11, 1.6],
+    [-25.515998, 93.488949, 11, 1.6],
+    [22.842656, -77.022941, 17, 1.6],
+    [31.505614, 95.054883, 17, 1.6],
+    [-19.913664, -98.693251, 17, 1.6],
+    [-34.51221, -97.023094, 17, 1.6],
+    [40.288345, -71.055738, 13.261406, 3.157478],
+    [-43.431033, 91.400921, 11, 1.6],
+    [26.341435, 85.510536, 11, 1.6],
+  ],
+  3317136582: [
+    [19.832847, 83.566821, 17, 1.6],
+    [-22.375351, -94.335992, 17, 1.6],
+    [-41.702238, -83.130451, 11, 1.6],
+    [-20.063034, 85.549405, 17, 1.6],
+    [11.714643, 88.323124, 17, 1.6],
+    [-20.720849, -82.383185, 17, 1.6],
+    [-29.161753, -92.581914, 17, 1.6],
+    [-24.594187, 94.517892, 17, 1.6],
+    [26.416571, 95.179817, 17, 1.6],
+    [-15.51124, -86.867977, 17, 1.6],
+    [-36.572666, -76.363217, 11, 2.253122],
+    [-37.794527, 86.507875, 17, 1.6],
+    [18.804671, 99.107647, 17, 1.6],
+    [39.230091, 77.750539, 17, 1.6],
+    [-42.567344, -90.235296, 17, 3.007877],
+    [20.310585, -85.373054, 17, 1.6],
+    [30.87389, 77.912542, 11, 1.6],
+    [25.637904, -94.155072, 17, 1.6],
+    [-39.543769, -69.906532, 14.601005, 3.47643],
+    [38.108138, -78.494187, 11, 1.6],
+    [32.418668, 89.120227, 11, 1.6],
+    [32.755996, -91.53359, 11, 1.6],
+    [-31.826055, 83.467635, 11, 1.6],
+  ],
+};
+
 // Road gates: where each base's road crosses its cradle (chosen BEFORE the
 // hills so the arc can leave the gap; planLayout wires the road through it).
 let GATES: [[number, number], [number, number]] = [
@@ -778,11 +882,43 @@ function terrainBase(x: number, z: number): number {
 // The pristine pre-battle terrain, with roads/paths flattened in. Structure
 // generation seats pieces on this, so later craters never move existing
 // geometry.
-export function baseHeightAt(x: number, z: number): number {
+function computeBaseHeightAt(x: number, z: number): number {
   const h = terrainBase(x, z);
   if (ROAD_SEGS.length === 0) return h;
   const r = roadFieldAt(x, z);
   return r.w > 0 ? h + (r.targetY - h) * r.w : h;
+}
+
+// Startup consumers repeatedly ask for the same one-metre terrain samples:
+// minimap coloring, render geometry, Jolt terrain, and bot navigation. Keep a
+// bounded per-map memo for exact grid points after procedural generation has
+// finished. Fractional gameplay queries still take the exact uncached path.
+const BASE_HEIGHT_CACHE_PAD = 10;
+const BASE_HEIGHT_CACHE_MIN = -SIZE / 2 - BASE_HEIGHT_CACHE_PAD;
+const BASE_HEIGHT_CACHE_N = SIZE + BASE_HEIGHT_CACHE_PAD * 2 + 1;
+let baseHeightCache: Float64Array | null = null;
+
+export function baseHeightAt(x: number, z: number): number {
+  const ix = x - BASE_HEIGHT_CACHE_MIN;
+  const iz = z - BASE_HEIGHT_CACHE_MIN;
+  const cache = baseHeightCache;
+  if (
+    cache &&
+    Number.isInteger(ix) &&
+    Number.isInteger(iz) &&
+    ix >= 0 &&
+    iz >= 0 &&
+    ix < BASE_HEIGHT_CACHE_N &&
+    iz < BASE_HEIGHT_CACHE_N
+  ) {
+    const index = iz * BASE_HEIGHT_CACHE_N + ix;
+    const cached = cache[index];
+    if (!Number.isNaN(cached)) return cached;
+    const height = computeBaseHeightAt(x, z);
+    cache[index] = height;
+    return height;
+  }
+  return computeBaseHeightAt(x, z);
 }
 
 // ---------------------------------------------------------------------------
@@ -881,31 +1017,30 @@ export function ringMesh(
   const vertices: number[] = [];
   const indices: number[] = [];
   const n = Math.ceil((outer * 2) / cell);
-  let vi = 0;
+  const stride = n + 1;
+
+  // Adjacent tiles share their corners. Generate the grid once instead of
+  // evaluating the procedural height function four times per tile; the
+  // indices below still produce exactly the same triangle surface.
+  for (let iz = 0; iz <= n; iz++) {
+    const z = -outer + iz * cell;
+    for (let ix = 0; ix <= n; ix++) {
+      const x = -outer + ix * cell;
+      vertices.push(x, baseHeightAt(x, z), z);
+    }
+  }
+
   for (let iz = 0; iz < n; iz++) {
     for (let ix = 0; ix < n; ix++) {
       const x0 = -outer + ix * cell;
       const z0 = -outer + iz * cell;
-      const x1 = x0 + cell;
-      const z1 = z0 + cell;
       // Skip cells fully inside the core hole.
       if (Math.abs(x0 + cell / 2) < inner && Math.abs(z0 + cell / 2) < inner) continue;
-      vertices.push(
-        x0,
-        baseHeightAt(x0, z0),
-        z0,
-        x1,
-        baseHeightAt(x1, z0),
-        z0,
-        x0,
-        baseHeightAt(x0, z1),
-        z1,
-        x1,
-        baseHeightAt(x1, z1),
-        z1,
-      );
-      indices.push(vi, vi + 2, vi + 1, vi + 1, vi + 2, vi + 3);
-      vi += 4;
+      const a = iz * stride + ix;
+      const b = a + 1;
+      const c = a + stride;
+      const d = c + 1;
+      indices.push(a, c, b, b, c, d);
     }
   }
   return { vertices, indices };
@@ -3050,6 +3185,14 @@ function validateSpawnCover(): void {
   }
 }
 
+// Build-time helper for curating map seeds. Runtime clients and servers use
+// the baked repair stamps below and never execute the expensive ray marcher.
+export function validateCuratedSpawnCover(): boolean {
+  const firstRepair = HILLS.length;
+  validateSpawnCover();
+  return HILLS.length === firstRepair;
+}
+
 // One full greedy pass; true = no leaks remain.
 function validateSpawnCoverPass(): boolean {
   const cell = 1;
@@ -3271,7 +3414,10 @@ function buildMap(): MapDef {
   // timer keeps players in (see sim/client). The layout fills FLAT_PADS +
   // ROAD_SEGS before any geometry is seated on the terrain.
   LAYOUT = planLayout(rng);
-  validateSpawnCover();
+  const repairs = CURATED_SPAWN_REPAIRS[SEED];
+  if (repairs) {
+    for (const [x, z, radius, amplitude] of repairs) HILLS.push([x, z, radius, amplitude]);
+  }
 
   // Buildings: each lot fronts its street; the first lot is the fixed center
   // house. Most buildings get multiple entrances (a back door for through-flow,
@@ -3620,6 +3766,7 @@ export function initMap(seed: number): void {
 }
 
 function rebuildMap(): void {
+  baseHeightCache = null;
   resetCraters();
   const def = buildMap();
   MAP.statics = def.statics;
@@ -3630,6 +3777,8 @@ function rebuildMap(): void {
   MAP.spawns = def.spawns;
   ZONES.length = 0;
   for (const zn of LAYOUT.zones) ZONES.push(zn);
+  baseHeightCache = new Float64Array(BASE_HEIGHT_CACHE_N * BASE_HEIGHT_CACHE_N);
+  baseHeightCache.fill(Number.NaN);
 }
 
 // ---------------------------------------------------------------------------
