@@ -18,6 +18,7 @@ import {
 } from "./shared/constants.js";
 import {
   craterList,
+  CURATED_MAP_SEEDS,
   DEFAULT_MAP_SEED,
   ENEMY_BASE_RADIUS,
   heightAt,
@@ -139,7 +140,7 @@ let botNav: BotNav | null = null;
 // world. SANDBOX keeps the fixture seed for reproducible iteration.
 function pickMapSeed(): number {
   if (SANDBOX) return DEFAULT_MAP_SEED;
-  return ((Math.random() * 0x100000000) ^ (server.elapsedMs() * 2654435761)) >>> 0;
+  return CURATED_MAP_SEEDS[Math.floor(Math.random() * CURATED_MAP_SEEDS.length)];
 }
 
 const players = new Map<string, Player>(); // by connection id, or "bot:<n>"
@@ -166,18 +167,30 @@ function readBotFillConfig(): number {
 }
 
 export async function main() {
+  const bootStartedAt = server.elapsedMs();
+  let stageStartedAt = bootStartedAt;
   await joltModule();
+  console.log(`[boot] jolt: ${(server.elapsedMs() - stageStartedAt).toFixed(0)}ms`);
+  stageStartedAt = server.elapsedMs();
   mapSeed = pickMapSeed();
   initMap(mapSeed); // before sim.init(): the physics world builds from MAP
+  console.log(`[boot] map: ${(server.elapsedMs() - stageStartedAt).toFixed(0)}ms`);
+  stageStartedAt = server.elapsedMs();
   sim = new GameSim(0xbeac4);
   await sim.init();
+  console.log(`[boot] game-world: ${(server.elapsedMs() - stageStartedAt).toFixed(0)}ms`);
   sim.phaseEndTick = ROUND_TICKS;
   configuredBotFill = readBotFillConfig();
   if (!SANDBOX && configuredBotFill > 0) {
+    stageStartedAt = server.elapsedMs();
     await initBotNav();
+    console.log(`[boot] bot-nav-init: ${(server.elapsedMs() - stageStartedAt).toFixed(0)}ms`);
+    stageStartedAt = server.elapsedMs();
     botNav = new BotNav();
     botNav.warm(sim);
+    console.log(`[boot] bot-nav-grid: ${(server.elapsedMs() - stageStartedAt).toFixed(0)}ms`);
   }
+  console.log(`[boot] server-ready: ${(server.elapsedMs() - bootStartedAt).toFixed(0)}ms`);
 
   // Client stream messages carry explicit requests (currently the spawn
   // choice). The recv REJECTING is the shutdown signal — it only rejects

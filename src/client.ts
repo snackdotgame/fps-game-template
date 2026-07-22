@@ -91,6 +91,7 @@ import {
   CROUCH_EYE_HEIGHT,
   EYE_HEIGHT,
   joltFreeMemory,
+  joltModule,
   type GameWorld,
   type InputCmd,
   makeChar,
@@ -528,7 +529,7 @@ function vnoise(x: number, z: number, freq: number): number {
 let baseHGrid: Float32Array | null = null;
 let baseHGridN = 0; // points per side
 let baseHGridMin = 0;
-const BASEH_PAD = 8; // cover AO taps just past the core edge
+const BASEH_PAD = 3; // exactly covers the widest AO taps past the core edge
 
 function warmBaseHeightGrid(): void {
   if (baseHGrid) return;
@@ -2628,13 +2629,19 @@ function copyCtrl(into: CharState, from: CharState): void {
 // itself rebuilds in buildWorlds(), which callers trigger right after.
 function applyMapSeed(seed: number): void {
   if (seed >>> 0 === mapSeed() && MAP.panels.length > 0) return;
+  const mapBuildStartedAt = performance.now();
   initMap(seed);
+  recordBootStage("applyMapSeed:map", mapBuildStartedAt);
   baseHGrid = null;
   mmBase = null;
+  const heightGridStartedAt = performance.now();
   warmBaseHeightGrid(); // one exact pass; minimap + face coloring read it
+  recordBootStage("applyMapSeed:height-grid", heightGridStartedAt);
   zoneState = ZONES.map(() => ({ owner: -1, v: 0 }));
+  const mapUiStartedAt = performance.now();
   ensureMapUi();
   for (const m of minimaps) m.repaint();
+  recordBootStage("applyMapSeed:ui", mapUiStartedAt);
 }
 
 async function buildWorlds(): Promise<void> {
@@ -2730,6 +2737,8 @@ function showFrag(victimIdx: number, weapon: "rifle" | "grenade" | "melee"): voi
 function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): void {
   switch (msg.type) {
     case "welcome": {
+      const welcomeAt = performance.now();
+      bootPerf.welcomeAt = Math.round(welcomeAt);
       selfIdx = msg.selfIdx;
       roster.clear();
       for (const p of msg.players) roster.set(p.idx, p);
@@ -2737,7 +2746,9 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       phaseEndTick = msg.phaseEndTick;
       scores = [msg.scores[0], msg.scores[1]];
       mapEpoch = msg.mapEpoch;
+      const mapSeedStartedAt = performance.now();
       applyMapSeed(msg.mapSeed); // BEFORE replaying destruction/craters below
+      recordBootStage("applyMapSeed", mapSeedStartedAt);
       destroyedSet = new Set(msg.destroyed);
       builtList = [...msg.built];
       collapsedList = [...msg.collapsed];
@@ -5519,6 +5530,13 @@ document.getElementById("boot")?.remove();
 
 async function boot(): Promise<void> {
   bootPerf["0:moduleEvalDoneAt"] = Math.round(performance.now());
+  // Jolt compilation does not depend on the server's map seed. Start it while
+  // the connection/welcome is in flight so createGameWorld only has to build
+  // bodies once the authoritative seed arrives.
+  const joltWarmupStartedAt = performance.now();
+  void joltModule()
+    .then(() => recordBootStage("joltWarmup", joltWarmupStartedAt))
+    .catch(() => {});
   void readStreams();
   void readDatagrams();
   frame();
@@ -5528,6 +5546,7 @@ async function boot(): Promise<void> {
   try {
     await client.ready;
     connected = true;
+    bootPerf.clientReadyAt = Math.round(performance.now());
   } catch {
     return;
   }

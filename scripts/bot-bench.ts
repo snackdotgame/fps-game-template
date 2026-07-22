@@ -9,7 +9,7 @@
 //     && node /tmp/fps-bot-bench.mjs
 
 import { BOT_FILL, TICK_RATE } from "../src/shared/constants.js";
-import { heightAt, MAP, ZONES } from "../src/shared/map.js";
+import { CURATED_MAP_SEEDS, heightAt, initMap, MAP, ZONES } from "../src/shared/map.js";
 import { BotNav, initBotNav, type BotNavPoint } from "../src/server/botNav.js";
 import {
   aimDirection,
@@ -445,6 +445,7 @@ function hasLineOfSight(sim: GameSim, from: SimPlayer, to: SimPlayer, counters: 
 
 async function runSample(sample: number): Promise<Sample> {
   botNav = null;
+  initMap(CURATED_MAP_SEEDS[(sample - 1) % CURATED_MAP_SEEDS.length]);
   const sim = new GameSim(0xbeac4);
   await sim.init();
   if (navEnabled) {
