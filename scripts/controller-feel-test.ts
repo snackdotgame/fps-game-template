@@ -10,12 +10,14 @@ import { heightAt, MAP, spawnPoint } from "../src/shared/map.js";
 import {
   type Body,
   type CharState,
+  createCorpseBody,
   createGameWorld,
   createPlayerBody,
   GRAVITY,
   type GameWorld,
   type InputCmd,
   makeChar,
+  PLAYER_RADIUS,
   readChar,
   stepPlayerController,
   ZERO_INPUT,
@@ -61,6 +63,36 @@ async function main(): Promise<void> {
     const ok = bob < 0.002 && Math.abs(hover) < 0.02;
     if (!ok) failures++;
     console.log(`  ${ok ? "PASS" : "FAIL"} (want bob<2mm AND feet on ground; old bob ~400mm)`);
+    gw.world.dispose();
+  }
+
+  // --- Corpse physics (the "dies floating in the air" bug) ---
+  {
+    const gw = await createGameWorld();
+    const spawn: [number, number, number] = [MAP.size / 2 - 6, 7, MAP.size / 2 - 6];
+    const body = createCorpseBody(gw, spawn, Math.PI / 3);
+    const start = body.translation();
+    const startRot = body.rotation();
+    const startAxisY = 1 - 2 * (startRot.x * startRot.x + startRot.z * startRot.z);
+    for (let t = 0; t < 240; t++) gw.world.step(DT);
+    const end = body.translation();
+    const endRot = body.rotation();
+    const endAxisY = 1 - 2 * (endRot.x * endRot.x + endRot.z * endRot.z);
+    const endVel = body.linearVelocity();
+    const below = gw.world.castRay([end.x, end.y, end.z], [0, -2, 0], { excludeBody: body });
+    const groundGap = below ? below.fraction * 2 - PLAYER_RADIUS : Infinity;
+    console.log("\n== corpse physics (real game path) ==");
+    console.log(
+      `  fell ${(start.y - end.y).toFixed(2)} m  ground gap=${(groundGap * 1000).toFixed(1)} mm  axisY=${endAxisY.toExponential(1)}`,
+    );
+    const ok =
+      Math.abs(startAxisY) < 1e-6 &&
+      Math.abs(endAxisY) < 1e-6 &&
+      end.y < start.y - 2 &&
+      Math.abs(endVel.y) < 0.1 &&
+      groundGap < 0.12;
+    if (!ok) failures++;
+    console.log(`  ${ok ? "PASS" : "FAIL"} (want horizontal capsule settled on static ground)`);
     gw.world.dispose();
   }
 

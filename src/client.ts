@@ -84,6 +84,7 @@ import {
   muzzleOrigin,
   perturb,
   spreadFor,
+  createCorpseBody,
   createGameWorld,
   createGrenadeBody,
   createPlayerBody,
@@ -97,6 +98,7 @@ import {
   makeChar,
   PLAYER_FLOAT_HEIGHT,
   PLAYER_HALF_HEIGHT,
+  PLAYER_RADIUS,
   readChar,
   removeGrenadeBody,
   pieceIdFromHit,
@@ -968,6 +970,7 @@ function recordBootStage(stage: string, t0: number): void {
 
 function buildMapVisuals(): void {
   const tBuild0 = performance.now();
+  clearCorpses();
   scene.remove(mapGroup);
   mapGroup.traverse((o) => {
     if (o instanceof THREE.InstancedMesh) o.dispose();
@@ -983,7 +986,6 @@ function buildMapVisuals(): void {
   panelDefs.clear();
   terrainChunkVisuals.clear();
   decals.length = 0;
-  corpses.length = 0; // their groups died with the old mapGroup
   fallingChunks.clear(); // ditto
 
   // The map may have been re-seeded since the last build: refresh the water
@@ -2959,7 +2961,11 @@ function handleSnapshot(snap: Snapshot, receivedAt: number): void {
   selfStatus = snap.self.status;
   if ((prevSelfStatus & SS_DEAD) === 0 && (selfStatus & SS_DEAD) !== 0 && predState) {
     const team = roster.get(selfIdx)?.team ?? 0;
-    spawnCorpse(new THREE.Vector3(predState.x, predState.y, predState.z), yaw, team);
+    spawnCorpse(new THREE.Vector3(predState.x, predState.y, predState.z), yaw, team, [
+      predState.vx,
+      predState.vy,
+      predState.vz,
+    ]);
   }
   // Back alive: the server just respawned us — face the action from the new
   // spawn position before the first rendered frame, primary in hand.
@@ -3128,7 +3134,15 @@ function syncGrenades(snap: Snapshot): void {
   }
 }
 
-// Local closest-hit ray that skips our own capsule (mirror-world query).
+const LOCAL_RAY_OPTIONS = {
+  // Cosmetic corpse physics must never alter predicted aiming, placement, or
+  // effects; the authoritative server has no matching corpse bodies.
+  filter: ({ body }: { body: Body | undefined }): boolean =>
+    (body?.userData as { corpse?: boolean } | undefined)?.corpse !== true,
+};
+
+// Local closest-hit ray that skips our own capsule and cosmetic corpse bodies
+// (mirror-world query).
 function castLocal(
   origin: readonly number[],
   dir: readonly number[],
@@ -3143,6 +3157,7 @@ function castLocal(
     const hit = gw.world.castRay(
       [ox, oy, oz],
       [dir[0] * remaining, dir[1] * remaining, dir[2] * remaining],
+      LOCAL_RAY_OPTIONS,
     );
     if (!hit || !hit.body) return null;
     const px = ox + dir[0] * remaining * hit.fraction;
@@ -3373,11 +3388,13 @@ function stepSelfFootsteps(dead: boolean): void {
 interface CharacterTemplate {
   scene: THREE.Group;
   clips: THREE.AnimationClip[];
+  deathPoseMinY: number;
 }
 interface CharacterInstance {
   root: THREE.Group;
   mixer: THREE.AnimationMixer;
   actions: Map<string, THREE.AnimationAction>;
+  deathPoseMinY: number;
 }
 // Per-instance animation state carried on each remote player / corpse.
 interface CharacterAnim {
@@ -3489,17 +3506,86 @@ function trimDuplicateLoopFrame(clip: THREE.AnimationClip): void {
 
 async function loadCharacterTemplate(url: string): Promise<CharacterTemplate> {
   const { scene, animations } = await loadModel(url);
-  prepareExternalCharacterModel(scene);
   for (const clip of animations) trimDuplicateLoopFrame(clip);
-  return { scene, clips: animations };
+  const prepared = prepareExternalCharacterModel(scene, animations);
+  return {
+    scene: prepared.scene,
+    clips: animations,
+    deathPoseMinY: prepared.deathPoseMinY,
+  };
 }
 
-function prepareExternalCharacterModel(root: THREE.Group): void {
+// Measure an animated pose on a temporary skeleton clone. Static geometry
+// bounds describe the GLB's bind pose, not the vertices after skinning, so they
+// cannot reliably establish a character's visible scale or ground contact.
+function measureCharacterPose(
+  scene: THREE.Group,
+  clips: THREE.AnimationClip[],
+  clipName: string,
+  normalizedTime: number,
+): THREE.Box3 {
+  const clip = THREE.AnimationClip.findByName(clips, clipName);
+  if (!clip) return new THREE.Box3();
+  const root = cloneSkeleton(scene) as THREE.Group;
+  const mixer = new THREE.AnimationMixer(root);
+  const action = mixer.clipAction(clip);
+  action.setLoop(THREE.LoopOnce, 1);
+  action.clampWhenFinished = true;
+  action.reset().play();
+  action.time = clip.duration * THREE.MathUtils.clamp(normalizedTime, 0, 1);
+  mixer.update(0);
+
+  root.updateWorldMatrix(true, true);
+  // SkinnedMesh bounds use the skeleton's current bone matrices. Rendering
+  // normally refreshes them, but this template clone is measured off-scene.
+  root.traverse((o) => {
+    if (o instanceof THREE.SkinnedMesh) o.skeleton.update();
+  });
+  const box = posedBoxFromObject(root, (o) => !hasNamedAncestor(o, CHARACTER_WEAPON_NODES));
+  mixer.stopAllAction();
+  mixer.uncacheRoot(root);
+  return box;
+}
+
+function prepareExternalCharacterModel(
+  root: THREE.Group,
+  clips: THREE.AnimationClip[],
+): { scene: THREE.Group; deathPoseMinY: number } {
   // Hide every weapon node; instances reveal exactly one via setHeldWeapon.
   root.traverse((o) => {
     if (CHARACTER_WEAPON_NODES.has(o.name)) o.visible = false;
+    if (o instanceof THREE.Mesh) {
+      o.castShadow = true;
+      o.receiveShadow = true;
+    }
   });
-  prepareExternalModel(root, 1.78, (o) => !hasNamedAncestor(o, CHARACTER_WEAPON_NODES));
+
+  // Normalize outside the bound skeleton. Mutating and then re-measuring the
+  // GLTF root compounds attached-skeleton transforms; a parent wrapper applies
+  // the authored pose exactly once and remains safe to move with snapshots.
+  let idleBox = measureCharacterPose(root, clips, "Idle", 0);
+  if (idleBox.isEmpty()) {
+    root.updateWorldMatrix(true, true);
+    idleBox = boxFromObject(root, (o) => !hasNamedAncestor(o, CHARACTER_WEAPON_NODES));
+  }
+  const size = idleBox.getSize(new THREE.Vector3());
+  const scale = size.y > 0 ? 1.78 / size.y : 1;
+  const center = idleBox.getCenter(new THREE.Vector3());
+  const wrapper = new THREE.Group();
+  wrapper.scale.setScalar(scale);
+  wrapper.position.set(-center.x * scale, -idleBox.min.y * scale, -center.z * scale);
+  wrapper.add(root);
+  wrapper.updateWorldMatrix(true, true);
+
+  // Convert the untouched final Death-pose minimum through the same affine
+  // normalization. Corpses can then align that point with their collider floor
+  // without ever deriving bounds from an already-transformed skeleton.
+  const deathBox = measureCharacterPose(root, clips, "Death", 1);
+  const deathPoseMinY =
+    deathBox.isEmpty() || !Number.isFinite(deathBox.min.y)
+      ? 0
+      : wrapper.position.y + deathBox.min.y * scale;
+  return { scene: wrapper, deathPoseMinY };
 }
 
 // Show the weapon the player is actually holding on a character rig.
@@ -3547,6 +3633,27 @@ function boxFromObject(
     box.union(meshBox);
   });
   return box.isEmpty() ? new THREE.Box3().setFromObject(root) : box;
+}
+
+function posedBoxFromObject(
+  root: THREE.Object3D,
+  includeInBounds: (object: THREE.Object3D) => boolean,
+): THREE.Box3 {
+  const box = new THREE.Box3();
+  const meshBox = new THREE.Box3();
+  root.traverse((o) => {
+    if (!(o instanceof THREE.Mesh) || !isVisibleInHierarchy(o) || !includeInBounds(o)) return;
+    let localBox: THREE.Box3 | null = null;
+    if (o instanceof THREE.SkinnedMesh) {
+      o.computeBoundingBox();
+      localBox = o.boundingBox;
+    } else {
+      if (!o.geometry.boundingBox) o.geometry.computeBoundingBox();
+      localBox = o.geometry.boundingBox;
+    }
+    if (localBox) box.union(meshBox.copy(localBox).applyMatrix4(o.matrixWorld));
+  });
+  return box;
 }
 
 function hasNamedAncestor(object: THREE.Object3D, names: ReadonlySet<string>): boolean {
@@ -3647,7 +3754,7 @@ function instantiateCharacter(team: number): CharacterInstance | null {
   const mixer = new THREE.AnimationMixer(root);
   const actions = new Map<string, THREE.AnimationAction>();
   for (const clip of tpl.clips) actions.set(clip.name, mixer.clipAction(clip));
-  return { root, mixer, actions };
+  return { root, mixer, actions, deathPoseMinY: tpl.deathPoseMinY };
 }
 
 // Crossfade the looping locomotion clip. Shoot/jump/hit variants are full-body
@@ -4051,8 +4158,9 @@ interface Corpse {
   mixer: THREE.AnimationMixer | null;
   until: number;
   materials: THREE.Material[]; // captured once for the fade-out
-  vy: number; // fall velocity — a body that died airborne drops to the ground
-  groundY: number; // surface (terrain/floor/rubble) the body settles on
+  body: Body | null; // horizontal client-only Jolt capsule
+  vy: number; // no-world fallback for a death during a map rebuild
+  groundY: number; // fallback surface; normal corpses settle through Jolt
 }
 
 const CORPSE_GRAVITY = 18; // m/s^2 for the corpse drop
@@ -4062,7 +4170,12 @@ const CORPSE_CAP = 18;
 const CORPSE_TTL_MS = 50_000; // bodies linger, then fade away
 const CORPSE_FADE_MS = 1500;
 
-function spawnCorpse(at: THREE.Vector3, yaw: number, team: number): void {
+function spawnCorpse(
+  at: THREE.Vector3,
+  yaw: number,
+  team: number,
+  velocity: readonly number[] = [0, 0, 0],
+): void {
   const group = new THREE.Group();
   group.position.set(at.x, at.y, at.z);
   group.rotation.y = yaw;
@@ -4070,6 +4183,10 @@ function spawnCorpse(at: THREE.Vector3, yaw: number, team: number): void {
   const inst = instantiateCharacter(team);
   if (inst) {
     inst.root.rotation.y = EXTERNAL_CHARACTER_YAW;
+    // The final Death pose sits above the normalized rig origin. Offset the
+    // visual inside the physics group so its lowest skinned point coincides
+    // with the horizontal capsule's bottom instead of hovering over it.
+    inst.root.position.y -= inst.deathPoseMinY;
     group.add(inst.root);
     mixer = inst.mixer;
     const death = inst.actions.get("Death");
@@ -4088,34 +4205,50 @@ function spawnCorpse(at: THREE.Vector3, yaw: number, team: number): void {
     }),
   );
   mapGroup.add(group);
-  // Where the body comes to rest: ray straight down for the first surface
-  // (terrain, a building floor, rubble) so a soldier killed mid-air or on a
-  // ledge drops to the ground instead of hanging where they died. Never above
-  // the death height (a grounded body shouldn't pop up).
-  let groundY = heightAt(at.x, at.z);
-  // Guard the raycast: gw can be mid-rebuild on a round reset, and a throw here
-  // would otherwise propagate out of handleSnapshot. Terrain height is the safe
-  // fallback.
+  // The normal path is a real horizontal Jolt capsule. It occupies a dedicated
+  // static-only collision layer, so it can fall onto terrain/floors/rubble but
+  // cannot perturb predicted players or grenades. Keep the old downward drop
+  // only as a safe fallback if a death arrives during a world rebuild.
+  let body: Body | null = null;
   try {
-    const below = castLocal([at.x, at.y + 0.4, at.z], [0, -1, 0], 100);
-    if (below) groundY = below.point[1];
+    if (gw) body = createCorpseBody(gw, [at.x, at.y, at.z], yaw, velocity);
   } catch {
-    /* keep terrain height */
+    /* world is being replaced; use the bounded fallback below */
   }
-  groundY = Math.min(groundY, at.y);
+  let groundY = heightAt(at.x, at.z);
+  if (!body) {
+    try {
+      const below = castLocal([at.x, at.y + 0.4, at.z], [0, -1, 0], 100);
+      if (below) groundY = below.point[1];
+    } catch {
+      /* keep terrain height */
+    }
+    groundY = Math.min(groundY, at.y);
+  }
   corpses.push({
     group,
     mixer,
     until: performance.now() + CORPSE_TTL_MS,
     materials,
+    body,
     vy: 0,
     groundY,
   });
   if (corpses.length > CORPSE_CAP) {
     const old = corpses.shift()!;
-    old.mixer?.stopAllAction();
-    old.group.parent?.remove(old.group);
+    removeCorpse(old);
   }
+}
+
+function removeCorpse(corpse: Corpse): void {
+  corpse.mixer?.stopAllAction();
+  if (corpse.body?.valid) corpse.body.remove();
+  corpse.group.parent?.remove(corpse.group);
+}
+
+function clearCorpses(): void {
+  for (const corpse of corpses) removeCorpse(corpse);
+  corpses.length = 0;
 }
 
 function makeFallbackCorpse(team: number): THREE.Group {
@@ -4132,12 +4265,17 @@ function stepCorpses(dt: number): void {
   const now = performance.now();
   while (corpses.length > 0 && now > corpses[0].until) {
     const old = corpses.shift()!;
-    old.mixer?.stopAllAction();
-    old.group.parent?.remove(old.group);
+    removeCorpse(old);
   }
   for (const c of corpses) {
     c.mixer?.update(dt); // advance the Death clip (clamps on its last frame)
-    if (c.group.position.y > c.groundY) {
+    if (c.body?.valid) {
+      // The rig origin remains in feet-space while the horizontal capsule's
+      // origin is its center. The death clip owns the visible body pose; Jolt
+      // owns only translation/contact so the two do not double-rotate.
+      c.body.translationInto(c.group.position);
+      c.group.position.y -= PLAYER_RADIUS;
+    } else if (c.group.position.y > c.groundY) {
       c.vy -= CORPSE_GRAVITY * dt;
       c.group.position.y += c.vy * dt;
       if (c.group.position.y <= c.groundY) {

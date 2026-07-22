@@ -53,7 +53,7 @@ import {
   joltModule,
   readChar,
 } from "./shared/physics.js";
-import { BotNav, initBotNav, type BotNavPoint } from "./server/botNav.js";
+import { BotNav, BOT_NAV_WAYPOINT_RADIUS, initBotNav, type BotNavPoint } from "./server/botNav.js";
 import { CLASSES, secondaryIdxFor } from "./shared/weapons.js";
 import { GameSim, type SimPlayer } from "./shared/sim.js";
 
@@ -530,19 +530,33 @@ function updateBotDecision(p: SimPlayer, b: BotBrain): void {
     if (s.ammo < 12) reload = true;
   }
 
-  // --- Stuck? Sledge through whatever wall is in the way, BattleBit style. ---
+  // --- Stuck? Reverse the avoidance side and force a fresh route. ---
   if (tick >= b.stuckCheckAt) {
     const moved = Math.hypot(s.x - b.stuckX, s.z - b.stuckZ);
     if (moved < 0.5 && !p.dead && (moveX !== 0 || moveZ !== 0)) {
-      const dir = aimDirection(b.aimYaw, 0);
+      // Probe the direction we are actually trying to move, not the view
+      // direction (combat bots often aim forward while strafing sideways).
+      const moveYaw = Math.atan2(moveX, moveZ);
+      const dir = aimDirection(moveYaw, 0);
       const ahead = sim.gw.world.castRay(
         [eye[0], eye[1] - 0.5, eye[2]],
         [dir[0] * 1.8, 0, dir[2] * 1.8],
       );
       const tag = (ahead?.body?.userData ?? {}) as { panelId?: number; slabIdx?: number };
-      if (tag.panelId !== undefined || tag.slabIdx !== undefined) melee = true;
-      else jump = true;
-      if (rng() < 0.3) b.repathAtTick = 0; // sometimes just go somewhere else
+      if (tag.panelId !== undefined || tag.slabIdx !== undefined) {
+        b.strafeSign *= -1;
+        b.strafeFlipAt = tick + 30;
+      } else {
+        jump = true;
+      }
+      // Always invalidate stale route state. If geometry changed or a coarse
+      // waypoint chose the wrong side of a corner, the next decision gets a
+      // fresh path instead of pushing into the wall for several more seconds.
+      b.path = [];
+      b.pathIdx = 0;
+      b.pathRefreshAtTick = 0;
+      b.pathVersion = 0;
+      b.repathAtTick = 0;
     }
     b.stuckX = s.x;
     b.stuckZ = s.z;
@@ -619,6 +633,12 @@ function refreshCombatIntent(p: SimPlayer, b: BotBrain): void {
     b.moveX -= nx * 0.8;
     b.moveZ -= nz * 0.8;
   }
+  const nav = navForBots();
+  if (nav) {
+    const steer = nav.steer(sim, [p.state.x, p.state.y, p.state.z], b.moveX, b.moveZ, b.strafeSign);
+    b.moveX = steer.x;
+    b.moveZ = steer.z;
+  }
 }
 
 function initialBotStuckCheckTick(slot: number): number {
@@ -646,9 +666,10 @@ function botSteerDestination(
 ): { x: number; y: number; z: number } {
   const nav = navForBots();
   if (nav) {
+    const navVersion = nav.sync(sim);
     const targetShift = Math.hypot(b.pathTargetX - b.wanderX, b.pathTargetZ - b.wanderZ);
     const shouldRetryMissingPath = b.path.length === 0 && sim.tick >= b.pathRefreshAtTick;
-    if (shouldRetryMissingPath || b.pathVersion !== nav.version || targetShift > 1.2) {
+    if (shouldRetryMissingPath || b.pathVersion !== navVersion || targetShift > 1.2) {
       const route = nav.findRoute(sim, [x, y, z], [b.wanderX, b.wanderY, b.wanderZ]);
       b.path = route ?? [];
       b.pathIdx = b.path.length > 1 ? 1 : 0;
@@ -657,16 +678,17 @@ function botSteerDestination(
       b.pathTargetZ = b.wanderZ;
       b.pathRefreshAtTick =
         b.path.length > 0 ? Number.MAX_SAFE_INTEGER : sim.tick + 90 + Math.floor(rng() * 90);
-      b.pathVersion = nav.version;
+      b.pathVersion = navVersion;
     }
     while (b.pathIdx < b.path.length - 1) {
       const point = b.path[b.pathIdx];
-      if (Math.hypot(point[0] - x, point[2] - z) >= 1.05) break;
+      if (Math.hypot(point[0] - x, point[2] - z) >= BOT_NAV_WAYPOINT_RADIUS) break;
       b.pathIdx++;
     }
     const point = b.path[b.pathIdx];
     if (point) {
-      return { x: point[0] - x, y: point[1], z: point[2] - z };
+      const steer = nav.steer(sim, [x, y, z], point[0] - x, point[2] - z, b.strafeSign);
+      return { x: steer.x, y: point[1], z: steer.z };
     }
   }
   return { x: b.wanderX - x, y: b.wanderY, z: b.wanderZ - z };

@@ -269,6 +269,12 @@ export class GameSim {
   readonly panelHp = new Map<number, number>(); // damaged panels only
   readonly destroyedPanels = new Set<number>();
   readonly builtPanels = new Map<number, PanelDef>();
+  // Monotonic collision-topology revision consumed by the authoritative bot
+  // navigation grid. Presentation and network state never depend on it.
+  navRevision = 0;
+  // Unlike ordinary topology changes, a round reset can make previously
+  // destroyed authored panels walkable again, so it requires a full rebuild.
+  navGeneration = 0;
   readonly collapsedBuildings = new Set<number>();
   private nextBuiltPanelId = BUILT_PANEL_ID_BASE;
   private pendingHpUpdates = new Map<number, number>();
@@ -577,6 +583,7 @@ export class GameSim {
     const placed: PanelDef = { ...panel, id: this.nextBuiltPanelId++ };
     addPanelBody(this.gw, placed);
     this.builtPanels.set(placed.id, placed);
+    this.navRevision++;
     this.outbox.push({ type: "build", panel: placed, byIdx: p.idx });
   }
 
@@ -709,6 +716,7 @@ export class GameSim {
     this.destroyedPanels.add(panelId);
     this.panelHp.delete(panelId);
     this.builtPanels.delete(panelId);
+    this.navRevision++;
     removePanelBody(this.gw, panelId);
     this.markPieceGone(panelId);
     this.pendingDestroys.push(panelId);
@@ -849,6 +857,7 @@ export class GameSim {
         this.builtPanels.set(def.id, def);
         settled.push(def);
       }
+      if (settled.length > 0) this.navRevision++;
       this.outbox.push({ type: "settle", chunkId: f.id, pieces: settled });
     }
   }
@@ -875,6 +884,7 @@ export class GameSim {
     this.destroyedPanels.add(panelId);
     this.panelHp.delete(panelId);
     this.builtPanels.delete(panelId);
+    this.navRevision++;
     removePanelBody(this.gw, panelId);
     this.markPieceGone(panelId);
     this.pendingDestroys.push(panelId);
@@ -918,6 +928,7 @@ export class GameSim {
     };
     addPanelBody(this.gw, def);
     this.builtPanels.set(def.id, def);
+    this.navRevision++;
     this.pendingRubble.push(def); // batched into one "rubble" message per tick
   }
 
@@ -1252,6 +1263,8 @@ export class GameSim {
     this.panelHp.clear();
     this.destroyedPanels.clear();
     this.builtPanels.clear();
+    this.navRevision++;
+    this.navGeneration++;
     this.collapsedBuildings.clear();
     this.pendingHpUpdates = new Map();
     this.pendingDestroys = [];
