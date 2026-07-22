@@ -243,6 +243,7 @@ interface BodyTag {
   panelId?: number; // a single runtime piece (deployed cover, rubble, settled)
   slabIdx?: number; // a map structure slab (one body, many pieces)
   playerIdx?: number;
+  corpse?: boolean; // client-only cosmetic body; never feeds gameplay queries
   grenadeId?: number;
   fallingId?: number; // a released chunk mid-tumble (server-side dynamic)
   static?: boolean;
@@ -327,6 +328,14 @@ export async function createGameWorld(destroyed?: ReadonlySet<number>): Promise<
     raw: raw as never,
     gravity: [0, -GRAVITY, 0],
     deterministic: "cross-platform",
+    // Cosmetic corpse bodies live only in the client mirror. Let them settle
+    // against the shared static world without perturbing predicted players,
+    // remote collision ghosts, grenades, or the authoritative server sim.
+    layers: {
+      static: { broadPhase: "static", collidesWith: ["moving", "corpse"] },
+      moving: { broadPhase: "moving", collidesWith: ["static", "moving"] },
+      corpse: { broadPhase: "moving", collidesWith: ["static"] },
+    },
   });
   const gw: GameWorld = {
     world,
@@ -667,6 +676,42 @@ export function createPlayerBody(
     playerControllers.set(body, controller);
   }
   return body;
+}
+
+// A dead soldier is presentation-only, but it still needs real collision and
+// gravity so an airborne death lands on terrain, floors, or rubble instead of
+// hanging at the sampled death height. Jolt capsules are vertical by default;
+// rotate this one 90 degrees around X, then around Y by the soldier yaw, so its
+// long axis lies along the body while remaining horizontal. Rotation stays
+// locked after creation to prevent the simple collision proxy from standing
+// back up on end.
+export function createCorpseBody(
+  gw: GameWorld,
+  feet: readonly number[],
+  yaw: number,
+  velocity: readonly number[] = [0, 0, 0],
+): Body {
+  const half = Math.SQRT1_2;
+  const sy = Math.sin(yaw / 2);
+  const cy = Math.cos(yaw / 2);
+  return gw.world.createBody({
+    type: "dynamic",
+    shape: Shape.capsule({ halfHeight: PLAYER_HALF_CYL, radius: PLAYER_RADIUS }),
+    position: [feet[0], feet[1] + PLAYER_RADIUS, feet[2]],
+    // qYaw * qX(90deg): local +Y (the capsule axis) becomes yaw-forward.
+    rotation: [cy * half, sy * half, -sy * half, cy * half],
+    layer: "corpse",
+    friction: 0.8,
+    restitution: 0,
+    mass: 80,
+    linearDamping: 0.3,
+    angularDamping: 1,
+    linearVelocity: [velocity[0], velocity[1], velocity[2]],
+    allowSleeping: true,
+    motionQuality: "linearCast",
+    allowedDofs: ["translation-x", "translation-y", "translation-z"],
+    userData: { corpse: true } satisfies BodyTag,
+  });
 }
 
 export function removePlayerBody(gw: GameWorld, idx: number): void {

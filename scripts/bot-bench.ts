@@ -10,7 +10,12 @@
 
 import { BOT_FILL, TICK_RATE } from "../src/shared/constants.js";
 import { CURATED_MAP_SEEDS, heightAt, initMap, MAP, ZONES } from "../src/shared/map.js";
-import { BotNav, initBotNav, type BotNavPoint } from "../src/server/botNav.js";
+import {
+  BotNav,
+  BOT_NAV_WAYPOINT_RADIUS,
+  initBotNav,
+  type BotNavPoint,
+} from "../src/server/botNav.js";
 import {
   aimDirection,
   destroyGameWorld,
@@ -72,6 +77,7 @@ interface Counters {
   losChecks: number;
   raycasts: number;
   stuckChecks: number;
+  stuckEvents: number;
 }
 
 interface Sample {
@@ -86,6 +92,7 @@ interface Sample {
   losChecksPerTick: number;
   raycastsPerTick: number;
   stuckChecksPerTick: number;
+  stuckEventsPerTick: number;
   destroyedPanels: number;
   builtPanels: number;
   grenades: number;
@@ -178,9 +185,10 @@ function botSteerDestination(
 ): { x: number; y: number; z: number } {
   const nav = navForBots();
   if (nav) {
+    const navVersion = nav.sync(sim);
     const targetShift = Math.hypot(b.pathTargetX - b.wanderX, b.pathTargetZ - b.wanderZ);
     const shouldRetryMissingPath = b.path.length === 0 && sim.tick >= b.pathRefreshAtTick;
-    if (shouldRetryMissingPath || b.pathVersion !== nav.version || targetShift > 1.2) {
+    if (shouldRetryMissingPath || b.pathVersion !== navVersion || targetShift > 1.2) {
       const route = nav.findRoute(sim, [x, y, z], [b.wanderX, b.wanderY, b.wanderZ]);
       b.path = route ?? [];
       b.pathIdx = b.path.length > 1 ? 1 : 0;
@@ -189,16 +197,17 @@ function botSteerDestination(
       b.pathTargetZ = b.wanderZ;
       b.pathRefreshAtTick =
         b.path.length > 0 ? Number.MAX_SAFE_INTEGER : sim.tick + 90 + Math.floor(rng() * 90);
-      b.pathVersion = nav.version;
+      b.pathVersion = navVersion;
     }
     while (b.pathIdx < b.path.length - 1) {
       const point = b.path[b.pathIdx];
-      if (Math.hypot(point[0] - x, point[2] - z) >= 1.05) break;
+      if (Math.hypot(point[0] - x, point[2] - z) >= BOT_NAV_WAYPOINT_RADIUS) break;
       b.pathIdx++;
     }
     const point = b.path[b.pathIdx];
     if (point) {
-      return { x: point[0] - x, y: point[1], z: point[2] - z };
+      const steer = nav.steer(sim, [x, y, z], point[0] - x, point[2] - z, b.strafeSign);
+      return { x: steer.x, y: point[1], z: steer.z };
     }
   }
   return { x: b.wanderX - x, y: b.wanderY, z: b.wanderZ - z };
@@ -334,16 +343,26 @@ function updateBotDecision(sim: GameSim, p: SimPlayer, b: BotBrain, counters: Co
     counters.stuckChecks++;
     const moved = Math.hypot(s.x - b.stuckX, s.z - b.stuckZ);
     if (moved < 0.5 && !p.dead && (moveX !== 0 || moveZ !== 0)) {
-      const dir = aimDirection(b.aimYaw, 0);
+      counters.stuckEvents++;
+      const moveYaw = Math.atan2(moveX, moveZ);
+      const dir = aimDirection(moveYaw, 0);
       counters.raycasts++;
       const ahead = sim.gw.world.castRay(
         [eye[0], eye[1] - 0.5, eye[2]],
         [dir[0] * 1.8, 0, dir[2] * 1.8],
       );
       const tag = (ahead?.body?.userData ?? {}) as { panelId?: number; slabIdx?: number };
-      if (tag.panelId !== undefined || tag.slabIdx !== undefined) melee = true;
-      else jump = true;
-      if (rng() < 0.3) b.repathAtTick = 0;
+      if (tag.panelId !== undefined || tag.slabIdx !== undefined) {
+        b.strafeSign *= -1;
+        b.strafeFlipAt = tick + 30;
+      } else {
+        jump = true;
+      }
+      b.path = [];
+      b.pathIdx = 0;
+      b.pathRefreshAtTick = 0;
+      b.pathVersion = 0;
+      b.repathAtTick = 0;
     }
     b.stuckX = s.x;
     b.stuckZ = s.z;
@@ -419,6 +438,12 @@ function refreshCombatIntent(sim: GameSim, p: SimPlayer, b: BotBrain): void {
     b.moveX -= nx * 0.8;
     b.moveZ -= nz * 0.8;
   }
+  const nav = navForBots();
+  if (nav) {
+    const steer = nav.steer(sim, [p.state.x, p.state.y, p.state.z], b.moveX, b.moveZ, b.strafeSign);
+    b.moveX = steer.x;
+    b.moveZ = steer.z;
+  }
 }
 
 function initialBotStuckCheckTick(sim: GameSim, slot: number): number {
@@ -459,7 +484,7 @@ async function runSample(sample: number): Promise<Sample> {
   }
   if (scenario === "skirmish") placeSkirmish(sim, players);
 
-  const counters: Counters = { losChecks: 0, raycasts: 0, stuckChecks: 0 };
+  const counters: Counters = { losChecks: 0, raycasts: 0, stuckChecks: 0, stuckEvents: 0 };
   let inputBotsMs = 0;
   let physicsMs = 0;
   let totalMs = 0;
@@ -490,6 +515,7 @@ async function runSample(sample: number): Promise<Sample> {
   counters.losChecks = 0;
   counters.raycasts = 0;
   counters.stuckChecks = 0;
+  counters.stuckEvents = 0;
   for (let i = 0; i < measuredTicks; i++) runTick(true);
   let kills = 0;
   let deaths = 0;
@@ -511,6 +537,7 @@ async function runSample(sample: number): Promise<Sample> {
     losChecksPerTick: counters.losChecks / measuredTicks,
     raycastsPerTick: counters.raycasts / measuredTicks,
     stuckChecksPerTick: counters.stuckChecks / measuredTicks,
+    stuckEventsPerTick: counters.stuckEvents / measuredTicks,
     destroyedPanels: sim.destroyedPanels.size,
     builtPanels: sim.builtPanels.size,
     grenades: sim.grenades.length,
@@ -550,7 +577,7 @@ for (let i = 0; i < samples; i++) {
     `sample ${sample.sample}: tick=${sample.avgTickMs.toFixed(3)}ms ` +
       `input+bots=${sample.avgInputBotsMs.toFixed(3)}ms physics=${sample.avgPhysicsMs.toFixed(3)}ms ` +
       `los=${sample.losChecksPerTick.toFixed(2)}/tick rays=${sample.raycastsPerTick.toFixed(2)}/tick ` +
-      `kills=${sample.kills}`,
+      `stuck=${sample.stuckEventsPerTick.toFixed(3)}/tick kills=${sample.kills}`,
   );
 }
 
@@ -566,6 +593,7 @@ const summary = {
   medianAvgPhysicsMs: median(results.map((r) => r.avgPhysicsMs)),
   medianLosChecksPerTick: median(results.map((r) => r.losChecksPerTick)),
   medianRaycastsPerTick: median(results.map((r) => r.raycastsPerTick)),
+  medianStuckEventsPerTick: median(results.map((r) => r.stuckEventsPerTick)),
   medianKills: median(results.map((r) => r.kills)),
   medianDeaths: median(results.map((r) => r.deaths)),
   worstTickMs: Math.max(...results.map((r) => r.worstTickMs)),

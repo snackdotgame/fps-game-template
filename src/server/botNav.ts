@@ -1,19 +1,23 @@
-import { heightAt, MAP, PLAY_HALF } from "../shared/map.js";
-import { mergeSlabBoxes, PLAYER_HEIGHT, PLAYER_RADIUS } from "../shared/physics.js";
+import { heightAt, MAP, mapSeed, type PanelDef, PLAY_HALF } from "../shared/map.js";
+import { PLAYER_HEIGHT, PLAYER_RADIUS } from "../shared/physics.js";
 import { type GameSim } from "../shared/sim.js";
 
 export type BotNavPoint = [number, number, number];
 
 // Recast produced good paths, but its multi-megabyte WASM runtime and full
 // tiled-navmesh build sat directly on the server's cold-start path. This
-// coarse deterministic grid captures what these bots need (route around
-// buildings and steep terrain) without delaying the first player welcome.
-const CELL = 6;
+// deterministic clearance grid stays lightweight while resolving authored
+// doors, wall corners, and the terrain around buildings accurately enough for
+// a player-sized capsule.
+const CELL = 2;
 const GRID_MIN = -PLAY_HALF;
 const GRID_SIZE = Math.ceil((PLAY_HALF * 2) / CELL);
 const GRID_COUNT = GRID_SIZE * GRID_SIZE;
 const MAX_TERRAIN_STEP = 1.5;
-const SEARCH_LIMIT = Math.min(GRID_COUNT, 1024);
+const SEARCH_LIMIT = Math.min(GRID_COUNT, 10_000);
+const CLEARANCE = PLAYER_RADIUS + 0.18;
+const STEER_LOOKAHEAD = 3.2;
+export const BOT_NAV_WAYPOINT_RADIUS = 0.8;
 const CARDINALS: ReadonlyArray<readonly [number, number]> = [
   [-1, 0],
   [1, 0],
@@ -35,7 +39,13 @@ export async function initBotNav(): Promise<void> {}
 export class BotNav {
   private walkable: Uint8Array | null = null;
   private heights: Float32Array | null = null;
+  private blockers: Uint16Array | null = null;
+  private readonly knownDestroyed = new Set<number>();
+  private readonly knownBuilt = new Map<number, PanelDef>();
   private versionValue = 0;
+  private sourceRevision = -1;
+  private sourceMapSeed = -1;
+  private sourceGeneration = -1;
 
   get version(): number {
     return this.versionValue;
@@ -43,6 +53,11 @@ export class BotNav {
 
   warm(sim: GameSim): void {
     this.ensureGrid(sim);
+  }
+
+  sync(sim: GameSim): number {
+    this.ensureGrid(sim);
+    return this.versionValue;
   }
 
   findRoute(
@@ -81,9 +96,19 @@ export class BotNav {
         if (nx < 0 || nx >= GRID_SIZE || nz < 0 || nz >= GRID_SIZE) continue;
         const next = nz * GRID_SIZE + nx;
         if (!walkable[next] || closed[next]) continue;
+        if (!canStep(heights, current, next)) continue;
         // Do not squeeze diagonally through two blocked corners.
         if (dx !== 0 && dz !== 0) {
-          if (!walkable[cz * GRID_SIZE + nx] || !walkable[nz * GRID_SIZE + cx]) continue;
+          const sideX = cz * GRID_SIZE + nx;
+          const sideZ = nz * GRID_SIZE + cx;
+          if (
+            !walkable[sideX] ||
+            !walkable[sideZ] ||
+            !canStep(heights, current, sideX) ||
+            !canStep(heights, current, sideZ)
+          ) {
+            continue;
+          }
         }
         const planar = dx === 0 || dz === 0 ? 1 : Math.SQRT2;
         const rise = Math.abs(heights[next] - heights[current]);
@@ -95,6 +120,37 @@ export class BotNav {
       }
     }
     return null;
+  }
+
+  // Keep short-horizon movement out of walls even when a visible enemy makes
+  // the combat brain strafe instead of following a long objective route.
+  // Candidate directions are deterministic and bounded; no per-tick A* is
+  // needed for ordinary corner avoidance.
+  steer(
+    sim: GameSim,
+    position: readonly [number, number, number],
+    desiredX: number,
+    desiredZ: number,
+    sidePreference: number,
+  ): { x: number; z: number } {
+    this.ensureGrid(sim);
+    const magnitude = Math.hypot(desiredX, desiredZ);
+    if (magnitude < 1e-5) return { x: 0, z: 0 };
+    const nx = desiredX / magnitude;
+    const nz = desiredZ / magnitude;
+    const side = sidePreference < 0 ? -1 : 1;
+    const turns = [0, side, -side, side * 2, -side * 2, side * 3, -side * 3, 4];
+    for (const turn of turns) {
+      const angle = turn * (Math.PI / 4);
+      const cos = Math.cos(angle);
+      const sin = Math.sin(angle);
+      const x = nx * cos - nz * sin;
+      const z = nx * sin + nz * cos;
+      if (this.canAdvance(position[0], position[2], x, z, STEER_LOOKAHEAD)) {
+        return { x: x * magnitude, z: z * magnitude };
+      }
+    }
+    return { x: 0, z: 0 };
   }
 
   randomPoint(sim: GameSim, rng: () => number): BotNavPoint | null {
@@ -110,67 +166,132 @@ export class BotNav {
   }
 
   private ensureGrid(sim: GameSim): void {
-    if (this.walkable) return;
+    if (
+      this.walkable &&
+      (this.sourceMapSeed !== mapSeed() || this.sourceGeneration !== sim.navGeneration)
+    ) {
+      this.walkable = null;
+      this.heights = null;
+      this.blockers = null;
+      this.knownDestroyed.clear();
+      this.knownBuilt.clear();
+    }
+    if (!this.walkable) {
+      this.buildInitialGrid(sim);
+      return;
+    }
+    if (this.sourceRevision === sim.navRevision) return;
+    this.syncTopology(sim);
+  }
+
+  private buildInitialGrid(sim: GameSim): void {
     const heights = new Float32Array(GRID_COUNT);
     const walkable = new Uint8Array(GRID_COUNT);
+    const blockers = new Uint16Array(GRID_COUNT);
     walkable.fill(1);
     for (let cell = 0; cell < GRID_COUNT; cell++) {
       const { x, z } = cellCenter(cell);
       heights[cell] = heightAt(x, z);
     }
-
-    // Reject terrain cells with a cliff-height edge. The character controller
-    // can handle ordinary hills and the bot brain already jumps small ledges.
-    for (let cell = 0; cell < GRID_COUNT; cell++) {
-      const cx = cell % GRID_SIZE;
-      const cz = Math.floor(cell / GRID_SIZE);
-      for (const [dx, dz] of CARDINALS) {
-        const nx = cx + dx;
-        const nz = cz + dz;
-        if (nx < 0 || nx >= GRID_SIZE || nz < 0 || nz >= GRID_SIZE) continue;
-        const next = nz * GRID_SIZE + nx;
-        if (Math.abs(heights[next] - heights[cell]) > MAX_TERRAIN_STEP) {
-          walkable[cell] = 0;
-          break;
-        }
-      }
-    }
+    this.heights = heights;
+    this.walkable = walkable;
+    this.blockers = blockers;
+    this.knownDestroyed.clear();
+    this.knownBuilt.clear();
 
     for (const box of MAP.statics) {
-      blockBox(
-        walkable,
-        heights,
+      this.adjustBox(
         box.x - box.w / 2,
         box.x + box.w / 2,
         box.y - box.h / 2,
         box.y + box.h / 2,
         box.z - box.d / 2,
         box.z + box.d / 2,
+        1,
       );
     }
-    const alive = (pieceId: number): boolean => !sim.destroyedPanels.has(pieceId);
-    for (const slab of MAP.slabs) {
-      const pieces = MAP.panels.slice(slab.first - 1, slab.last);
-      for (const box of mergeSlabBoxes(pieces, alive)) {
-        blockBox(walkable, heights, box.x0, box.x1, box.y0, box.y1, box.z0, box.z1);
-      }
+    for (const panel of MAP.panels) this.adjustPanel(panel, 1);
+    for (const panelId of sim.destroyedPanels) {
+      const panel = MAP.panels[panelId - 1];
+      if (panel?.id === panelId) this.adjustPanel(panel, -1);
+      this.knownDestroyed.add(panelId);
     }
     for (const panel of sim.builtPanels.values()) {
-      blockBox(
-        walkable,
-        heights,
-        panel.x - panel.ex / 2,
-        panel.x + panel.ex / 2,
-        panel.y - panel.ey / 2,
-        panel.y + panel.ey / 2,
-        panel.z - panel.ez / 2,
-        panel.z + panel.ez / 2,
-      );
+      this.adjustPanel(panel, 1);
+      this.knownBuilt.set(panel.id, panel);
     }
-
-    this.heights = heights;
-    this.walkable = walkable;
+    this.sourceRevision = sim.navRevision;
+    this.sourceMapSeed = mapSeed();
+    this.sourceGeneration = sim.navGeneration;
     this.versionValue++;
+  }
+
+  private syncTopology(sim: GameSim): void {
+    for (const panelId of sim.destroyedPanels) {
+      if (this.knownDestroyed.has(panelId)) continue;
+      this.knownDestroyed.add(panelId);
+      const panel = MAP.panels[panelId - 1];
+      if (panel?.id === panelId) this.adjustPanel(panel, -1);
+    }
+    for (const [panelId, panel] of this.knownBuilt) {
+      if (sim.builtPanels.has(panelId)) continue;
+      this.adjustPanel(panel, -1);
+      this.knownBuilt.delete(panelId);
+    }
+    for (const [panelId, panel] of sim.builtPanels) {
+      if (this.knownBuilt.has(panelId)) continue;
+      this.adjustPanel(panel, 1);
+      this.knownBuilt.set(panelId, panel);
+    }
+    this.sourceRevision = sim.navRevision;
+    this.versionValue++;
+  }
+
+  private adjustPanel(panel: PanelDef, delta: 1 | -1): void {
+    const half = rotatedHorizontalHalfExtents(panel);
+    this.adjustBox(
+      panel.x - half.x,
+      panel.x + half.x,
+      panel.y - half.y,
+      panel.y + half.y,
+      panel.z - half.z,
+      panel.z + half.z,
+      delta,
+    );
+  }
+
+  private adjustBox(
+    x0: number,
+    x1: number,
+    y0: number,
+    y1: number,
+    z0: number,
+    z1: number,
+    delta: 1 | -1,
+  ): void {
+    adjustBox(this.blockers!, this.walkable!, this.heights!, x0, x1, y0, y1, z0, z1, delta);
+  }
+
+  private canAdvance(x: number, z: number, dirX: number, dirZ: number, length: number): boolean {
+    const walkable = this.walkable!;
+    const heights = this.heights!;
+    const start = pointCell(x, z);
+    let previous = start;
+    const samples = Math.ceil(length / (CELL * 0.45));
+    for (let sample = 1; sample <= samples; sample++) {
+      const distance = (length * sample) / samples;
+      const px = x + dirX * distance;
+      const pz = z + dirZ * distance;
+      if (px < GRID_MIN || pz < GRID_MIN || px >= PLAY_HALF || pz >= PLAY_HALF) return false;
+      const cell = pointCell(px, pz);
+      // A bot can start in a cell newly blocked by built cover; permit motion
+      // within that cell so it can escape, but require every entered cell to
+      // have capsule clearance.
+      if (cell !== start && !walkable[cell]) return false;
+      if (cell !== previous && !canStep(heights, previous, cell)) return false;
+      previous = cell;
+    }
+    return true;
   }
 }
 
@@ -210,7 +331,8 @@ function nearestWalkable(walkable: Uint8Array, origin: number): number {
   return -1;
 }
 
-function blockBox(
+function adjustBox(
+  blockers: Uint16Array,
   walkable: Uint8Array,
   heights: Float32Array,
   x0: number,
@@ -219,21 +341,73 @@ function blockBox(
   y1: number,
   z0: number,
   z1: number,
+  delta: 1 | -1,
 ): void {
-  const padding = PLAYER_RADIUS + 0.25;
-  const minX = Math.max(0, Math.floor((x0 - padding - GRID_MIN) / CELL));
-  const maxX = Math.min(GRID_SIZE - 1, Math.floor((x1 + padding - GRID_MIN) / CELL));
-  const minZ = Math.max(0, Math.floor((z0 - padding - GRID_MIN) / CELL));
-  const maxZ = Math.min(GRID_SIZE - 1, Math.floor((z1 + padding - GRID_MIN) / CELL));
+  const minWorldX = x0 - CLEARANCE;
+  const maxWorldX = x1 + CLEARANCE;
+  const minWorldZ = z0 - CLEARANCE;
+  const maxWorldZ = z1 + CLEARANCE;
+  const minX = Math.max(0, Math.floor((minWorldX - GRID_MIN) / CELL));
+  const maxX = Math.min(GRID_SIZE - 1, Math.floor((maxWorldX - GRID_MIN) / CELL));
+  const minZ = Math.max(0, Math.floor((minWorldZ - GRID_MIN) / CELL));
+  const maxZ = Math.min(GRID_SIZE - 1, Math.floor((maxWorldZ - GRID_MIN) / CELL));
   for (let z = minZ; z <= maxZ; z++) {
     for (let x = minX; x <= maxX; x++) {
       const cell = z * GRID_SIZE + x;
       const ground = heights[cell];
+      const centerX = GRID_MIN + (x + 0.5) * CELL;
+      const centerZ = GRID_MIN + (z + 0.5) * CELL;
       // Low floor/step boxes and overhead roofs are traversable; walls and
       // other geometry intersecting the character capsule are not.
-      if (y1 > ground + 0.35 && y0 < ground + PLAYER_HEIGHT) walkable[cell] = 0;
+      if (
+        centerX >= minWorldX &&
+        centerX <= maxWorldX &&
+        centerZ >= minWorldZ &&
+        centerZ <= maxWorldZ &&
+        y1 > ground + 0.35 &&
+        y0 < ground + PLAYER_HEIGHT
+      ) {
+        const count = blockers[cell];
+        blockers[cell] = delta > 0 ? Math.min(0xffff, count + 1) : Math.max(0, count - 1);
+        walkable[cell] = blockers[cell] === 0 ? 1 : 0;
+      }
     }
   }
+}
+
+function rotatedHorizontalHalfExtents(panel: PanelDef): { x: number; y: number; z: number } {
+  const hx = panel.ex / 2;
+  const hy = panel.ey / 2;
+  const hz = panel.ez / 2;
+  if (!panel.rot) return { x: hx, y: hy, z: hz };
+  const [qx, qy, qz, qw] = panel.rot;
+  const xx = qx * qx;
+  const yy = qy * qy;
+  const zz = qz * qz;
+  const xy = qx * qy;
+  const xz = qx * qz;
+  const yz = qy * qz;
+  const wx = qw * qx;
+  const wy = qw * qy;
+  const wz = qw * qz;
+  const m00 = 1 - 2 * (yy + zz);
+  const m01 = 2 * (xy - wz);
+  const m02 = 2 * (xz + wy);
+  const m10 = 2 * (xy + wz);
+  const m11 = 1 - 2 * (xx + zz);
+  const m12 = 2 * (yz - wx);
+  const m20 = 2 * (xz - wy);
+  const m21 = 2 * (yz + wx);
+  const m22 = 1 - 2 * (xx + yy);
+  return {
+    x: Math.abs(m00) * hx + Math.abs(m01) * hy + Math.abs(m02) * hz,
+    y: Math.abs(m10) * hx + Math.abs(m11) * hy + Math.abs(m12) * hz,
+    z: Math.abs(m20) * hx + Math.abs(m21) * hy + Math.abs(m22) * hz,
+  };
+}
+
+function canStep(heights: Float32Array, from: number, to: number): boolean {
+  return Math.abs(heights[to] - heights[from]) <= MAX_TERRAIN_STEP;
 }
 
 function heuristic(from: number, to: number): number {
