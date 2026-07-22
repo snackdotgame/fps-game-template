@@ -12,12 +12,11 @@
 import {
   BLEED_INTERVAL_TICKS,
   EXPLOSION_IMPULSE,
-  EXPLOSION_MAX_DAMAGE,
-  EXPLOSION_MIN_DAMAGE,
   EXPLOSION_PANEL_OUTER_DAMAGE,
   EXPLOSION_PANEL_OUTER_RADIUS,
   EXPLOSION_PANEL_RADIUS,
   EXPLOSION_RADIUS,
+  explosionPlayerDamage,
   GRENADE_FUSE_TICKS,
   HEADSHOT_HEIGHT,
   MAX_HP,
@@ -996,15 +995,14 @@ export class GameSim {
       const dz = p.state.z - at[2];
       const dist = Math.hypot(dx, dy, dz);
       if (dist > EXPLOSION_RADIUS) continue;
-      const falloff = 1 - dist / EXPLOSION_RADIUS;
+      const impulseFalloff = 1 - dist / EXPLOSION_RADIUS;
       const friendly = owner !== null && p.team === owner.team && p.idx !== ownerIdx;
       if (!friendly && owner) {
-        const dmg = EXPLOSION_MIN_DAMAGE + (EXPLOSION_MAX_DAMAGE - EXPLOSION_MIN_DAMAGE) * falloff;
-        this.damagePlayer(p, Math.round(dmg), owner, "grenade");
+        this.damagePlayer(p, Math.round(explosionPlayerDamage(dist)), owner, "grenade");
       }
       if (!p.dead) {
         const n = dist > 0.01 ? 1 / dist : 0;
-        const kick = EXPLOSION_IMPULSE * falloff;
+        const kick = EXPLOSION_IMPULSE * impulseFalloff;
         p.body.setLinearVelocity(
           p.state.vx + dx * n * kick,
           p.state.vy + Math.max(3, dy * n * kick + 4),

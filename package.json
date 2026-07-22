@@ -17,6 +17,7 @@
     "test:char-sync": "esbuild scripts/char-controller-sync-test.ts --bundle --format=esm --platform=node --external:jolt-ts --external:module --outfile=node_modules/.cache/cc-sync-test.mjs && node node_modules/.cache/cc-sync-test.mjs",
     "test:reconcile": "esbuild scripts/movement-reconcile-test.ts --bundle --format=esm --platform=node --external:jolt-ts --external:jolt-ts/* --external:module --outfile=node_modules/.cache/reconcile-test.mjs && node node_modules/.cache/reconcile-test.mjs",
     "test:controller": "esbuild scripts/controller-feel-test.ts --bundle --format=esm --platform=node --external:jolt-ts --external:jolt-ts/* --external:module --outfile=node_modules/.cache/controller-feel-test.mjs && node node_modules/.cache/controller-feel-test.mjs",
+    "test:grenade": "esbuild scripts/grenade-balance-test.ts --bundle --format=esm --platform=node --outfile=node_modules/.cache/grenade-balance-test.mjs && node node_modules/.cache/grenade-balance-test.mjs",
     "test:bot-nav": "esbuild scripts/bot-nav-test.ts --bundle --format=esm --platform=browser --external:module --outfile=node_modules/.cache/bot-nav-test.mjs && node node_modules/.cache/bot-nav-test.mjs",
     "test:map-boot": "esbuild scripts/map-boot-bench.ts --bundle --format=esm --platform=node --outfile=node_modules/.cache/map-boot-bench.mjs && node node_modules/.cache/map-boot-bench.mjs",
     "test:map-seeds": "esbuild scripts/verify-map-seeds.ts --bundle --format=esm --platform=node --outfile=node_modules/.cache/verify-map-seeds.mjs && node node_modules/.cache/verify-map-seeds.mjs",
