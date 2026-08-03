@@ -37,6 +37,11 @@ const TOUCH_TOL = 0.14;
 // Foliage is supposed to be up in the air; this only ever applies to the
 // LOWEST piece of an entity, which should be resting on something.
 const GROUND_TOL = 0.35;
+// Clear floor a staircase must leave at its foot, its head, and alongside it.
+// The character is 0.7m wide, so anything under this is a wall to squeeze past
+// rather than a landing to stand on.
+const STAIR_CLEAR = 0.6;
+const WALL_T = 0.3; // nominal masonry thickness, for measuring interior space
 
 interface Finding {
   seed: number;
@@ -259,6 +264,32 @@ for (const seed of CURATED_MAP_SEEDS) {
         `${loose.length}/${ps.length} pieces (${frac}%) detached [${mats}], ` +
           `worst gap ${near.toFixed(2)}m`,
       );
+    }
+
+    // Stairs you can actually use. A flight is laid out from the footprint, so
+    // shrinking a building silently pushes its treads out through the back wall
+    // and leaves nothing to stand on at the top — which is exactly what
+    // happened to the tower when it went from 7m square to 5.2m.
+    const treads = ps.filter((q) => q.material === "stair");
+    if (treads.length > 0) {
+      let sz0 = Infinity;
+      let sz1 = -Infinity;
+      let sx1 = -Infinity;
+      for (const t of treads) {
+        sz0 = Math.min(sz0, t.z - t.ez / 2);
+        sz1 = Math.max(sz1, t.z + t.ez / 2);
+        sx1 = Math.max(sx1, t.x + t.ex / 2);
+      }
+      const foot = sz0 - (b.cz - b.d / 2 + WALL_T);
+      const head = b.cz + b.d / 2 - WALL_T - sz1;
+      const beside = b.cx + b.w / 2 - WALL_T - sx1;
+      const tight = Math.min(foot, head, beside);
+      if (tight < STAIR_CLEAR) {
+        note(
+          `stairs have ${tight.toFixed(2)}m clear (need ${STAIR_CLEAR}m): ` +
+            `foot ${foot.toFixed(2)}m, head ${head.toFixed(2)}m, beside ${beside.toFixed(2)}m`,
+        );
+      }
     }
   }
 
