@@ -45,6 +45,7 @@ export interface StaticBox {
 
 export type PanelMaterial =
   | "brick" // clay brick in a running-bond wall
+  | "adobe" // sun-dried mud block: big, thick, soft — arid vernacular
   | "log" // stacked cabin log
   | "plank" // roof plank
   | "post" // structural timber corner post (tough)
@@ -58,6 +59,8 @@ export type PanelMaterial =
   | "rubble" // chunk left behind by a destroyed piece (spawned at runtime)
   | "metal" // deployed cover sheet (built at runtime)
   | "stone" // flagstone floor slab
+  | "frond" // one big palm leaf: a folded, tapered blade on its own bearing
+  | "bough" // one conifer tier: a skirt of needles, cone-shaped
   | "stair"; // staircase tread — effectively indestructible so floors stay reachable
 
 export interface PanelDef {
@@ -79,6 +82,12 @@ export interface PanelDef {
   // Palette seed for runtime pieces: a fallen brick keeps the color it had
   // on the wall (its original id), whatever runtime id it ends up with.
   seed?: number;
+  // Render-scale override for pieces whose MESH is not the shape of their box.
+  // A palm frond is a long blade pointing off on some diagonal bearing: its
+  // mesh is scaled by `vis` and turned by `rot`, while ex/ey/ez stay the
+  // world-space bounds the collider needs — merged slab bodies and pieceAt()
+  // are AABB-only, so the box has to remain the honest one.
+  vis?: [number, number, number];
   // A broken-off fragment of a destroyed piece — renders with fractured
   // geometry (jagged break face) instead of the pristine shape.
   broken?: boolean;
@@ -87,6 +96,7 @@ export interface PanelDef {
 // Max HP per material. Rifle hits chip 10, sledge swings 50.
 export const PANEL_HP: Record<PanelMaterial, number> = {
   brick: 45,
+  adobe: 60, // soft material, but the blocks are three times a brick
   log: 70,
   plank: 30,
   post: 150,
@@ -100,12 +110,18 @@ export const PANEL_HP: Record<PanelMaterial, number> = {
   rubble: 40,
   metal: 120,
   stone: 140, // tough flagstone flooring
+  frond: 25, // a leaf: shoot it off in one burst
+  bough: 30, // as tough as any other foliage
   stair: 100000, // effectively indestructible (also blast-exempt in sim)
 };
 
 export interface BuildingDef {
   id: number;
   kind: "building" | "tree";
+  // Which generator produced this, for `npm run review:entities`. Purely
+  // descriptive — nothing in the sim or the client branches on it — but
+  // without it an audit can only say "some structure is broken".
+  sub?: string;
   cx: number;
   cz: number;
   w: number;
@@ -118,6 +134,11 @@ export interface BuildingDef {
 // Masonry units (full extents: length along the wall, height, thickness).
 export const WALL_HEIGHT = 2.5;
 export const BRICK = { l: 0.5, h: WALL_HEIGHT / 12, t: 0.24 };
+// Adobe blocks are cast, not fired: far bigger than a brick and much thicker,
+// so an arid wall reads as a handful of heavy slabs where a temperate one
+// reads as a thousand little ones. That also makes arid settlements cost a
+// fraction of the panels a brick one does, which is what lets them be dense.
+export const ADOBE = { l: 0.9, h: WALL_HEIGHT / 6, t: 0.42 };
 export const LOG = { l: 2.0, h: 0.25, t: 0.26 };
 export const PLANK = { l: 2.0, h: 0.07, w: 0.5 };
 export const SANDBAG = { l: 0.55, h: 0.32, t: 0.42 };
@@ -177,11 +198,15 @@ function hash2(ix: number, iz: number): number {
 
 // Independent named sub-seed per subsystem, so one consumer drawing more
 // random numbers never reshuffles another's output on a different seed.
-function subSeed(label: number): number {
-  let h = (SEED ^ Math.imul(label, 0x9e3779b9)) >>> 0;
+function subSeedOf(seed: number, label: number): number {
+  let h = (seed ^ Math.imul(label, 0x9e3779b9)) >>> 0;
   h = Math.imul(h ^ (h >>> 16), 0x85ebca6b) >>> 0;
   h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35) >>> 0;
   return (h ^ (h >>> 16)) >>> 0;
+}
+
+function subSeed(label: number): number {
+  return subSeedOf(SEED, label);
 }
 
 function smooth(t: number): number {
@@ -235,104 +260,326 @@ let HILLS: Array<[number, number, number, number]> = [];
 // Runtime maps rotate through seeds whose spawn-cover repair hills were
 // exhaustively ray-marched offline. Applying these few stamps is effectively
 // free; running the repair search on every client and server took 1-8 seconds.
-export const CURATED_MAP_SEEDS = [3549999080, 27918196, 2029103397, 3317136582] as const;
+export const CURATED_MAP_SEEDS = [
+  1839804969, // Temperate
+  2086861921, // Temperate (island)
+  2657719470, // Snowfield
+  3034562417, // Snowfield (island)
+  1932791302, // Desert
+  1896408263, // Desert (island)
+  3191924140, // Tropical
+  3673718844, // Tropical (island)
+  2410523286, // Savanna
+  3435063619, // Savanna (island)
+  1511932964, // Badlands
+] as const;
 const CURATED_SPAWN_REPAIRS: Readonly<
   Record<number, ReadonlyArray<readonly [number, number, number, number]>>
 > = {
-  3549999080: [
-    [37.887596, -80.755703, 11, 1.6],
-    [-37.625255, 80.809979, 11, 1.6],
-    [-36.03837, -84.103349, 17, 1.6],
-    [-21.156178, -82.78198, 17, 1.6],
-    [19.649196, -85.525656, 17, 1.6],
-    [-20.221121, 85.504208, 17, 1.6],
-    [43.053663, 88.017085, 11, 1.6],
-    [31.046212, -79.156003, 11, 1.6],
-    [-24.642188, 95.474152, 17, 1.6],
-    [22.060005, 97.096912, 17, 1.6],
-    [27.950592, -90.988571, 11, 1.6],
-    [-36.370034, -76.248344, 11, 1.6],
-    [-31.596949, 94.676549, 17, 1.6],
-    [35.922317, 87.661446, 11, 1.6],
-    [22.327805, -96.817699, 17, 1.6],
-    [-35.773721, 87.886593, 11, 1.6],
-    [28.909163, 92.499066, 17, 1.6],
-    [33.00637, 78.466737, 11, 1.6],
-    [-14.147477, 88.477117, 17, 1.6],
+  // Temperate
+  1839804969: [
+    [-20.931767, -94.784205, 17, 1.6],
+    [-39.20069, -80.078269, 17, 1.6],
+    [-20.73778, 83.013913, 17, 1.6],
+    [36.289664, 84.132136, 11, 1.6],
+    [-25.485246, 92.082611, 17, 1.6],
+    [-41.473956, 83.648762, 11, 1.6],
+    [23.567412, 94.944538, 17, 1.6],
+    [-42.537374, -89.358561, 11, 1.6],
+    [-33.603444, 81.628626, 12.488413, 2.973432],
+    [-59.807505, 65.673254, 17, 4.594723],
+    [16.182366, 98.608047, 17, 1.6],
+    [-43.412876, -73.2878, 17, 1.6],
+    [-32.405204, 89.490834, 17, 4.729806],
+    [19.259676, 86.693929, 17, 1.6],
+    [44.510322, 79.266336, 11, 1.6],
+    [-50.635256, 54.088328, 17, 2.627687],
+    [31.082379, 95.586081, 17, 1.6],
+    [-28.97615, 73.038468, 17, 5.4],
+    [44.420398, 86.669864, 17, 1.6],
+    [-24.383573, -85.116713, 11, 1.6],
+    [-32.532304, -76.302237, 11, 1.6],
+    [-31.334524, 65.351768, 17, 5.4],
+    [-15.399335, -87.898763, 17, 1.6],
+    [38.828078, 75.504299, 11, 1.6],
+    [-31.334524, 65.351768, 17, 1.6],
+    [-28.854688, -92.724028, 11, 1.6],
+    [-23.658778, 84.007049, 11, 1.6],
+    [-13.303825, 82.689479, 17, 1.6],
+    [-41.851, 78.559249, 17, 1.6],
+    [-16.379373, 83.959756, 17, 1.6],
+    [-21.260591, 79.576622, 17, 1.6],
+    [-33.894234, 81.672106, 17, 1.6],
+    [-28.184799, 69.326971, 17, 1.6],
+    [-25.065003, 93.63239, 17, 1.6],
+    [-41.851, 78.559249, 17, 1.6],
+    [-20.020815, 76.665476, 17, 1.6],
   ],
-  27918196: [
-    [-17.048371, 84.570464, 17, 1.6],
-    [38.041276, -81.35569, 11, 1.6],
-    [-37.537212, -75.128293, 11, 1.6],
-    [-24.77797, -92.432481, 17, 1.6],
-    [-38.578176, 78.672047, 17, 1.6],
-    [23.258218, 95.247278, 17, 1.6],
-    [-32.08, -88.72, 11, 1.6],
-    [21.527181, -85.332005, 17, 1.6],
-    [-23.212102, 92.859848, 17, 1.6],
-    [-37.158044, 86.53339, 17, 1.6],
-    [29.568178, 93.41295, 17, 1.6],
-    [36.484549, -90.008466, 11, 1.6],
-    [-30.325824, 77.852456, 11, 1.6],
-    [-41.197009, 72.211064, 17, 1.6],
-    [33.116829, 87.927596, 17, 1.6],
-    [-20.209322, -81.280779, 17, 1.6],
-    [-37.307946, -82.852281, 17, 1.6],
-    [24.873214, -93.110047, 11, 1.6],
-    [23.524717, 85.85846, 11, 1.6],
-    [-43.739442, -72.202656, 17, 2.007905],
-    [14.4745, -88.783627, 17, 1.6],
-    [46.254605, -85.683129, 17, 1.6],
+  // Temperate (island)
+  2086861921: [
+    [17.028347, -82.666986, 17, 1.6],
+    [-27.174082, -95.338376, 17, 1.6],
+    [20.750175, 95.324963, 17, 1.6],
+    [-21.185413, 83.845487, 17, 1.6],
+    [-22.628105, -86.323779, 17, 1.6],
+    [12.304286, -87.645398, 17, 1.6],
+    [20.292274, 83.048375, 17, 1.6],
+    [32.833193, -80.777648, 17, 1.6],
+    [-34.262773, -86.804669, 11, 1.6],
+    [14.794094, 87.715383, 17, 1.6],
+    [-36.114378, 79.376799, 11, 1.6],
+    [-11.77627, -88.845572, 17, 1.6],
+    [28.64635, 93.525971, 17, 1.6],
+    [49.639186, -39.805769, 17, 1.6],
+    [20.61401, -93.646071, 17, 1.6],
+    [-24.258412, -79.601201, 17, 1.6],
+    [40.06516, 80.770013, 17, 2.151012],
+    [27.72097, -72.342568, 17, 3.890309],
+    [45.291816, -45.09882, 17, 1.6],
+    [-15.143356, -74.026476, 17, 1.6],
+    [35.657577, 75.690494, 11, 1.952494],
+    [-1.913887, -84.312766, 17, 1.6],
+    [-36.334587, -94.658629, 17, 1.6],
+    [-21.388306, -98.640108, 17, 1.6],
+    [-26.709292, 92.19857, 11, 1.6],
+    [36.583633, 89.892653, 11, 1.6],
+    [-13.536267, -97.479591, 17, 1.6],
+    [-50.041364, -85.775958, 11, 2.246346],
+    [-40.594659, 89.973695, 11, 1.6],
+    [-14.31253, 88.253204, 17, 1.6],
   ],
-  2029103397: [
-    [20.158941, -83.176425, 17, 1.6],
-    [17.770196, 97.879308, 17, 1.6],
-    [-36.542968, 84.630215, 11, 1.6],
-    [-21.401357, 84.687785, 17, 1.6],
-    [12.248216, -89.099932, 17, 1.6],
-    [36.755376, 83.249954, 11, 1.6],
-    [-37.986003, -85.580639, 11, 1.6],
-    [40.326237, -78.578816, 11, 1.6],
-    [18.996268, -96.941396, 17, 1.6],
-    [23.893431, 95.359344, 17, 1.6],
-    [-28.373094, -93.289936, 11, 1.6],
-    [-47.524858, -86.243976, 11, 1.6],
-    [39.65055, -85.759949, 17, 1.6],
-    [27.952947, -94.579375, 17, 1.6],
-    [43.508631, 87.079062, 11, 1.6],
-    [-25.515998, 93.488949, 11, 1.6],
-    [22.842656, -77.022941, 17, 1.6],
-    [31.505614, 95.054883, 17, 1.6],
-    [-19.913664, -98.693251, 17, 1.6],
-    [-34.51221, -97.023094, 17, 1.6],
-    [40.288345, -71.055738, 13.261406, 3.157478],
-    [-43.431033, 91.400921, 11, 1.6],
-    [26.341435, 85.510536, 11, 1.6],
+  // Snowfield
+  2657719470: [
+    [23.529151, 93.502195, 17, 1.6],
+    [19.61838, -84.595801, 17, 1.6],
+    [-35.617634, 83.162025, 11, 1.6],
+    [-34.6223, -75.948874, 11, 1.6],
+    [14.510422, 98.038058, 17, 1.6],
+    [9.724441, -89.865684, 17, 1.6],
+    [-22.438222, 85.376326, 17, 1.6],
+    [-34.876895, 76.57103, 11, 1.6],
+    [24.594236, -93.667888, 17, 1.6],
+    [19.156577, 84.472749, 17, 1.6],
+    [-39.207618, 89.959324, 11, 1.6],
+    [-41.714768, -89.262697, 11, 1.6],
+    [9.022621, 89.55288, 17, 1.6],
+    [14.023498, -98.771733, 17, 1.6],
+    [30.053586, 95.282001, 17, 1.6],
+    [35.538827, -82.36739, 11, 1.6],
+    [38.50253, 85.592008, 17, 2.218845],
+    [34.201732, -91.440866, 17, 1.6],
+    [49.958496, -81.07035, 11, 1.6],
+    [-28.755806, 92.806799, 11, 1.6],
+    [22.09297, 78.214332, 17, 1.6],
+    [-24.870397, -93.078187, 11, 1.6],
+    [31.474489, 88.356951, 17, 1.6],
   ],
-  3317136582: [
-    [19.832847, 83.566821, 17, 1.6],
-    [-22.375351, -94.335992, 17, 1.6],
-    [-41.702238, -83.130451, 11, 1.6],
-    [-20.063034, 85.549405, 17, 1.6],
-    [11.714643, 88.323124, 17, 1.6],
-    [-20.720849, -82.383185, 17, 1.6],
-    [-29.161753, -92.581914, 17, 1.6],
-    [-24.594187, 94.517892, 17, 1.6],
-    [26.416571, 95.179817, 17, 1.6],
-    [-15.51124, -86.867977, 17, 1.6],
-    [-36.572666, -76.363217, 11, 2.253122],
-    [-37.794527, 86.507875, 17, 1.6],
-    [18.804671, 99.107647, 17, 1.6],
-    [39.230091, 77.750539, 17, 1.6],
-    [-42.567344, -90.235296, 17, 3.007877],
-    [20.310585, -85.373054, 17, 1.6],
-    [30.87389, 77.912542, 11, 1.6],
-    [25.637904, -94.155072, 17, 1.6],
-    [-39.543769, -69.906532, 14.601005, 3.47643],
-    [38.108138, -78.494187, 11, 1.6],
-    [32.418668, 89.120227, 11, 1.6],
-    [32.755996, -91.53359, 11, 1.6],
-    [-31.826055, 83.467635, 11, 1.6],
+  // Snowfield (island)
+  3034562417: [
+    [-24.392184, -95.174508, 17, 1.6],
+    [-21.428205, 84.156594, 17, 1.6],
+    [22.198672, 95.061133, 17, 1.6],
+    [-39.186382, -76.050702, 11, 1.6],
+    [-23.870653, 95.046166, 17, 1.6],
+    [35.829101, 82.438981, 17, 1.6],
+    [-45.502151, 81.714997, 11, 1.6],
+    [-20.638181, -84.742953, 17, 1.6],
+    [-31.527299, 76.897261, 17, 3.391507],
+    [35.959627, -77.509424, 11, 1.6],
+    [-31.468496, -92.858463, 11, 1.6],
+    [12.756576, -88.787473, 17, 1.6],
+    [20.317234, -87.991614, 17, 1.6],
+    [-41.71796, -90.696751, 11, 1.6],
+    [-33.48421, 96.745026, 17, 1.6],
+    [40.393308, -89.701301, 11, 1.6],
+    [-36.5484, 90.902071, 11, 1.6],
+  ],
+  // Desert
+  1932791302: [
+    [37.566807, 85.323143, 11, 1.6],
+    [-30.910123, 84.191773, 11, 1.6],
+    [-18.433504, 84.343888, 17, 1.6],
+    [22.633941, -89.482597, 11, 1.6],
+    [23.991033, 95.996485, 17, 1.6],
+    [12.06965, -90.595036, 17, 1.6],
+    [-38.275227, -78.424722, 11, 1.6],
+    [38.428039, -80.613755, 11, 1.6],
+    [45.896483, -85.951384, 17, 1.6],
+    [15.255413, 98.614975, 17, 1.6],
+    [-28.945594, 76.929197, 17, 1.6],
+    [-28.11555, 92.257737, 17, 1.6],
+    [20.794145, 87.784672, 17, 1.6],
+    [38.961625, -87.288145, 17, 1.6],
+    [28.510002, -93.998356, 11, 1.6],
+    [33.303323, 95.81163, 17, 1.6],
+    [13.492099, 88.239583, 17, 1.6],
+    [42.248376, 95.682642, 17, 1.769305],
+  ],
+  // Desert (island)
+  1896408263: [
+    [19.081113, -83.20838, 17, 1.6],
+    [-27.130816, -92.748111, 17, 1.6],
+    [18.831438, 83.149298, 17, 1.6],
+    [-28.340143, 83.07093, 11, 1.6],
+    [11.99741, -89.227547, 17, 1.6],
+    [-20.752788, -84.544755, 17, 1.6],
+    [10.453103, 89.101557, 17, 1.6],
+    [-40.309924, -82.178764, 17, 1.816306],
+    [18.632146, -97.016821, 17, 1.6],
+    [25.327587, 95.10229, 17, 1.6],
+    [37.028544, -81.243866, 17, 1.6],
+    [-13.645427, -86.303744, 17, 1.6],
+    [14.816591, 97.841337, 17, 1.6],
+    [34.524485, 92.458207, 17, 4.524535],
+    [27.656201, -93.859668, 17, 1.6],
+    [56.699016, -55.699007, 11, 2.149918],
+    [26.300151, 85.515162, 11, 2.313615],
+    [-22.388029, -77.580602, 17, 1.6],
+    [-19.79751, 83.537948, 17, 1.6],
+    [25.30938, -85.471871, 11, 2.20258],
+    [33.232735, 81.615009, 11, 2.40515],
+    [-33.723329, -77.404693, 11, 1.934384],
+    [13.883935, -102.108169, 17, 1.6],
+    [-34.358598, -89.500886, 17, 3.053341],
+    [41.951092, 89.153544, 17, 1.6],
+    [25.775293, -100.497082, 17, 1.6],
+    [36.516868, -91.423644, 11, 1.6],
+    [-35.914504, 82.067217, 11, 1.6],
+    [32.633828, 75.756454, 17, 2.04362],
+    [6.436827, 83.975939, 17, 1.6],
+    [49.864236, 84.056826, 17, 1.805409],
+    [36.304474, -77.410808, 11, 1.6],
+    [51.485341, 76.654844, 11, 1.745384],
+  ],
+  // Tropical
+  3191924140: [
+    [19.250968, -84.883965, 17, 1.6],
+    [-40.106534, -82.160176, 11, 1.6],
+    [40.580077, -85.736058, 17, 1.6],
+    [36.985729, 86.306972, 11, 1.6],
+    [16.277218, -98.256917, 17, 1.6],
+    [-27.874547, -93.305463, 11, 1.6],
+    [45.871145, 82.935575, 11, 1.6],
+    [-47.504234, -86.359935, 11, 1.6],
+    [10.91926, -89.932776, 17, 1.6],
+    [32.813494, -92.760425, 11, 1.6],
+    [24.141768, 95.536602, 17, 1.6],
+    [-40.005407, 88.759233, 11, 1.6],
+    [26.029868, -95.571221, 17, 1.6],
+    [12.831615, 98.568096, 17, 1.6],
+    [30.96358, -83.311909, 11, 2.13814],
+    [-36.424187, 76.313177, 11, 1.6],
+    [32.48626, 94.86743, 17, 1.6],
+    [29.444618, -75.493054, 17, 4.370546],
+    [-22.125546, -96.653793, 17, 1.6],
+    [-41.803632, -91.57301, 11, 1.6],
+    [-33.76, 93.2, 11, 1.6],
+  ],
+  // Tropical (island)
+  3673718844: [
+    [17.893584, 84.417715, 17, 1.6],
+    [-23.383335, -94.549313, 17, 1.6],
+    [19.484134, -83.973251, 17, 1.6],
+    [-20.86332, 83.472604, 17, 1.6],
+    [10.827433, 88.839227, 17, 1.6],
+    [-38.676727, -81.919769, 17, 1.6],
+    [-24.012666, 93.709933, 17, 1.6],
+    [24.583773, -93.817278, 17, 1.6],
+    [16.009973, 97.448902, 17, 1.6],
+    [-19.8183, -83.480033, 17, 1.6],
+    [-38.231618, 78.249599, 11, 1.6],
+    [37.029112, -80.193633, 11, 1.6],
+    [24.785789, 95.673495, 17, 1.6],
+    [-13.597011, -85.407972, 17, 1.6],
+    [-64.548153, -44.617288, 11, 1.6],
+    [40.866157, -86.745666, 11, 1.6],
+    [22.625961, 78.926022, 17, 1.625853],
+    [31.592078, 94.346273, 17, 1.6],
+    [-36.456723, -74.922793, 13.145236, 3.129818],
+    [-39.329874, 85.925233, 17, 1.6],
+    [23.01772, 78.743484, 17, 2.544347],
+    [36.779633, 85.676308, 11, 1.6],
+    [-32.746572, -91.676874, 11, 1.6],
+    [-43.653321, -75.402086, 17, 1.6],
+    [33.718787, 79.24669, 11, 2.08769],
+  ],
+  // Savanna
+  2410523286: [
+    [19.524275, -83.025052, 17, 1.6],
+    [-24.952557, -95.681848, 17, 1.6],
+    [36.370438, 82.703723, 11, 1.6],
+    [23.28021, 95.55275, 17, 1.6],
+    [11.886716, -88.78076, 17, 1.6],
+    [-20.232606, -86.448253, 17, 1.6],
+    [-32.287386, -93.619622, 17, 1.6],
+    [-44.128292, -81.315581, 17, 1.6],
+    [17.485265, -96.885702, 17, 1.6],
+    [-36.969983, -87.373901, 17, 1.6],
+    [38.908839, -78.344119, 17, 1.6],
+    [15.566113, 98.664431, 17, 1.6],
+    [35.825415, -84.338221, 17, 1.6],
+    [-42.691535, -71.254442, 17, 3.313216],
+    [-23.196589, -79.531359, 17, 1.6],
+    [31.412969, 95.446617, 17, 1.6],
+    [24.295044, -95.786686, 17, 1.6],
+    [30.463042, -78.294706, 11, 1.674256],
+    [20.35275, 86.808616, 17, 1.6],
+    [35.422038, 75.959874, 11, 1.6],
+    [37.025479, 89.28694, 11, 1.6],
+    [-31.039073, -77.196803, 17, 1.6],
+    [-51.695723, -82.59538, 17, 2.601481],
+    [-67.681045, -65.550487, 11, 2.371757],
+    [-31.227095, -84.061121, 13.846676, 3.296828],
+    [29.84, -92.08, 11, 1.6],
+    [-36.855168, -70.782387, 17, 1.730386],
+    [-25.514291, -92.847405, 17, 1.6],
+    [-26.777392, -92.143382, 17, 1.6],
+    [-26.777392, -92.143382, 17, 1.6],
+    [-26.777392, -92.143382, 17, 1.6],
+    [-25.514291, -92.847405, 17, 1.6],
+    [-33.76524, -88.248516, 17, 1.6],
+    [-44.247012, -82.406216, 17, 1.6],
+    [-17.065966, -99.23001, 17, 1.6],
+    [-15.270005, -88.560008, 17, 1.6],
+    [-21.941956, -84.390039, 17, 1.6],
+    [-50.879898, -81.634045, 17, 1.6],
+  ],
+  // Savanna (island)
+  3435063619: [
+    [17.9344, -83.332229, 17, 1.6],
+    [-21.531711, 85.083555, 17, 1.6],
+    [-37.002056, 79.024345, 11, 1.6],
+    [28.657654, 90.978404, 11, 1.6],
+    [11.74651, -88.649864, 17, 1.6],
+    [39.348967, -83.175157, 17, 1.6],
+    [28.499928, -91.44446, 11, 1.6],
+    [21.223331, -98.128495, 17, 1.6],
+    [29.406033, -78.884631, 11, 1.6],
+    [30.200287, -79.013559, 11, 1.797219],
+    [43.09867, -77.839, 17, 1.6],
+    [36.991378, -71.008622, 11, 1.763528],
+  ],
+  // Badlands
+  1511932964: [
+    [20.130483, 84.294362, 17, 1.6],
+    [-23.68641, -93.417095, 17, 1.6],
+    [20.62335, -83.371019, 17, 1.6],
+    [-41.576655, -85.83205, 11, 1.6],
+    [11.321811, 89.006011, 17, 1.6],
+    [-35.287317, -82.049995, 17, 1.6],
+    [-20.847777, -83.306196, 17, 1.6],
+    [35.61108, -79.911101, 11, 1.6],
+    [24.941577, 97.1542, 17, 1.6],
+    [-33.081682, -75.281391, 11, 1.6],
+    [-13.978187, -84.18817, 17, 1.6],
+    [38.201331, 81.784217, 17, 1.6],
+    [15.765792, 98.618282, 17, 1.6],
+    [43.051494, 76.347326, 17, 1.6],
+    [-32.69278, 78.107841, 11, 1.6],
+    [28.596337, -90.549482, 11, 1.6],
+    [41.880067, 89.60813, 11, 1.6],
+    [29.385808, 91.680198, 11, 1.6],
+    [33.628526, 99.473595, 17, 1.6],
   ],
 };
 
@@ -476,23 +723,371 @@ function planHills(rng: () => number): void {
 }
 
 // ---------------------------------------------------------------------------
+// Climate: which world this seed is.
+//
+// Biome classification in the literature is a Whittaker diagram — temperature
+// against moisture — and that is what this does, with one adaptation for the
+// scale. The arena is 224m across. Classifying every ~66m cell independently
+// on the diagram would seat a dune sea one cell from a snowfield, which is the
+// classic failure of a naive biome grid (the usual fix is an explicit
+// adjacency constraint). So the Whittaker lookup runs ONCE per seed and picks
+// the map's climate, and the per-cell field below keeps its four LOCAL roles —
+// open / wooded / rocky / wet. Each climate re-expresses those roles: "wooded"
+// is a birch wood in the temperate, a snow-laden taiga in the snow, palms in
+// the tropics, dead scrub in the desert. One coherent place per match, six
+// very different places across the seed rotation.
+//
+// Temperature and moisture are drawn from INDEPENDENT seed hashes. Correlated
+// axes collapse the diagram onto its diagonal and lose half the table.
+
+export const CLIMATE_TEMPERATE = 0;
+export const CLIMATE_SNOW = 1;
+export const CLIMATE_DESERT = 2;
+export const CLIMATE_TROPICAL = 3;
+export const CLIMATE_SAVANNA = 4;
+export const CLIMATE_BADLANDS = 5;
+
+export const CLIMATE_NAMES = [
+  "Temperate",
+  "Snowfield",
+  "Desert",
+  "Tropical",
+  "Savanna",
+  "Badlands",
+] as const;
+
+// Whittaker lookup, [temperature band][moisture band], cold->hot and arid->wet.
+// The cold row is snow at every moisture: the diagram's tundra/taiga/ice-sheet
+// corner reads as one place at arena scale. The hot row is where moisture
+// actually separates worlds — dunes, then grass savanna, then jungle.
+const WHITTAKER: readonly (readonly number[])[] = [
+  [CLIMATE_SNOW, CLIMATE_SNOW, CLIMATE_SNOW, CLIMATE_SNOW],
+  [CLIMATE_BADLANDS, CLIMATE_TEMPERATE, CLIMATE_TEMPERATE, CLIMATE_TEMPERATE],
+  [CLIMATE_DESERT, CLIMATE_SAVANNA, CLIMATE_TEMPERATE, CLIMATE_TROPICAL],
+  [CLIMATE_DESERT, CLIMATE_DESERT, CLIMATE_SAVANNA, CLIMATE_TROPICAL],
+];
+
+// Sub-seed labels for the two Whittaker axes. Independent hashes: correlated
+// axes collapse the diagram onto its diagonal. These particular values are
+// picked so the four curated seeds spread over Snow / Temperate / Desert /
+// Tropical — see planClimate.
+const CLIMATE_TEMP_LABEL = 0xc2;
+const CLIMATE_MOIST_LABEL = 0xd2;
+
+// Tree silhouettes. These are FORMS, not species — what a "palm" or a "snag"
+// is coloured like is the climate's business (see the client's canopy/bark
+// rows), but the shape is what you read at 80m through a scope.
+//   conifer   stacked tiers narrowing to a spire — taiga, temperate crags
+//   broadleaf layered asymmetric crown on a stout bole — temperate farmland
+//   palm      bare curving stem, radial drooping fronds — oasis, coast
+//   acacia    bare stem under one wide FLAT crown — savanna
+//   cactus    columnar green trunk with raised arms, no crown — desert
+//   snag      dead: bare trunk, a few broken branch stubs — badlands, dunes
+//   emergent  tall straight bole, small high crown, buttress roots — jungle
+export type TreeForm = "conifer" | "broadleaf" | "palm" | "acacia" | "cactus" | "snag" | "emergent";
+
+let CLIMATE: number = CLIMATE_TEMPERATE;
+
+// The active climate. Client presentation and the generator both read this;
+// it is pure seed state, so both sides agree without anything on the wire.
+export function climate(): number {
+  return CLIMATE;
+}
+
+export function climateName(): string {
+  return CLIMATE_NAMES[CLIMATE];
+}
+
+// Per-climate generation traits. Anything that changes how a biome ROLE is
+// expressed lives here rather than as scattered climate conditionals, so a new
+// climate is one table row. Colors are the client's business — this is only
+// what the generator itself decides: species, densities, ground relief.
+interface ClimateTraits {
+  // What GROWS here, per biome role (open, wooded, rocky, wet). Each entry is
+  // a weighted bag of silhouettes — repeats weight the draw. This is the thing
+  // that makes a world recognisable from across the map: a savanna is flat
+  // acacia crowns on bare stems, a jungle is straight emergent boles, a desert
+  // is columnar cactus and dead snags. Colour alone never sold the difference.
+  treeForms: readonly [
+    readonly TreeForm[],
+    readonly TreeForm[],
+    readonly TreeForm[],
+    readonly TreeForm[],
+  ];
+  // Canopy color bands to sample for leafy crowns; repeats weight the draw.
+  // Indices key the client's per-climate canopy row. Needle forms always take
+  // band 5, so every climate's row 5 is its needle color.
+  broadleaf: readonly number[];
+  // Trunk bark ids (client palette, 2 bits): 0 default, 1 needle, 2 pale,
+  // 3 the climate's oddity (dead white, palm, charred).
+  paleGroveP: number; // chance a ~22m cell of wooded ground is a pale stand
+  oddBarkP: number; // chance any one broadleaf takes bark 3
+  // Rock strata bands to sample (client palette, 2 bits), repeats weight.
+  rockBands: readonly number[];
+  // Added to the tree-density mask per role — arid worlds thin right out,
+  // jungles close in. Applied on top of the shared per-role bias.
+  treeDensity: number;
+  // Boulder-cluster count scale: badlands are strewn, jungles are buried.
+  rockDensity: number;
+  // Hedgerow count scale. Hedges are field boundaries — they belong to farmed
+  // temperate country and read as a mistake anywhere arid, so dry climates
+  // trade them for the extra boulders above.
+  hedgeDensity: number;
+
+  // --- Vernacular architecture. A climate that only repainted the ground read
+  // as a palette swap, because people kept building the same house in it. Real
+  // vernacular form follows climate and the materials to hand: heavy timber
+  // and steep roofs under snow load, thick mud brick with a flat parapet roof
+  // where rain never falls, deep shaded verandas in the wet tropics. These
+  // knobs are what the lot planner reads instead of hard-coded odds.
+  styleMix: readonly BuildingStyle[]; // weighted bag; repeats weight the draw
+  flatRoofP: number; // roof is flat rather than gabled
+  storyBias: number; // shifts the story roll: <0 low-rise, >0 stacked
+  elongation: number; // >1 stretches the street frontage toward a hall
+  porchP: number; // shaded veranda over the front door
+  chimneyP: number; // stack up a windowless wall — only cold places heat
+  parapetP: number; // crouch-cover kerb around a flat roof
+  // Which special lot kinds this climate builds at all, and how often one is
+  // rolled in place of a plain house. Order matters only as a weighted bag.
+  specialKinds: readonly LotKind[];
+  specialP: number;
+  // Odds this climate's map is an ISLAND rather than mainland. The tropics are
+  // mostly islands; the badlands are landlocked by definition.
+  islandP: number;
+}
+
+const CLIMATE_TRAITS: readonly ClimateTraits[] = [
+  // Temperate — mixed farming country: brick, timber and a little poured
+  // concrete, gable and flat roofs in equal measure, chimneys on the brick.
+  {
+    treeForms: [
+      ["broadleaf", "broadleaf", "broadleaf", "conifer"],
+      ["broadleaf", "broadleaf", "conifer", "conifer"],
+      ["conifer", "conifer", "conifer", "broadleaf", "snag"],
+      ["broadleaf", "broadleaf", "broadleaf", "conifer"],
+    ],
+    broadleaf: [0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 6],
+    paleGroveP: 0.35,
+    oddBarkP: 0.0,
+    rockBands: [0, 0, 0, 0, 0, 1, 1, 2, 3, 3],
+    treeDensity: 0,
+    rockDensity: 1,
+    hedgeDensity: 1,
+    styleMix: ["brick", "log", "concrete"],
+    flatRoofP: 0.5,
+    storyBias: 0,
+    elongation: 1,
+    porchP: 0.4,
+    chimneyP: 0.55,
+    parapetP: 0.4,
+    specialKinds: ["longhouse", "granary"],
+    specialP: 0.18,
+    islandP: 0.22,
+  },
+  // Snow — taiga conifers under snow load, pale aspen stands, bare frozen
+  // ground. Building is heavy timber, low and long, with steep roofs that
+  // shed the load and a chimney on nearly every one.
+  {
+    treeForms: [
+      ["conifer", "conifer", "broadleaf", "snag"],
+      ["conifer", "conifer", "conifer", "conifer", "broadleaf"],
+      ["conifer", "conifer", "conifer", "snag"],
+      ["conifer", "conifer", "broadleaf"],
+    ],
+    broadleaf: [7, 7, 7, 2, 2, 0, 1],
+    paleGroveP: 0.6,
+    oddBarkP: 0.18,
+    rockBands: [0, 0, 0, 2, 2, 1, 3],
+    treeDensity: -0.04,
+    rockDensity: 1.1,
+    hedgeDensity: 0.35,
+    styleMix: ["log", "log", "log", "brick"],
+    flatRoofP: 0.06,
+    storyBias: -0.12,
+    elongation: 1.35,
+    porchP: 0.12,
+    chimneyP: 0.85,
+    parapetP: 0.15,
+    specialKinds: ["longhouse", "longhouse", "granary"],
+    specialP: 0.3,
+    islandP: 0.18,
+  },
+  // Desert — dune seas, almost no canopy, sandstone outcrops. No timber to
+  // build with, so it's thick mud brick and block: compact, stacked, flat
+  // roofs behind a parapet, and walled courtyards against the sun and wind.
+  {
+    treeForms: [
+      ["cactus", "cactus", "snag", "snag", "acacia"],
+      ["cactus", "snag", "snag", "acacia", "palm"],
+      ["cactus", "snag", "snag"],
+      ["palm", "palm", "palm", "acacia"],
+    ],
+    broadleaf: [6, 6, 7, 7, 2],
+    paleGroveP: 0.12,
+    oddBarkP: 0.5,
+    rockBands: [1, 1, 1, 1, 1, 0, 2],
+    treeDensity: -0.13,
+    rockDensity: 1.35,
+    hedgeDensity: 0,
+    styleMix: ["adobe", "adobe", "adobe", "concrete"],
+    flatRoofP: 0.92,
+    storyBias: 0.18,
+    elongation: 0.85,
+    porchP: 0.28,
+    chimneyP: 0.03,
+    parapetP: 0.85,
+    specialKinds: ["compound", "compound", "granary", "roundhut"],
+    specialP: 0.36,
+    islandP: 0.1,
+  },
+  // Tropical — closed jungle canopy, dark wet greens, overgrown rock. Timber
+  // frames on masonry footings, steep roofs for the rain, and a deep shaded
+  // veranda on nearly everything.
+  {
+    treeForms: [
+      ["palm", "broadleaf", "broadleaf", "emergent"],
+      ["emergent", "emergent", "broadleaf", "broadleaf", "palm"],
+      ["emergent", "broadleaf", "palm"],
+      ["palm", "palm", "broadleaf", "emergent"],
+    ],
+    broadleaf: [1, 1, 1, 1, 0, 0, 2, 4],
+    paleGroveP: 0.2,
+    oddBarkP: 0.4,
+    rockBands: [0, 0, 0, 0, 2, 2, 3],
+    treeDensity: 0.18,
+    // Volcanic ground: dark basalt breaking through the canopy everywhere, so
+    // the tropics get MORE loose stone than anywhere but the badlands, not the
+    // least of any climate.
+    rockDensity: 1.45,
+    hedgeDensity: 0.25,
+    styleMix: ["log", "log", "brick"],
+    flatRoofP: 0.12,
+    storyBias: 0.05,
+    elongation: 1.15,
+    porchP: 0.8,
+    chimneyP: 0.04,
+    parapetP: 0.2,
+    specialKinds: ["stilt", "stilt", "stilt", "roundhut", "longhouse", "granary"],
+    specialP: 0.5,
+    islandP: 0.75,
+  },
+  // Savanna — golden grass, sparse flat-crowned acacia, dry riverbeds.
+  // Laterite brick under wide shading eaves; low, spread out, half of it
+  // flat-roofed and walled against the herds.
+  {
+    treeForms: [
+      ["acacia", "acacia", "acacia", "acacia", "snag"],
+      ["acacia", "acacia", "acacia", "broadleaf", "palm"],
+      ["acacia", "snag", "snag", "broadleaf"],
+      ["acacia", "palm", "palm", "broadleaf"],
+    ],
+    broadleaf: [2, 2, 2, 6, 6, 0, 3],
+    paleGroveP: 0.28,
+    oddBarkP: 0.22,
+    rockBands: [1, 1, 0, 0, 0, 2, 3],
+    treeDensity: -0.1,
+    rockDensity: 1.15,
+    hedgeDensity: 0.2,
+    styleMix: ["adobe", "adobe", "log"],
+    flatRoofP: 0.58,
+    storyBias: -0.14,
+    elongation: 0.95,
+    porchP: 0.62,
+    chimneyP: 0.08,
+    parapetP: 0.55,
+    specialKinds: ["roundhut", "roundhut", "roundhut", "compound", "granary"],
+    specialP: 0.48,
+    islandP: 0.2,
+  },
+  // Badlands — cold arid rock. Stepped mesas, scorched stumps, no soil worth
+  // the name and no wood either: quarried block, squat and heavy, parapets
+  // everywhere because the wind takes anything lighter.
+  {
+    treeForms: [
+      ["snag", "snag", "snag", "cactus", "conifer"],
+      ["snag", "snag", "conifer", "conifer", "cactus"],
+      ["snag", "snag", "snag", "conifer"],
+      ["conifer", "snag", "broadleaf"],
+    ],
+    broadleaf: [7, 7, 6, 6, 2, 3],
+    paleGroveP: 0.15,
+    oddBarkP: 0.45,
+    rockBands: [1, 1, 2, 2, 0, 0, 3],
+    treeDensity: -0.12,
+    rockDensity: 1.5,
+    hedgeDensity: 0,
+    styleMix: ["concrete", "concrete", "adobe"],
+    flatRoofP: 0.74,
+    storyBias: 0.08,
+    elongation: 0.9,
+    porchP: 0.18,
+    chimneyP: 0.35,
+    parapetP: 0.75,
+    specialKinds: ["compound", "granary"],
+    specialP: 0.28,
+    islandP: 0.0,
+  },
+];
+
+let TRAITS: ClimateTraits = CLIMATE_TRAITS[CLIMATE_TEMPERATE];
+
+export function climateTraits(): ClimateTraits {
+  return TRAITS;
+}
+
+// Roll the seed's point on the Whittaker diagram. Runs first in buildMap so
+// everything downstream can read the climate.
+//
+// IMPORTANT: anything a climate changes that MOVES the terrain heightfield —
+// dune relief, mesa steps, per-climate water, and settlement layout, since lot
+// pads flatten ground — invalidates the baked spawn-cover repairs, which were
+// ray-marched against one specific heightfield. That's allowed, but it means
+// re-running `npm run curate:map-seeds` and pasting the new tables;
+// `npm run test:map-seeds` is the detector when someone forgets.
+//
+// The label constants below are chosen so the four curated seeds land on four
+// DIFFERENT climates — the runtime rotates through exactly those seeds, so an
+// unlucky hash would hide most of the table from players.
+// The Whittaker roll for any seed, WITHOUT building its map — two hashes and a
+// table read. Lets a caller search seed space for a given climate cheaply
+// (see the dev biome picker) instead of generating worlds to find out.
+export function climateForSeed(seed: number): number {
+  const s = seed >>> 0;
+  const axis = (label: number): number => (subSeedOf(s, label) >>> 8) / 0x1000000;
+  const band = (v: number): number => Math.min(3, Math.floor(v * 4));
+  return WHITTAKER[band(axis(CLIMATE_TEMP_LABEL))][band(axis(CLIMATE_MOIST_LABEL))];
+}
+
+function planClimate(): void {
+  CLIMATE = climateForSeed(SEED);
+  TRAITS = CLIMATE_TRAITS[CLIMATE];
+}
+
+// ---------------------------------------------------------------------------
 // Biomes: a jittered-grid Voronoi field with domain-warped borders. Each
 // ~66m cell gets a seed point and a biome; a point's biome is its nearest
 // seed after warping the lookup, so borders meander organically instead of
 // reading as straight Voronoi edges. Biomes steer terrain character, ground
 // palette (client), tree density/species, rocks, hedges and reeds — cosmetics
 // and cover density, never traversability, so no side is walled in.
+//
+// The four ids are LOCAL ROLES, not fixed landscapes: what "forest" or "marsh"
+// looks like is the active climate's business (see CLIMATE_TRAITS). Naming
+// them for the temperate case is a holdover, but every consumer treats them as
+// open / wooded / rocky / wet.
 
-export const BIOME_MEADOW = 0;
-export const BIOME_FOREST = 1;
-export const BIOME_ROCKY = 2;
-export const BIOME_MARSH = 3;
+export const BIOME_MEADOW = 0; // open ground: meadow, dune flat, savanna grass
+export const BIOME_FOREST = 1; // wooded: forest, taiga, jungle, dead scrub
+export const BIOME_ROCKY = 2; // high ground: crags, mesas, icy tors
+export const BIOME_MARSH = 3; // wet low ground: bog, oasis, slush, mangrove
 
 const BIOME_CELL = 66;
 const BIOME_WARP = 15;
 
 // Cell (cx,cz) -> jittered seed point + biome id, statelessly from the seed.
-// Marsh gravitates to the river lowlands; away from water it's rare.
+// Wet ground gravitates to the river lowlands; away from water it's rare.
+// Climate deliberately does NOT shift this mix: the biome field feeds
+// reliefAt, and the terrain heightfield is frozen (see planClimate).
 function biomeCell(cx: number, cz: number): [number, number, number] {
   const jx = hash2(cx * 3 + 1013, cz * 3 + 557);
   const jz = hash2(cx * 3 + 2029, cz * 3 + 773);
@@ -846,8 +1441,53 @@ function channelProfile(t: number): number {
   return 0;
 }
 
+// --- Landform ---------------------------------------------------------------
+// Orthogonal to climate: the same six climates can be a piece of continent or
+// an island. This is the biggest single thing you read about a map before you
+// read anything else — open sea on two sides changes every route on it, and it
+// costs almost nothing to render, because the client already draws one sheet
+// at water level and shades a beach wherever the ground crosses it.
+export const LANDFORM_MAINLAND = 0;
+export const LANDFORM_ISLAND = 1;
+
+let LANDFORM: number = LANDFORM_MAINLAND;
+// Coast ellipse. The LONG axis runs north-south on purpose: both bases sit at
+// z = ±100, so the island has to reach past them or a team would spawn in the
+// surf. The sea therefore opens up east and west, and across the corners.
+let ISLAND_RX = 90;
+let ISLAND_RZ = 124;
+const SEA_DEPTH = 3.4; // deep enough to read as ocean, not as a flooded field
+const SEA_SHELF = 0.15; // beach width, in units of the normalized radius
+
+export function landform(): number {
+  return LANDFORM;
+}
+
+export function isIsland(): boolean {
+  return LANDFORM === LANDFORM_ISLAND;
+}
+
+function planLandform(rng: () => number): void {
+  LANDFORM = rng() < TRAITS.islandP ? LANDFORM_ISLAND : LANDFORM_MAINLAND;
+  ISLAND_RX = 84 + rng() * 12;
+  ISLAND_RZ = 122 + rng() * 8;
+}
+
+// Sea depth at (x,z); 0 on land. The coastline is that ellipse warped by fbm,
+// which is what makes it read as a coast instead of a swimming pool.
+function seaDepthAt(x: number, z: number): number {
+  if (LANDFORM !== LANDFORM_ISLAND) return 0;
+  const warp = fbm2(x + 5100, z + 5100, 3, 1 / 62) * 0.12;
+  const d = Math.hypot(x / ISLAND_RX, z / ISLAND_RZ) + warp;
+  if (d <= 1) return 0;
+  return smooth(Math.min(1, (d - 1) / SEA_SHELF)) * SEA_DEPTH;
+}
+
 // How deep the water carve is at (x,z), before pad/road fading. >0 digs the
 // channel or a lake; the small <0 lip raises a bank berm. 0 = untouched land.
+// The sea folds in HERE rather than into terrainBase, so every consumer that
+// already avoids water — anchor siting, lot clearance, prop scatter, road
+// costs — keeps a settlement out of the surf without knowing the sea exists.
 export function waterCarveAt(x: number, z: number): number {
   let best = Infinity;
   let bestHalf = RIVER_HALF_WIDTH;
@@ -869,7 +1509,7 @@ export function waterCarveAt(x: number, z: number): number {
     const e = Math.hypot((x - cx) / rx, (z - cz) / rz);
     if (e < 1) dug = Math.max(dug, smooth(1 - e) * WATER_DEPTH);
   }
-  return dug;
+  return Math.max(dug, seaDepthAt(x, z));
 }
 
 // The pre-road terrain: simplex relief minus the water carve, both flattened
@@ -897,6 +1537,28 @@ const BASE_HEIGHT_CACHE_PAD = 10;
 const BASE_HEIGHT_CACHE_MIN = -SIZE / 2 - BASE_HEIGHT_CACHE_PAD;
 const BASE_HEIGHT_CACHE_N = SIZE + BASE_HEIGHT_CACHE_PAD * 2 + 1;
 let baseHeightCache: Float64Array | null = null;
+
+// Drop the memoized heights inside a stamp's footprint. HILLS is an input to
+// reliefAt, so pushing a repair stamp makes every cached sample under it stale
+// — and the sightline repair search reads the field back through baseHeightAt
+// to decide whether the stamp worked. Without this the search is blind: it
+// re-samples, sees the pre-stamp ground, concludes nothing changed, and grinds
+// out hundreds of useless hills. (It used to run inside buildMap, before the
+// cache was allocated, which is why the baked tables are small.)
+function invalidateBaseHeightPatch(cx: number, cz: number, r: number): void {
+  const cache = baseHeightCache;
+  if (!cache) return;
+  const lo = (v: number): number => Math.max(0, Math.floor(v - r - BASE_HEIGHT_CACHE_MIN));
+  const hi = (v: number): number =>
+    Math.min(BASE_HEIGHT_CACHE_N - 1, Math.ceil(v + r - BASE_HEIGHT_CACHE_MIN));
+  const i0 = lo(cx);
+  const i1 = hi(cx);
+  const j0 = lo(cz);
+  const j1 = hi(cz);
+  for (let j = j0; j <= j1; j++) {
+    cache.fill(Number.NaN, j * BASE_HEIGHT_CACHE_N + i0, j * BASE_HEIGHT_CACHE_N + i1 + 1);
+  }
+}
 
 export function baseHeightAt(x: number, z: number): number {
   const ix = x - BASE_HEIGHT_CACHE_MIN;
@@ -1239,7 +1901,7 @@ function partitionInterior(
   return out;
 }
 
-export type BuildingStyle = "brick" | "log" | "concrete";
+export type BuildingStyle = "brick" | "adobe" | "log" | "concrete";
 
 export interface BuildingOpts {
   stories: number;
@@ -1247,9 +1909,11 @@ export interface BuildingOpts {
   doorSides: ReadonlyArray<0 | 1 | 2 | 3>; // some houses have several doors
   roof: "flat" | "gable";
   ladder: boolean; // exterior step-ladder to the roof/eaves
+  kind?: string; // descriptive only, for `npm run review:entities`
   rng: () => number;
   // Variety knobs (all optional):
-  barn?: boolean; // one big open hall + loft instead of rooms; wide wagon door
+  barn?: boolean; // one big open hall + loft instead of partitioned rooms
+  wagonDoor?: boolean; // 2.5m cart opening instead of a 1.3m doorway
   parapet?: boolean; // flat roofs only: masonry crouch-cover around the edge
   porch?: boolean; // plank platform + posts + canopy over the front door
   chimney?: boolean; // brick stack climbing a windowless wall past the roof
@@ -1274,12 +1938,13 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
     }
   }
   const id = nextBuildingId++;
-  const firstPanel = nextPanelId;
+  const firstPanelIdx = g.panels.length;
   const x0 = cx - w / 2;
   const x1 = cx + w / 2;
   const z0 = cz - d / 2;
   const z1 = cz + d / 2;
-  const unit = style === "brick" ? BRICK : style === "log" ? LOG : CONCRETE;
+  const unit =
+    style === "brick" ? BRICK : style === "adobe" ? ADOBE : style === "log" ? LOG : CONCRETE;
   const rowsPerStory = Math.round(WALL_HEIGHT / unit.h);
   const height = stories * WALL_HEIGHT;
 
@@ -1296,8 +1961,8 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
   // door). Windows: 2.1m wide at sill height on the other ground walls and on
   // EVERY upper-story wall. Pieces are clipped, so brick walls get cut bricks
   // around openings and log walls get sawed log ends.
-  const doorHalf = o.barn ? 1.25 : 0.65;
-  const doorTop = o.barn ? 2.45 : 2.05;
+  const doorHalf = o.wagonDoor ? 1.25 : 0.65;
+  const doorTop = o.wagonDoor ? 2.45 : 2.05;
   const door = (mid: number): GapRect[] => [
     { lo: mid - doorHalf, hi: mid + doorHalf, y0: 0, y1: doorTop },
   ];
@@ -1667,12 +2332,29 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
   // eaves, walkable like stairs once you're up there.
   if (gable) {
     const roofFirst = nextPanelId;
-    const along0 = ridgeAlongX ? x0 : z0;
-    const along1 = ridgeAlongX ? x1 : z1;
+    // Overhang the gable ends: a roof flush with its walls is the silhouette
+    // of a box with a lid, and the shadow an eave throws is most of what makes
+    // a building read as built rather than extruded.
+    const VERGE = 0.34;
+    const along0 = (ridgeAlongX ? x0 : z0) - VERGE;
+    const along1 = (ridgeAlongX ? x1 : z1) + VERGE;
     const crossBase = ridgeAlongX ? z0 : x0;
     const nAlong = Math.max(1, Math.round((along1 - along0) / PLANK.l));
     const alongL = (along1 - along0) / nAlong; // stretched to close the eaves
-    const strip = (cross: number, y: number): void => {
+    // The treads are a staircase — that is what you WALK on, and the collider
+    // keeps it. But a staircase is the boxiest silhouette on the map, so each
+    // tread RENDERS as a slab tilted into the roof plane and stretched to the
+    // slope length: consecutive slabs meet edge to edge and the gable reads as
+    // one continuous pitch. Centres already lie on that plane, so the visual
+    // never drifts more than half a riser from the surface underfoot.
+    const pitch = Math.atan2(GABLE_RISE, gStepW);
+    const slopeW = gStepW / Math.cos(pitch);
+    const strip = (cross: number, y: number, down: -1 | 1, eave = false): void => {
+      // Turn about the ridge, downhill toward the eave this side falls to.
+      const h = (down * pitch * (ridgeAlongX ? 1 : -1)) / 2;
+      const rot: [number, number, number, number] = ridgeAlongX
+        ? [Math.sin(h), 0, 0, Math.cos(h)]
+        : [0, 0, Math.sin(h), Math.cos(h)];
       const segs: Array<[number, number]> = [];
       for (let i = 0; i < nAlong; i++) segs.push([along0 + (i + 0.5) * alongL, alongL]);
       for (const [c, l] of segs) {
@@ -1686,14 +2368,22 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
           ey: ROOF_STEP_H,
           ez: ridgeAlongX ? gStepW : l,
           material: "plank",
+          rot,
+          // The bottom tread renders wider than it collides, and the extra
+          // hangs out past the wall as an eave — free, because `vis` never
+          // touches the box.
+          vis: ridgeAlongX
+            ? [l, ROOF_STEP_H, slopeW + (eave ? 0.8 : 0)]
+            : [slopeW + (eave ? 0.8 : 0), ROOF_STEP_H, l],
           buildingId: id,
         });
       }
     };
     for (let i = 0; i < gSteps; i++) {
       const y = height + i * GABLE_RISE + ROOF_STEP_H / 2;
-      strip(crossBase + (i + 0.5) * gStepW, y);
-      strip(crossBase + span - (i + 0.5) * gStepW, y);
+      // Near side climbs as cross grows, so it falls back toward crossBase.
+      strip(crossBase + (i + 0.5) * gStepW, y, -1, i === 0);
+      strip(crossBase + span - (i + 0.5) * gStepW, y, 1, i === 0);
     }
     endSlab(g, roofFirst);
   }
@@ -1820,10 +2510,14 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
     }
   }
 
-  const mine = g.panels.filter((p) => p.id >= firstPanel);
+  // Panels are append-only with ids in push order, so this structure's
+  // pieces are exactly the array tail — scanning the whole map per building
+  // is quadratic and shows up in map build time once yards get dense.
+  const mine = g.panels.slice(firstPanelIdx);
   g.buildings.push({
     id,
     kind: "building",
+    sub: o.kind ?? "building",
     cx,
     cz,
     w,
@@ -1844,89 +2538,230 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
   });
 }
 
-// Procedural trees: conifers (ragged stacked tiers) and broadleaf (layered,
-// asymmetric, drooping crowns), in size classes with a tapered, sometimes
-// leaning trunk. The trunk is the structure — break two segments and it falls.
-// Each tree tags its canopy/trunk pieces with a seed band so pieceColor gives
-// it one coherent species/season (incl. autumn & dry) while clumps still vary.
+// Procedural trees. Seven silhouettes (see TreeForm), drawn from the active
+// climate's per-biome-role bag, so what grows on a savanna ridge and what
+// grows on a jungle ridge are different PLANTS and not the same plant in a
+// different green. The trunk is the structure — break two segments and it
+// falls. Every piece is tagged with a seed band so pieceColor gives one tree a
+// coherent species/season while individual clumps still vary.
 function tree(g: Gen, x: number, z: number, rng: () => number, biome = BIOME_MEADOW): void {
   const slabFirst = nextPanelId;
   const id = nextBuildingId++;
   const base = baseHeightAt(x, z);
-  // Species follow the biome: conifers own the rocky tops, mixed woods in the
-  // forest, broadleaf across the meadows, scrubby broadleaf in the marsh.
-  const coniferP =
-    biome === BIOME_ROCKY
-      ? 0.72
-      : biome === BIOME_FOREST
-        ? 0.5
-        : biome === BIOME_MARSH
-          ? 0.12
-          : 0.28;
-  const conifer = rng() < coniferP;
+  const bag = TRAITS.treeForms[biome];
+  const form = bag[Math.floor(rng() * bag.length)];
   const SEG = 0.8;
   const big = rng() < 0.22;
   const small = !big && rng() < 0.32;
-  const segs = conifer
-    ? small
-      ? 4
-      : big
-        ? 7
-        : 5 + Math.floor(rng() * 2)
-    : small
-      ? 3
-      : big
-        ? 6
-        : 4 + Math.floor(rng() * 2);
-  const girth0 = (conifer ? 0.3 : 0.46) * (big ? 1.4 : small ? 0.78 : 1) + rng() * 0.06;
-  // Canopy band: conifers dark green; broadleaf mostly green, sometimes autumn/dry.
-  const r = rng();
-  const canopyBand = conifer
-    ? 5
-    : r < 0.52
-      ? 0
-      : r < 0.68
-        ? 1
-        : r < 0.8
-          ? 2
-          : r < 0.9
-            ? 3
-            : r < 0.97
-              ? 4
-              : 6;
-  // Birch stands: forest cells hash into whole birch groves (pale trunks in
-  // clumps read as a stand, not salt-and-pepper).
-  const birchGrove =
-    !conifer &&
+  const sizeF = big ? 1.35 : small ? 0.75 : 1;
+
+  // Trunk length in segments, per form. The bare-stemmed forms (palm, acacia,
+  // emergent) run tall precisely because the silhouette IS the bare stem.
+  const segs = Math.max(
+    2,
+    Math.round(
+      (form === "conifer"
+        ? 5.5
+        : form === "broadleaf"
+          ? 4.5
+          : form === "palm"
+            ? 6.5
+            : form === "acacia"
+              ? 5.5
+              : form === "cactus"
+                ? 4.5
+                : form === "snag"
+                  ? 5
+                  : 8.5) * sizeF, // emergent
+    ),
+  );
+  const girth0 =
+    (form === "conifer"
+      ? 0.3
+      : form === "palm"
+        ? 0.32
+        : form === "acacia"
+          ? 0.3
+          : form === "cactus"
+            ? // A saguaro is a COLUMN. At 0.42 across it was a green stick
+              // with two twigs on it, which is not what anyone pictures.
+              0.78
+            : form === "snag"
+              ? 0.46
+              : form === "emergent"
+                ? 0.44
+                : 0.46) *
+      sizeF +
+    rng() * 0.06;
+
+  // Canopy band: needle forms take band 5 (each climate's needle colour);
+  // everything leafy draws from the climate's weighted list. The band is an
+  // INDEX, not a colour — the client resolves it against the active climate's
+  // palette row, so no extra bits go on the wire.
+  const needle = form === "conifer";
+  const drawn = TRAITS.broadleaf[Math.floor(rng() * TRAITS.broadleaf.length)];
+  // Palms don't flower and don't turn: a blossom-red or autumn-orange frond
+  // reads as a dead palm, which is not what a beach is for. Bands 3 and 4 are
+  // the flowering/turning slots, so a palm that draws one falls back to green.
+  const canopyBand = needle ? 5 : form === "palm" && drawn >= 3 && drawn <= 4 ? 0 : drawn;
+  // Pale stands: wooded cells hash into whole groves of pale trunks (birch in
+  // the temperate, aspen under snow, ghost gum on the savanna) — clumped, so
+  // they read as a stand rather than salt-and-pepper.
+  const paleGrove =
+    (form === "broadleaf" || form === "acacia") &&
     biome === BIOME_FOREST &&
-    hash2(Math.floor(x / 22) + 9001, Math.floor(z / 22) + 7001) < 0.35;
-  const bark = conifer ? 1 : birchGrove ? 2 : rng() < 0.12 ? 2 : 0;
+    hash2(Math.floor(x / 22) + 9001, Math.floor(z / 22) + 7001) < TRAITS.paleGroveP;
+  // Bark 3 is the climate's oddity: dead white in the badlands, palm in the
+  // tropics, sun-bleached driftwood in the desert. Palms and snags always take
+  // it — that IS the oddity those slots were painted for.
+  const bark = needle
+    ? 1
+    : form === "palm" || form === "snag"
+      ? 3
+      : paleGrove
+        ? 2
+        : rng() < TRAITS.oddBarkP
+          ? 3
+          : rng() < 0.12
+            ? 2
+            : 0;
+
+  // Lean. A palm curves (each segment offsets further along one bearing); the
+  // rest either stand straight or take a slight uniform tilt.
   const leanA = rng() * Math.PI * 2;
-  const leanAmt = conifer ? 0 : (big ? 0.1 : 0.05) * (rng() < 0.5 ? 1 : 0);
+  const curve = form === "palm";
+  const leanAmt = curve
+    ? 0.16 + rng() * 0.12
+    : form === "conifer" || form === "emergent" || form === "cactus"
+      ? 0
+      : (big ? 0.1 : 0.05) * (rng() < 0.5 ? 1 : 0);
   const span = segs * SEG;
   let serial = 0;
   const trunkIds: number[] = [];
   const canopyIds: number[] = [];
-  for (let s = 0; s < segs; s++) {
-    const f = s / segs;
-    const gx = girth0 * (1 - 0.28 * f);
+
+  // Offset of the trunk axis at height fraction f. Straight forms are a
+  // constant lean; the palm bends, so its offset grows with f squared.
+  const offAt = (f: number): [number, number] => {
+    const t = curve ? f * f : f;
+    return [Math.sin(leanA) * leanAmt * span * t, Math.cos(leanA) * leanAmt * span * t];
+  };
+
+  const trunkSeg = (
+    px: number,
+    py: number,
+    pz: number,
+    gx: number,
+    gz = gx,
+    h = SEG,
+    material: PanelMaterial = "trunk",
+  ): void => {
     trunkIds.push(nextPanelId);
     g.panels.push({
       id: nextPanelId++,
-      x: x + Math.sin(leanA) * leanAmt * span * f,
-      y: base + (s + 0.5) * SEG,
-      z: z + Math.cos(leanA) * leanAmt * span * f,
+      x: px,
+      y: py,
+      z: pz,
       ex: gx,
-      ey: SEG,
-      ez: gx,
-      material: "trunk",
+      ey: h,
+      ez: gz,
+      material,
+      seed:
+        (material === "canopy" ? canopyBand : bark) | (serial++ << (material === "canopy" ? 3 : 2)),
+      buildingId: id,
+    });
+  };
+  // Bare woody outgrowth — a snag's broken stub, an emergent's buttress root.
+  // Falls with the tree but isn't part of what holds it up.
+  const limb = (cx: number, cy: number, cz: number, ex: number, ey: number, ez: number): void => {
+    canopyIds.push(nextPanelId);
+    g.panels.push({
+      id: nextPanelId++,
+      x: cx,
+      y: cy,
+      z: cz,
+      ex,
+      ey,
+      ez,
+      material: "post",
       seed: bark | (serial++ << 2),
       buildingId: id,
     });
-  }
-  const topX = x + Math.sin(leanA) * leanAmt * span;
-  const topZ = z + Math.cos(leanA) * leanAmt * span;
-  const top = base + span;
+  };
+  // One palm leaf, anchored at the crown and thrown out along a bearing. The
+  // MESH is a blade turned onto that bearing (`rot` + `vis`); the BOX stays
+  // the world-space bounds it sweeps, because merged slab bodies and the
+  // hit-resolve are AABB-only and would ignore the rotation.
+  //
+  // The blade mesh runs base->tip along local +X inside a unit box, with its
+  // stalk at (-0.5, +0.5, 0). Orientation is yaw onto the bearing composed
+  // over a pitch that cocks the leaf up out of the crown.
+  const frond = (
+    bx: number,
+    by: number,
+    bz: number,
+    bearing: number,
+    pitch: number,
+    len: number,
+    wide: number,
+    drop: number,
+  ): void => {
+    const ca = Math.cos(bearing);
+    const sa = Math.sin(bearing);
+    const cp = Math.cos(pitch);
+    const sp = Math.sin(pitch);
+    // The blade only fills 84% of its box across the width. Fit it here rather
+    // than in fitOrganicColliders(), because the box below is a ROTATED bound
+    // and scaling its world axes afterwards would not mean anything.
+    const wideF = wide * MESH_FIT.frond[2];
+    // R = Ry(-bearing) * Rz(pitch): pitch in the blade's own plane, then swing
+    // the whole leaf around to its bearing.
+    const hy = -bearing / 2;
+    const hp = pitch / 2;
+    const [yx, yw] = [Math.sin(hy), Math.cos(hy)];
+    const [pz, pw] = [Math.sin(hp), Math.cos(hp)];
+    const rot: [number, number, number, number] = [yx * pz, yx * pw, yw * pz, yw * pw];
+    // Stalk sits at local (-0.5, +0.5, 0), so the piece centre is half a blade
+    // out along +X and half a drop down — both turned by R.
+    const lx = len / 2;
+    const ly = -drop / 2;
+    const rx = lx * cp - ly * sp;
+    const ry = lx * sp + ly * cp;
+    // Exact world AABB of the rotated box: |R| applied to its half-extents.
+    canopyIds.push(nextPanelId);
+    g.panels.push({
+      id: nextPanelId++,
+      x: bx + rx * ca,
+      y: by + ry,
+      z: bz + rx * sa,
+      ex: Math.abs(ca * cp) * len + Math.abs(ca * sp) * drop + Math.abs(sa) * wideF,
+      ey: Math.abs(sp) * len + Math.abs(cp) * drop,
+      ez: Math.abs(sa * cp) * len + Math.abs(sa * sp) * drop + Math.abs(ca) * wideF,
+      material: "frond",
+      rot,
+      vis: [len, drop, wideF],
+      seed: canopyBand | (serial++ << 3),
+      buildingId: id,
+    });
+  };
+  // One conifer tier: a cone skirt of needles. A spruce is a stack of these,
+  // which is both the canonical low-poly evergreen and a quarter of the pieces
+  // the old ring-of-lumps crown cost.
+  const bough = (cy: number, rad: number, h: number): void => {
+    canopyIds.push(nextPanelId);
+    g.panels.push({
+      id: nextPanelId++,
+      x: topX,
+      y: cy,
+      z: topZ,
+      ex: rad * 2,
+      ey: h,
+      ez: rad * 2,
+      material: "bough",
+      seed: canopyBand | (serial++ << 3),
+      buildingId: id,
+    });
+  };
   const clump = (cx: number, cy: number, cz: number, ex: number, ey: number, ez: number): void => {
     canopyIds.push(nextPanelId);
     g.panels.push({
@@ -1942,55 +2777,271 @@ function tree(g: Gen, x: number, z: number, rng: () => number, biome = BIOME_MEA
       buildingId: id,
     });
   };
-  if (conifer) {
-    const tiers = 3 + (big ? 1 : 0);
-    const baseR = big ? 2.0 : 1.5;
-    for (let t = 0; t < tiers; t++) {
-      const f = 1 - t / tiers;
-      const rad = 0.5 + baseR * f;
-      const cy = top - (tiers - 1 - t) * 0.95 - 0.2;
-      const ring = 3 + Math.floor(f * 2);
-      for (let k = 0; k < ring; k++) {
-        const a = (k / ring) * Math.PI * 2 + t * 0.7;
-        clump(
-          topX + Math.cos(a) * rad * 0.7,
-          cy - 0.12,
-          topZ + Math.sin(a) * rad * 0.7,
-          rad * 0.7 + 0.4,
-          0.55,
-          rad * 0.7 + 0.4,
-        );
+
+  // --- Trunk. A cactus IS its trunk (green, ribbed, no bark), so it stacks
+  // canopy-material segments instead; everything else stacks bark.
+  const cactus = form === "cactus";
+  for (let s = 0; s < segs; s++) {
+    const f = s / segs;
+    const [ox, oz] = offAt(f);
+    const taper = cactus ? 0.08 : form === "palm" ? 0.12 : 0.28;
+    const gx = girth0 * (1 - taper * f);
+    trunkSeg(x + ox, base + (s + 0.5) * SEG, z + oz, gx, gx, SEG, cactus ? "canopy" : "trunk");
+  }
+  const [tox, toz] = offAt(1);
+  const topX = x + tox;
+  const topZ = z + toz;
+  const top = base + span;
+
+  switch (form) {
+    case "conifer": {
+      // Tiers overlap so the skirts read as one ragged spire rather than a
+      // stack of separate hats, and each is nudged off-axis a little so the
+      // silhouette isn't a perfect solid of revolution.
+      const tiers = 4 + (big ? 1 : 0);
+      const baseR = (big ? 2.2 : 1.65) * (0.88 + rng() * 0.24);
+      const drop = big ? 1.15 : 0.95;
+      for (let t = 0; t < tiers; t++) {
+        const f = 1 - t / tiers; // 1 at the bottom skirt, ~0 at the leader
+        const rad = 0.34 + baseR * f * (0.9 + rng() * 0.2);
+        bough(top - (tiers - 1 - t) * drop + 0.35, rad, drop * 1.85);
       }
+      break;
     }
-    clump(topX, top + 0.7, topZ, 0.7, 1.0, 0.7); // spire
-  } else {
-    const crownR = (big ? 2.4 : small ? 1.2 : 1.8) + rng() * 0.4;
-    const layers = 3 + (big ? 1 : 0);
-    const ax = Math.cos(leanA + 1) * 0.3 * crownR; // light-seeking asymmetry
-    const az = Math.sin(leanA + 1) * 0.3 * crownR;
-    for (let L = 0; L < layers; L++) {
-      const lf = (L + 0.6) / (layers + 0.6);
-      const layerR = crownR * Math.sin(Math.PI * lf);
-      const cy = top - 0.3 + L * 0.85;
-      const ring = 3 + Math.round(layerR * 1.1);
-      for (let k = 0; k < ring; k++) {
-        const a = (k / ring) * Math.PI * 2 + L;
-        const rr = layerR * (0.55 + 0.45 * rng());
-        const s = 0.7 + layerR * 0.32 * (0.7 + 0.6 * rng());
-        clump(
-          topX + ax + Math.cos(a) * rr,
-          cy - rr * 0.15,
-          topZ + az + Math.sin(a) * rr,
-          s,
-          s * 0.8,
-          s,
+    case "broadleaf": {
+      const crownR = (big ? 2.4 : small ? 1.2 : 1.8) + rng() * 0.4;
+      const layers = 3 + (big ? 1 : 0);
+      const ax = Math.cos(leanA + 1) * 0.3 * crownR; // light-seeking asymmetry
+      const az = Math.sin(leanA + 1) * 0.3 * crownR;
+      // Inner mass first. The rings alone are a hollow shell of blobs: the
+      // outermost one on a small tree could sit clear of every neighbour and
+      // hang in the air, and a shot-out ring left the crown see-through.
+      clump(topX + ax * 0.5, top + layers * 0.3, topZ + az * 0.5, crownR, layers * 0.62, crownR);
+      for (let L = 0; L < layers; L++) {
+        const lf = (L + 0.6) / (layers + 0.6);
+        const layerR = crownR * Math.sin(Math.PI * lf);
+        // Layers overlap: at 0.85 apart they were spaced further than the
+        // clumps were tall and the stack came apart between tiers.
+        const cy = top - 0.3 + L * 0.72;
+        const ring = 3 + Math.round(layerR * 1.1);
+        for (let k = 0; k < ring; k++) {
+          const a = (k / ring) * Math.PI * 2 + L;
+          const rr = layerR * (0.42 + 0.4 * rng());
+          const sz = 0.7 + layerR * 0.32 * (0.7 + 0.6 * rng());
+          clump(
+            topX + ax + Math.cos(a) * rr,
+            cy - rr * 0.15,
+            topZ + az + Math.sin(a) * rr,
+            sz,
+            sz * 0.8,
+            sz,
+          );
+        }
+      }
+      break;
+    }
+    case "palm": {
+      // 5-9 oversized leaves radiating from the crown, each ONE blade mesh.
+      // That is how a stylized palm is built: the silhouette is carried by a
+      // few big shapes, not by many small ones. (It is also cheaper — eight
+      // pieces where the old clump-of-cubes crown cost fifty.)
+      const fronds = 5 + Math.floor(rng() * 4);
+      const a0 = rng() * Math.PI * 2;
+      for (let k = 0; k < fronds; k++) {
+        const a = a0 + (k / fronds) * Math.PI * 2 + (rng() - 0.5) * 0.5;
+        const len = (big ? 3.5 : 2.7) * (0.82 + rng() * 0.36);
+        // Leaves sit anywhere from cocked-up to nearly horizontal; the mesh's
+        // own arc carries each one over into a drooping tip from there.
+        const pitch = 0.12 + rng() * 0.5;
+        frond(topX, top + 0.15, topZ, a, pitch, len, len * (0.3 + rng() * 0.12), len * 0.5);
+      }
+      // The crown itself: the knot of old leaf bases the fronds spring from.
+      clump(topX, top + 0.1, topZ, 0.8, 0.62, 0.8);
+      if (rng() < 0.6) {
+        const fa = rng() * Math.PI * 2;
+        clump(topX + Math.cos(fa) * 0.4, top - 0.25, topZ + Math.sin(fa) * 0.4, 0.5, 0.45, 0.5);
+      }
+      break;
+    }
+    case "acacia": {
+      // The savanna signature: a wide umbrella on a bare stem. It has to have
+      // DEPTH — built as two flat discs it read as a table top from the side,
+      // which is the one angle you actually see it from in play. Layers now
+      // shrink as they rise and the clumps are chunky enough to overlap.
+      const crownR = (big ? 3.8 : small ? 2.3 : 3.0) + rng() * 0.5;
+      const ax = Math.cos(leanA + 1) * 0.22 * crownR;
+      const az = Math.sin(leanA + 1) * 0.22 * crownR;
+      const layers = 3;
+      for (let L = 0; L < layers; L++) {
+        const f = L / (layers - 1);
+        // Widest just above the fork, tapering to a domed top.
+        const rad = crownR * (1 - f * 0.52);
+        const cy = top + 0.1 + f * 1.15;
+        const ring = 5 + Math.round(rad * 1.6);
+        for (let k = 0; k < ring; k++) {
+          const a = (k / ring) * Math.PI * 2 + L * 0.7;
+          const rr = rad * (0.52 + 0.48 * rng());
+          const sz = 1.0 + rad * 0.3 * (0.75 + 0.5 * rng());
+          clump(
+            topX + ax + Math.cos(a) * rr,
+            cy - (rr / Math.max(0.001, rad)) * 0.28, // rim droops below the dome
+            topZ + az + Math.sin(a) * rr,
+            sz,
+            0.62,
+            sz,
+          );
+        }
+      }
+      // Solid heart so the underside isn't see-through from below.
+      clump(topX + ax, top + 0.45, topZ + az, crownR * 0.72, 0.95, crownR * 0.72);
+      break;
+    }
+    case "cactus": {
+      // Saguaro: a thick column with arms that step out and turn up. The arms
+      // MUST overlap both the stem and each other — stepping them out at a
+      // fixed count left the elbow starting outside the trunk and each segment
+      // short of the next, so the arms hung in the air beside the cactus.
+      const arms = rng() < 0.18 ? 0 : rng() < 0.55 ? 1 : 2;
+      const a0 = rng() * Math.PI * 2;
+      for (let k = 0; k < arms; k++) {
+        const a = a0 + k * (Math.PI * 0.7 + rng() * 0.6);
+        const ca = Math.cos(a);
+        const sa = Math.sin(a);
+        const hf = 0.32 + rng() * 0.26;
+        const elbowY = base + span * hf;
+        const armG = girth0 * 0.7;
+        const reach = girth0 * 1.1 + 0.5 + rng() * 0.35;
+        // Enough steps that consecutive centres sit closer together than a
+        // segment is wide, and the first one starts inside the stem.
+        const steps = Math.max(2, Math.ceil(reach / (armG * 0.7)));
+        for (let e = 0; e < steps; e++) {
+          const t = e / (steps - 1);
+          const rr = reach * t;
+          // The elbow lifts as it goes out, so the arm turns rather than
+          // sticking out square.
+          trunkSeg(
+            x + ca * rr,
+            elbowY + t * t * 0.35,
+            z + sa * rr,
+            armG,
+            armG,
+            SEG * 0.95,
+            "canopy",
+          );
+        }
+        // Upright arm, overlapping the elbow's outer end.
+        const armSegs = 2 + Math.floor(rng() * 3);
+        for (let e = 0; e < armSegs; e++) {
+          trunkSeg(
+            x + ca * reach,
+            elbowY + 0.35 + (e + 0.5) * SEG * 0.85,
+            z + sa * reach,
+            armG,
+            armG,
+            SEG * 0.95,
+            "canopy",
+          );
+        }
+      }
+      break;
+    }
+    case "snag": {
+      // Dead standing timber. As a thin pole with three little nubs it read as
+      // a twig; a snag is a BROKEN TREE, so it wants a heavy trunk, a splintered
+      // top and a few long limbs that still hold their old reach.
+      const stubs = 3 + Math.floor(rng() * 3);
+      for (let k = 0; k < stubs; k++) {
+        const a = rng() * Math.PI * 2;
+        const hf = 0.3 + rng() * 0.6;
+        const [ox, oz] = offAt(hf);
+        const reach = 1.0 + rng() * 1.4;
+        const rise = 0.25 + rng() * 0.6; // dead limbs angle up, not out
+        const ca = Math.cos(a);
+        const sa = Math.sin(a);
+        // Step count comes off the limb's TRUE length, not its horizontal
+        // reach — the limb sweeps up as t^2, so a short steep one took bigger
+        // strides in y than in x and came apart at the tip. Each piece is then
+        // stretched to span its own step on every axis, so the chain always
+        // overlaps however the reach and the rise trade off.
+        const steps = Math.max(3, Math.ceil(Math.hypot(reach, rise) / 0.5));
+        for (let e = 0; e < steps; e++) {
+          const t = (e + 0.5) / steps;
+          const g = 0.3 * (1 - t * 0.55);
+          const t0 = Math.max(0, t - 1 / steps);
+          limb(
+            x + ox + ca * reach * t,
+            base + span * hf + rise * t * t,
+            z + oz + sa * reach * t,
+            Math.max(g, Math.abs(ca) * (reach / steps) * 1.9),
+            Math.max(g, rise * (t * t - t0 * t0) * 1.9),
+            Math.max(g, Math.abs(sa) * (reach / steps) * 1.9),
+          );
+        }
+      }
+      // Splintered crown: a couple of jagged spars where the top broke off.
+      const spars = 2 + Math.floor(rng() * 2);
+      for (let k = 0; k < spars; k++) {
+        const a = rng() * Math.PI * 2;
+        const r = girth0 * (0.2 + rng() * 0.5);
+        const h = 0.55 + rng() * 0.7;
+        // Sunk so the spar's foot is inside the trunk. Perched on top of it,
+        // a tall spar's base cleared the trunk and the splinter floated.
+        limb(
+          topX + Math.cos(a) * r,
+          top - 0.15 + h / 2,
+          topZ + Math.sin(a) * r,
+          girth0 * 0.42,
+          h,
+          girth0 * 0.42,
         );
       }
+      break;
+    }
+    case "emergent": {
+      // Rainforest giant: a long clean bole to a small dense crown, standing
+      // on buttress roots. Reading UP a bare trunk is what makes a jungle feel
+      // tall rather than just cluttered.
+      for (let k = 0; k < 4; k++) {
+        const a = (k / 4) * Math.PI * 2 + rng() * 0.4;
+        const ca = Math.cos(a);
+        const sa = Math.sin(a);
+        const reach = girth0 * 1.9;
+        limb(
+          x + ca * reach * 0.6,
+          base + 0.55,
+          z + sa * reach * 0.6,
+          Math.max(0.22, Math.abs(ca) * reach * 1.5),
+          1.1,
+          Math.max(0.22, Math.abs(sa) * reach * 1.5),
+        );
+      }
+      const crownR = (big ? 3.2 : 2.5) + rng() * 0.4;
+      // Solid heart FIRST: without it the ring clumps sat out at radius with
+      // nothing bridging them back to a 0.44m bole, so half the crown was
+      // floating free of the tree that was supposed to be holding it up.
+      clump(topX, top + 0.35, topZ, crownR * 1.1, 1.7, crownR * 1.1);
+      // Three tiers, widest in the MIDDLE. Two tiers shrinking upward made a
+      // flat disc on a pole — the tree read as a lollipop where it is supposed
+      // to read as a canopy spreading out above everything else.
+      for (let L = 0; L < 3; L++) {
+        const rad = crownR * (L === 0 ? 0.72 : L === 1 ? 1 : 0.78);
+        const cy = top + 0.1 + L * 0.85;
+        const ring = 4 + Math.round(rad * 1.3);
+        for (let k = 0; k < ring; k++) {
+          const a = (k / ring) * Math.PI * 2 + L * 0.8;
+          const rr = rad * (0.45 + 0.55 * rng());
+          const sz = 0.9 + rad * 0.3 * (0.7 + 0.5 * rng());
+          clump(topX + Math.cos(a) * rr, cy, topZ + Math.sin(a) * rr, sz, sz * 0.7, sz);
+        }
+      }
+      break;
     }
   }
+
   g.buildings.push({
     id,
     kind: "tree",
+    sub: form,
     cx: x,
     cz: z,
     w: 0.9,
@@ -2010,8 +3061,11 @@ function rocks(g: Gen, x: number, z: number, rng: () => number): void {
   const slabFirst = nextPanelId;
   const ra = rng();
   const arch = ra < 0.42 ? 0 : ra < 0.62 ? 1 : ra < 0.8 ? 2 : 3;
+  // Strata band, weighted per climate: sandstone dominates the desert, black
+  // volcanic rock the tropics, banded rock the badlands. As with canopy bands the
+  // value is an index the client resolves against the active climate's row.
   const rb = rng();
-  const band = rb < 0.5 ? 0 : rb < 0.7 ? 1 : rb < 0.88 ? 3 : 2; // granite/sandstone/mossy/basalt
+  const band = TRAITS.rockBands[Math.floor(rb * TRAITS.rockBands.length)];
   let serial = 0;
   const put = (px: number, pz: number, ex: number, ey: number, ez: number, bury = 0.35): void => {
     g.panels.push({
@@ -2247,6 +3301,685 @@ function hedge(g: Gen, x0: number, z0: number, x1: number, z1: number): void {
   endSlab(g, slabFirst);
 }
 
+// A round hut: an octagonal masonry drum under a stepped conical thatch roof,
+// with one doorway. There is no rectangle anywhere in it, which is the whole
+// point — a cluster of these reads as a different CULTURE from a street of
+// gabled boxes, not as the same village repainted. Savanna and tropical.
+function roundHut(
+  g: Gen,
+  cx: number,
+  cz: number,
+  w: number,
+  front: 0 | 1 | 2 | 3,
+  style: BuildingStyle,
+  rng: () => number,
+): void {
+  const id = nextBuildingId++;
+  const firstPanelIdx = g.panels.length;
+  const unit =
+    style === "brick" ? BRICK : style === "adobe" ? ADOBE : style === "log" ? LOG : CONCRETE;
+  const R = w / 2;
+  const SIDES = 10;
+  // Huts in one cluster are hand-built, not stamped: the drum runs a course
+  // taller or shorter and the thatch oversails by a varying amount.
+  const rows = Math.max(2, Math.round(WALL_HEIGHT / unit.h) + (rng() < 0.35 ? 1 : 0));
+  const eave = 1.16 + rng() * 0.14;
+  const plate = 2 * R * Math.tan(Math.PI / SIDES);
+  // Which facet the doorway lands on — the one nearest the street bearing.
+  const frontAngle =
+    front === 0 ? Math.PI / 2 : front === 1 ? -Math.PI / 2 : front === 2 ? 0 : Math.PI;
+  const doorFacet = Math.round(((frontAngle - Math.PI / SIDES) / (Math.PI * 2)) * SIDES);
+  const wallFirst = nextPanelId;
+  for (let s = 0; s < SIDES; s++) {
+    const a = (s / SIDES) * Math.PI * 2 + Math.PI / SIDES;
+    const ca = Math.cos(a);
+    const sa = Math.sin(a);
+    const isDoor = (((s - doorFacet) % SIDES) + SIDES) % SIDES === 0;
+    for (let row = 0; row < rows; row++) {
+      const y = (row + 0.5) * unit.h;
+      // The doorway eats the lower courses of one facet.
+      if (isDoor && y < 2.05) continue;
+      // Stagger alternate courses around the drum so the joints bond.
+      const jitter = row % 2 === 0 ? 0 : plate * 0.12;
+      g.panels.push({
+        id: nextPanelId++,
+        x: cx + ca * R - sa * jitter,
+        y,
+        z: cz + sa * R + ca * jitter,
+        ex: Math.abs(ca) > Math.abs(sa) ? unit.t : plate,
+        ey: unit.h,
+        ez: Math.abs(ca) > Math.abs(sa) ? plate : unit.t,
+        material: style,
+        buildingId: id,
+      });
+    }
+  }
+  endSlab(g, wallFirst);
+  // Steep thatched cone. The panels are TILTED onto the slope (rot + vis) so
+  // the roof reads as one surface rather than a stack of discs, and it is now
+  // as tall as the drum is wide. Four flat rings on a shallow rise gave a
+  // wedding cake under a mushroom cap, which is the thing about this hut that
+  // most obviously did not work.
+  //
+  // As everywhere else, `rot`/`vis` turn and size the MESH while ex/ey/ez stay
+  // the true world AABB — merged slab bodies and pieceAt() ignore rotation.
+  const roofFirst = nextPanelId;
+  const roofIds: number[] = [];
+  const tiers = 6;
+  const wallTop = rows * unit.h;
+  const eaveR = R * eave;
+  // Derived from the eave roll rather than a fresh draw: a new rng() here
+  // would shift the whole downstream stream and invalidate the curated seeds.
+  const roofH = R * (1.05 + (eave - 1.16) * 1.8);
+  const pitch = Math.atan2(roofH, eaveR);
+  const sp = Math.sin(pitch);
+  const cp = Math.cos(pitch);
+  const sp2 = Math.sin(pitch / 2);
+  const cp2 = Math.cos(pitch / 2);
+  const slant = (Math.hypot(eaveR, roofH) / tiers) * 1.15; // overlap, like shingles
+  for (let t = 0; t < tiers; t++) {
+    const f = (t + 0.5) / tiers;
+    const rMid = eaveR * (1 - f);
+    const yMid = wallTop + 0.1 + roofH * f;
+    const ring = Math.max(4, Math.round(rMid * 3.0));
+    const arc = ((2 * Math.PI * rMid) / ring) * 1.25;
+    for (let k = 0; k < ring; k++) {
+      const a = (k / ring) * Math.PI * 2 + t * 0.5;
+      const ca = Math.cos(a);
+      const sa = Math.sin(a);
+      // Yaw onto the bearing, then tip down the slope: local +X runs from the
+      // ridge out to the eave, local +Z spans the arc.
+      const sy = Math.sin(a / 2);
+      const cy = Math.cos(a / 2);
+      roofIds.push(nextPanelId);
+      g.panels.push({
+        id: nextPanelId++,
+        x: cx + ca * rMid,
+        y: yMid,
+        z: cz + sa * rMid,
+        ex: slant * Math.abs(cp * ca) + THATCH_T * Math.abs(sp * ca) + arc * Math.abs(sa),
+        ey: slant * sp + THATCH_T * cp,
+        ez: slant * Math.abs(cp * sa) + THATCH_T * Math.abs(sp * sa) + arc * Math.abs(ca),
+        material: "plank",
+        rot: [sy * sp2, -sy * cp2, -cy * sp2, cy * cp2],
+        vis: [slant, THATCH_T, arc],
+        buildingId: id,
+      });
+    }
+  }
+  // The apex knot the thatch is bound off against — and the plug for the hole
+  // the converging rings leave at the top.
+  roofIds.push(nextPanelId);
+  g.panels.push({
+    id: nextPanelId++,
+    x: cx,
+    y: wallTop + 0.1 + roofH - 0.3,
+    z: cz,
+    ex: Math.max(1.1, eaveR * 0.32),
+    ey: 0.9,
+    ez: Math.max(1.1, eaveR * 0.32),
+    material: "plank",
+    buildingId: id,
+  });
+  endSlab(g, roofFirst);
+  const mine = g.panels.slice(firstPanelIdx);
+  g.buildings.push({
+    id,
+    kind: "building",
+    sub: "roundhut",
+    cx,
+    cz,
+    w,
+    d: w,
+    wallPanelIds: mine.filter((p) => p.material !== "plank").map((p) => p.id),
+    roofPanelIds: roofIds,
+    collapseFraction: 0.5,
+  });
+}
+
+// A stilt house: a timber room lifted a storey clear of the ground on posts,
+// reached by a ladder, with a railed verandah and a steep gable. Wet-tropics
+// vernacular, and it plays like nothing else on the map — you can run and
+// shoot UNDER it, so it breaks a firing line without blocking movement.
+function stiltHouse(
+  g: Gen,
+  cx: number,
+  cz: number,
+  w: number,
+  d: number,
+  front: 0 | 1 | 2 | 3,
+  style: BuildingStyle,
+  rng: () => number,
+): void {
+  const id = nextBuildingId++;
+  const firstPanelIdx = g.panels.length;
+  const unit =
+    style === "brick" ? BRICK : style === "adobe" ? ADOBE : style === "log" ? LOG : CONCRETE;
+  const x0 = cx - w / 2;
+  const x1 = cx + w / 2;
+  const z0 = cz - d / 2;
+  const z1 = cz + d / 2;
+  const lift = 2.4 + rng() * 0.4; // clear headroom underneath
+  const rows = Math.max(2, Math.round(WALL_HEIGHT / unit.h));
+
+  // Posts on a grid under the floor.
+  const postFirst = nextPanelId;
+  const nx = Math.max(2, Math.round(w / 3));
+  const nz = Math.max(2, Math.round(d / 3));
+  for (let i = 0; i <= nx; i++) {
+    for (let j = 0; j <= nz; j++) {
+      // Only the perimeter and a sparse interior grid — a forest of posts
+      // underneath would defeat the point of the open undercroft.
+      const edge = i === 0 || i === nx || j === 0 || j === nz;
+      if (!edge && (i % 2 !== 0 || j % 2 !== 0)) continue;
+      const px = x0 + (i * w) / nx;
+      const pz = z0 + (j * d) / nz;
+      g.panels.push({
+        id: nextPanelId++,
+        x: px,
+        y: lift / 2,
+        z: pz,
+        ex: 0.28,
+        ey: lift,
+        ez: 0.28,
+        material: "post",
+        buildingId: id,
+      });
+    }
+  }
+  endSlab(g, postFirst);
+
+  // Floor deck.
+  const deckFirst = nextPanelId;
+  const deckIds: number[] = [];
+  const dnx = Math.max(1, Math.round(w / PLANK.l));
+  const dnz = Math.max(1, Math.round(d / PLANK.w));
+  for (let i = 0; i < dnx; i++) {
+    for (let j = 0; j < dnz; j++) {
+      deckIds.push(nextPanelId);
+      g.panels.push({
+        id: nextPanelId++,
+        x: x0 + ((i + 0.5) * w) / dnx,
+        y: lift + PLANK.h / 2,
+        z: z0 + ((j + 0.5) * d) / dnz,
+        ex: w / dnx,
+        ey: PLANK.h,
+        ez: d / dnz,
+        material: "plank",
+        buildingId: id,
+      });
+    }
+  }
+  endSlab(g, deckFirst);
+
+  // Walls, one storey, sitting on the deck. Doorway on the front, windows on
+  // the rest — the same openings vocabulary as a ground-built house.
+  const walls: Array<[axis: "x" | "z", mid: number, fixed: number]> = [
+    ["x", cx, z1],
+    ["x", cx, z0],
+    ["z", cz, x1],
+    ["z", cz, x0],
+  ];
+  const baseY = lift + PLANK.h;
+  for (let side = 0; side < 4; side++) {
+    const [axis, mid, fixed] = walls[side];
+    const a0 = axis === "x" ? x0 : z0;
+    const a1 = axis === "x" ? x1 : z1;
+    const gaps: GapRect[] =
+      side === front
+        ? [{ lo: mid - 0.65, hi: mid + 0.65, y0: baseY, y1: baseY + 2.05 }]
+        : [{ lo: mid - 1.05, hi: mid + 1.05, y0: baseY + 1.3, y1: baseY + 2.05 }];
+    masonryRun(g, axis, a0, a1, fixed, baseY, rows, unit, style, id, gaps);
+  }
+
+  // Steep gable over the top, stepped like every other roof in the world.
+  const roofFirst = nextPanelId;
+  const roofIds: number[] = [];
+  const ridgeAlongX = w >= d;
+  const span = ridgeAlongX ? d : w;
+  const steps = Math.max(2, Math.round(span / 2 / PLANK.w));
+  const stepW = span / 2 / steps;
+  const top = baseY + rows * unit.h;
+  // Same trick as the gable roof: walk the staircase, see a pitched plane.
+  const pitch = Math.atan2(0.36, stepW);
+  const slopeW = stepW / Math.cos(pitch);
+  for (let s = 0; s < steps; s++) {
+    const inset = s * stepW;
+    const y = top + 0.16 + s * 0.36;
+    for (const sign of [-1, 1]) {
+      const off = (span / 2 - inset - stepW / 2) * sign;
+      // Each half falls away from the ridge toward its own eave.
+      const h = (sign * pitch * (ridgeAlongX ? 1 : -1)) / 2;
+      const rot: [number, number, number, number] = ridgeAlongX
+        ? [Math.sin(h), 0, 0, Math.cos(h)]
+        : [0, 0, Math.sin(h), Math.cos(h)];
+      roofIds.push(nextPanelId);
+      g.panels.push({
+        id: nextPanelId++,
+        x: ridgeAlongX ? cx : cx + off,
+        y,
+        z: ridgeAlongX ? cz + off : cz,
+        ex: ridgeAlongX ? w + 0.7 : stepW,
+        ey: 0.36,
+        ez: ridgeAlongX ? stepW : d + 0.7,
+        material: "plank",
+        rot,
+        vis: ridgeAlongX ? [w + 0.7, 0.36, slopeW] : [slopeW, 0.36, d + 0.7],
+        buildingId: id,
+      });
+    }
+  }
+  endSlab(g, roofFirst);
+
+  // Ladder up to the deck on a blank flank.
+  const flank = ((front + 2) % 4) as 0 | 1 | 2 | 3;
+  const [laxis, , lfixed] = walls[flank];
+  const outSign = flank === 0 || flank === 2 ? 1 : -1;
+  const lalong = laxis === "x" ? cx + w * 0.28 : cz + d * 0.28;
+  g.ladders.push({
+    x: laxis === "x" ? lalong : lfixed + outSign * 0.2,
+    z: laxis === "x" ? lfixed + outSign * 0.2 : lalong,
+    nx: laxis === "x" ? 0 : outSign,
+    nz: laxis === "x" ? outSign : 0,
+    y1: baseY + 0.6,
+  });
+
+  const mine = g.panels.slice(firstPanelIdx);
+  g.buildings.push({
+    id,
+    kind: "building",
+    sub: "stilt",
+    cx,
+    cz,
+    w,
+    d,
+    // The posts ARE the structure: shoot enough of them out and the house
+    // comes down, which is a genuinely different demolition puzzle.
+    wallPanelIds: mine
+      .filter((p) => p.material !== "plank" && p.material !== "glass")
+      .map((p) => p.id),
+    roofPanelIds: [...roofIds, ...deckIds],
+    collapseFraction: 0.45,
+  });
+}
+
+// --- Works structures ------------------------------------------------------
+// Industry doesn't use the house generator at all. These are sheet metal on a
+// steel frame, not masonry courses: bigger pieces, fewer of them, and shapes a
+// mason would never build. That difference is meant to be legible at range and
+// under the feet — a works reads as hard cover and long straight sightlines
+// where a hamlet reads as broken ground.
+
+// Sheet steel comes in big panels; that is why a shed costs a fraction of the
+// pieces a brick building of the same size would.
+const SHEET = { l: 2.0, h: 1.0, t: 0.16 };
+
+// A steel-frame hall: corrugated walls between corner and bay columns, a wide
+// roller door on the front, a strip of clerestory glazing up high, and a flat
+// walkable roof. Interior is one clear span — that's what a shed is for.
+function shed(
+  g: Gen,
+  cx: number,
+  cz: number,
+  w: number,
+  d: number,
+  front: 0 | 1 | 2 | 3,
+  stories: number,
+  rng: () => number,
+): void {
+  const id = nextBuildingId++;
+  const firstPanelIdx = g.panels.length;
+  const x0 = cx - w / 2;
+  const x1 = cx + w / 2;
+  const z0 = cz - d / 2;
+  const z1 = cz + d / 2;
+  const height = stories * WALL_HEIGHT;
+  const rows = Math.max(1, Math.round(height / SHEET.h));
+  const roofIds: number[] = [];
+  const walls: Array<[axis: "x" | "z", mid: number, fixed: number]> = [
+    ["x", cx, z1],
+    ["x", cx, z0],
+    ["z", cz, x1],
+    ["z", cz, x0],
+  ];
+  // Roller door: a wagon-to-lorry sized opening, full height of the ground
+  // storey. Width varies by shed — a fabrication bay is not a store.
+  const doorHalf = 2.0 + rng() * 1.2;
+  for (let side = 0; side < 4; side++) {
+    const [axis, mid, fixed] = walls[side];
+    const a0 = axis === "x" ? x0 : z0;
+    const a1 = axis === "x" ? x1 : z1;
+    const gaps: GapRect[] = [];
+    if (side === front) {
+      gaps.push({ lo: mid - doorHalf, hi: mid + doorHalf, y0: 0, y1: WALL_HEIGHT * 0.95 });
+    }
+    // Clerestory: a continuous glazed band under the eaves, which is what
+    // makes a shed read as industrial rather than as a big blank box.
+    const clerY = height - SHEET.h * 1.2;
+    gaps.push({ lo: a0 + 1.2, hi: a1 - 1.2, y0: clerY, y1: clerY + SHEET.h * 0.9 });
+    masonryRun(g, axis, a0, a1, fixed, 0, rows, SHEET, "metal", id, gaps);
+  }
+  // Frame: columns at the corners and at bay centres, standing proud.
+  const colFirst = nextPanelId;
+  const bays = Math.max(2, Math.round(w / (4.2 + rng() * 1.6)));
+  for (const zz of [z0, z1]) {
+    for (let b = 0; b <= bays; b++) {
+      const px = x0 + ((x1 - x0) * b) / bays;
+      g.panels.push({
+        id: nextPanelId++,
+        x: px,
+        y: height / 2,
+        z: zz,
+        ex: 0.34,
+        ey: height,
+        ez: 0.34,
+        material: "post",
+        buildingId: id,
+      });
+    }
+  }
+  endSlab(g, colFirst);
+  // Flat roof deck, walkable, with a low kerb — high ground in a flat yard.
+  const deckFirst = nextPanelId;
+  const nx = Math.max(1, Math.round(w / 2.4));
+  const nz = Math.max(1, Math.round(d / 2.4));
+  for (let i = 0; i < nx; i++) {
+    for (let j = 0; j < nz; j++) {
+      roofIds.push(nextPanelId);
+      g.panels.push({
+        id: nextPanelId++,
+        x: x0 + ((i + 0.5) * w) / nx,
+        y: height + 0.09,
+        z: z0 + ((j + 0.5) * d) / nz,
+        ex: w / nx,
+        ey: 0.18,
+        ez: d / nz,
+        material: "metal",
+        buildingId: id,
+      });
+    }
+  }
+  endSlab(g, deckFirst);
+  // Ladder up a blank flank to the roof.
+  const flank = ((front + 2) % 4) as 0 | 1 | 2 | 3;
+  const [laxis, , lfixed] = walls[flank];
+  const outSign = flank === 0 || flank === 2 ? 1 : -1;
+  const lalong = laxis === "x" ? x0 + 1.4 : z0 + 1.4;
+  g.ladders.push({
+    x: laxis === "x" ? lalong : lfixed + outSign * (SHEET.t / 2),
+    z: laxis === "x" ? lfixed + outSign * (SHEET.t / 2) : lalong,
+    nx: laxis === "x" ? 0 : outSign,
+    nz: laxis === "x" ? outSign : 0,
+    y1: height + 0.6,
+  });
+  // Panels are append-only with ids in push order, so this structure's
+  // pieces are exactly the array tail — scanning the whole map per building
+  // is quadratic and shows up in map build time once yards get dense.
+  const mine = g.panels.slice(firstPanelIdx);
+  g.buildings.push({
+    id,
+    kind: "building",
+    sub: "shed",
+    cx,
+    cz,
+    w,
+    d,
+    wallPanelIds: mine
+      .filter((p) => p.material === "metal" || p.material === "post")
+      .map((p) => p.id),
+    roofPanelIds: [...roofIds, ...mine.filter((p) => p.material === "glass").map((p) => p.id)],
+    collapseFraction: 0.5,
+  });
+}
+
+// A storage bin: an octagonal steel shell on stub legs, capped with a cone.
+// Tall, narrow and hard — the landmark you give directions by, and the one
+// piece of cover on a works yard that nobody shoots through.
+function silo(g: Gen, cx: number, cz: number, rng: () => number, stories: number): void {
+  const id = nextBuildingId++;
+  const firstPanelIdx = g.panels.length;
+  const R = 2.5;
+  const legH = 1.5;
+  const height = stories * WALL_HEIGHT;
+  const SIDES = 8;
+  // Every other generator plants itself on the terrain; this one indexed its
+  // heights from world zero, so on any ground above sea level the silo sank
+  // into the hill and on anything below it hung in the air.
+  const base = baseHeightAt(cx, cz);
+  // Octagon: eight flat plates, each a stack of courses.
+  const wallFirst = nextPanelId;
+  const rows = Math.max(1, Math.round((height - legH) / SHEET.h));
+  const plate = 2 * R * Math.tan(Math.PI / SIDES); // chord of one face
+  for (let s = 0; s < SIDES; s++) {
+    const a = (s / SIDES) * Math.PI * 2 + Math.PI / SIDES;
+    const ca = Math.cos(a);
+    const sa = Math.sin(a);
+    for (let row = 0; row < rows; row++) {
+      g.panels.push({
+        id: nextPanelId++,
+        x: cx + ca * R,
+        y: base + legH + (row + 0.5) * SHEET.h,
+        z: cz + sa * R,
+        // The plate lies across its own radius: wide along the tangent, thin
+        // along the normal. Axis-aligned boxes can only approximate that, so
+        // pick whichever axis the face is more nearly square to.
+        ex: Math.abs(ca) > Math.abs(sa) ? SHEET.t * 2 : plate,
+        ey: SHEET.h,
+        ez: Math.abs(ca) > Math.abs(sa) ? plate : SHEET.t * 2,
+        material: "metal",
+        buildingId: id,
+      });
+    }
+  }
+  endSlab(g, wallFirst);
+  // Legs.
+  const legFirst = nextPanelId;
+  for (let s = 0; s < 4; s++) {
+    // Every other PLATE bearing, at the plate radius. On their own 45deg ring
+    // at 0.82R the legs fell between the plates and missed the shell entirely:
+    // the drum was a cylinder standing on four posts it never touched, so
+    // nothing tied it to the ground and shooting the legs did nothing to it.
+    const a = ((s * 2) / SIDES) * Math.PI * 2 + Math.PI / SIDES;
+    g.panels.push({
+      id: nextPanelId++,
+      x: cx + Math.cos(a) * R,
+      y: base + legH / 2,
+      z: cz + Math.sin(a) * R,
+      ex: 0.3,
+      ey: legH,
+      ez: 0.3,
+      material: "post",
+      buildingId: id,
+    });
+  }
+  endSlab(g, legFirst);
+  // Stepped cone cap.
+  const capFirst = nextPanelId;
+  const capIds: number[] = [];
+  for (let t = 0; t < 3; t++) {
+    const rr = R * (1 - t * 0.3);
+    capIds.push(nextPanelId);
+    g.panels.push({
+      id: nextPanelId++,
+      x: cx,
+      y: base + legH + rows * SHEET.h + 0.25 + t * 0.45,
+      z: cz,
+      ex: rr * 2,
+      ey: 0.45,
+      ez: rr * 2,
+      material: "metal",
+      buildingId: id,
+    });
+  }
+  endSlab(g, capFirst);
+  g.ladders.push({
+    x: cx + R + 0.2,
+    z: cz,
+    nx: 1,
+    nz: 0,
+    y1: base + legH + rows * SHEET.h + 0.4,
+  });
+  // Panels are append-only with ids in push order, so this structure's
+  // pieces are exactly the array tail — scanning the whole map per building
+  // is quadratic and shows up in map build time once yards get dense.
+  const mine = g.panels.slice(firstPanelIdx);
+  g.buildings.push({
+    id,
+    kind: "building",
+    sub: "silo",
+    cx,
+    cz,
+    w: R * 2,
+    d: R * 2,
+    wallPanelIds: mine.filter((p) => !capIds.includes(p.id)).map((p) => p.id),
+    roofPanelIds: capIds,
+    collapseFraction: 0.55,
+  });
+}
+
+// A squat process vessel: chest-to-head high, ringed with a catwalk kerb and
+// tied to its neighbours by a low pipe run. Cover you fight around, not in.
+function tank(g: Gen, cx: number, cz: number, w: number, rng: () => number): void {
+  const id = nextBuildingId++;
+  const firstPanelIdx = g.panels.length;
+  const R = w / 2;
+  const SIDES = 8;
+  const h = 2.2 + rng() * 0.8;
+  const rows = Math.max(1, Math.round(h / SHEET.h));
+  const plate = 2 * R * Math.tan(Math.PI / SIDES);
+  const base = baseHeightAt(cx, cz);
+  const wallFirst = nextPanelId;
+  for (let s = 0; s < SIDES; s++) {
+    const a = (s / SIDES) * Math.PI * 2 + Math.PI / SIDES;
+    const ca = Math.cos(a);
+    const sa = Math.sin(a);
+    for (let row = 0; row < rows; row++) {
+      g.panels.push({
+        id: nextPanelId++,
+        x: cx + ca * R,
+        y: base + (row + 0.5) * (h / rows),
+        z: cz + sa * R,
+        ex: Math.abs(ca) > Math.abs(sa) ? SHEET.t * 2 : plate,
+        ey: h / rows,
+        ez: Math.abs(ca) > Math.abs(sa) ? plate : SHEET.t * 2,
+        material: "metal",
+        buildingId: id,
+      });
+    }
+  }
+  endSlab(g, wallFirst);
+  // Lid.
+  const lidFirst = nextPanelId;
+  const lidIds: number[] = [nextPanelId];
+  g.panels.push({
+    id: nextPanelId++,
+    x: cx,
+    y: base + h + 0.12,
+    z: cz,
+    ex: R * 1.9,
+    ey: 0.24,
+    ez: R * 1.9,
+    material: "metal",
+    buildingId: id,
+  });
+  endSlab(g, lidFirst);
+  // Panels are append-only with ids in push order, so this structure's
+  // pieces are exactly the array tail — scanning the whole map per building
+  // is quadratic and shows up in map build time once yards get dense.
+  const mine = g.panels.slice(firstPanelIdx);
+  g.buildings.push({
+    id,
+    kind: "building",
+    sub: "tank",
+    cx,
+    cz,
+    w,
+    d: w,
+    wallPanelIds: mine.filter((p) => !lidIds.includes(p.id)).map((p) => p.id),
+    roofPanelIds: lidIds,
+    collapseFraction: 0.6,
+  });
+}
+
+// A compound's courtyard wall: a chest-high mud-brick ring set back from the
+// house, with one gateway on the street side. Arid vernacular — shade, wind
+// break, livestock pen — and in play a piece of standing cover with exactly
+// one legal approach, which is what makes pushing a desert hamlet feel unlike
+// pushing a snow one. Its own building id, so it collapses on its own.
+const THATCH_T = 0.34; // thickness of a roundhut thatch panel
+
+const COURTYARD_PAD = 4.8; // yard reserved around a compound lot, in metres
+
+function courtyard(
+  g: Gen,
+  cx: number,
+  cz: number,
+  w: number,
+  d: number,
+  front: 0 | 1 | 2 | 3,
+  rng: () => number,
+): void {
+  const id = nextBuildingId++;
+  const slabFirst = nextPanelId;
+  const firstPanelIdx = g.panels.length;
+  // Stay inside COURTYARD_PAD: the planner reserved exactly that much.
+  const hw = w / 2 + 3.2 + rng() * 1.4;
+  const hd = d / 2 + 3.2 + rng() * 1.4;
+  const h = 1.35 + rng() * 0.25;
+  const step = 0.9; // block run; short enough that a breach reads as a hole
+  const gateHalf = 1.6;
+  // Walk the rectangle side by side, skipping the gateway span on the front.
+  const sides: Array<[number, number, number, number, 0 | 1 | 2 | 3]> = [
+    [cx - hw, cz + hd, cx + hw, cz + hd, 0],
+    [cx - hw, cz - hd, cx + hw, cz - hd, 1],
+    [cx + hw, cz - hd, cx + hw, cz + hd, 2],
+    [cx - hw, cz - hd, cx - hw, cz + hd, 3],
+  ];
+  for (const [ax, az, bx, bz, side] of sides) {
+    const len = Math.hypot(bx - ax, bz - az);
+    const n = Math.max(1, Math.round(len / step));
+    // Blocks have to ABUT. At 0.55 of the run they were spaced a full step
+    // apart and only half that wide, so the "wall" was a picket fence you
+    // could see and shoot straight through — and no structural check caught
+    // it, because every block sits on the ground on its own.
+    const run = (len / n) * 1.02;
+    for (let i = 0; i < n; i++) {
+      const t = (i + 0.5) / n;
+      const x = ax + (bx - ax) * t;
+      const z = az + (bz - az) * t;
+      // The gateway: a gap at the middle of the street-facing side.
+      if (side === front && Math.abs((t - 0.5) * len) < gateHalf) continue;
+      if (onRoad(x, z) > 0) continue; // never wall off the road itself
+      g.panels.push({
+        id: nextPanelId++,
+        x,
+        y: baseHeightAt(x, z) + h * 0.5,
+        z,
+        ex: side >= 2 ? 0.3 : run,
+        ey: h,
+        ez: side >= 2 ? run : 0.3,
+        material: "adobe",
+        buildingId: id,
+      });
+    }
+  }
+  g.buildings.push({
+    id,
+    kind: "building",
+    sub: "courtyard",
+    cx,
+    cz,
+    w: hw * 2,
+    d: hd * 2,
+    wallPanelIds: g.panels.slice(firstPanelIdx).map((p) => p.id),
+    roofPanelIds: [],
+    // A garden wall carries nothing, so it never collapses as a unit — you
+    // shoot a hole and step through, which is exactly the cover we want.
+    collapseFraction: 1,
+  });
+  endSlab(g, slabFirst);
+}
+
 // A roofless ruin: one story of weathered walls with a jagged, noise-eaten
 // top line, a doorway breach, surviving corner posts, half-buried flagstones
 // and a spill of rubble — pre-destroyed cover wired into the same collapse
@@ -2390,6 +4123,7 @@ function ruin(g: Gen, cx: number, cz: number, w: number, d: number, rng: () => n
   g.buildings.push({
     id,
     kind: "building",
+    sub: "ruin",
     cx,
     cz,
     w,
@@ -2438,12 +4172,45 @@ function cropRows(g: Gen, x: number, z: number, axis: number, rng: () => number)
 // ---------------------------------------------------------------------------
 // Layout: a settlement of varied clusters — one true village (a market plaza
 // and the biggest buildings) plus hamlets and farmsteads placed fresh every
-// seed in 180°-mirrored pairs (so the conquest flags stay fair) — wired
-// together by an MST-plus-loops road network of jittered polylines that shies
-// away from hills and fords the river where it must. Buildings front the
-// streets. Fully deterministic from the map seed.
+// seed, wired together by an MST-plus-loops road network of jittered polylines
+// that shies away from hills and fords the river where it must. Fully
+// deterministic from the map seed.
+//
+// Nothing here is mirrored. The four conquest greens are placed freely and
+// then MEASURED for fairness (see the flag search below), and each cluster
+// draws its own street plan, so no two settlements — and no two halves of a
+// map — lay out the same way.
 
-type LotKind = "house" | "tower" | "barn" | "ruin";
+// What a lot is FOR. Kind drives footprint, height, material and roof before
+// the climate's own bias is applied, so a granary reads as a granary in snow
+// and in sand — it just gets built out of what that climate has.
+//   house     the default; the climate's bias does most of the work
+//   tower     square watchtower, 3 stories, ladder to a parapet roof
+//   barn      one open hall + loft, wide wagon door — farmsteads
+//   ruin      roofless pre-destroyed walls (its own generator)
+//   longhouse long narrow hall, steep gable — cold and wet climates
+//   granary   small, tall, blank-walled store on a plinth — everywhere
+//   compound  squat walled block behind a courtyard wall — arid climates
+//   roundhut  octagonal drum under a conical thatch cone — savanna, tropics
+//   stilt     room lifted clear of the ground on posts — wet tropics
+// Industrial sites build none of the above; their structures are steel and
+// concrete and have their own generators:
+//   shed      wide steel-frame hall, roller door, walkable flat roof
+//   silo      tall octagonal bin on legs — a landmark you navigate by
+//   tank      squat wide vessel, chest-high, hard cover in the open
+type LotKind =
+  | "house"
+  | "tower"
+  | "barn"
+  | "ruin"
+  | "longhouse"
+  | "granary"
+  | "compound"
+  | "roundhut"
+  | "stilt"
+  | "shed"
+  | "silo"
+  | "tank";
 
 interface LotPlan {
   cx: number;
@@ -2475,6 +4242,16 @@ export function duelLaneX(): number {
   return DUEL_LANE_X;
 }
 
+// How many lots the main village actually placed, of the count its archetype
+// asked for. The village is the one settlement whose size is fixed up front
+// rather than by whatever room the terrain leaves, so this is the honest
+// measure of whether a seed has a town on it — see the gate in
+// scripts/curate-map-seeds.ts.
+export function villageLotCount(): [placed: number, wanted: number] {
+  return VILLAGE_LOTS_STAT;
+}
+let VILLAGE_LOTS_STAT: [number, number] = [0, 0];
+
 function planLayout(rng: () => number): Layout {
   const half = SIZE / 2;
   const pads: Array<[number, number, number, number]> = [];
@@ -2482,15 +4259,6 @@ function planLayout(rng: () => number): Layout {
   const stalls: Array<[number, number]> = [];
   const farms: Array<[number, number, number]> = [];
   const nodes: Array<[number, number]> = [];
-
-  // Balanced-but-shuffled material mix.
-  const styleBag: BuildingStyle[] = [];
-  for (let i = 0; i < 48; i++) styleBag.push((["brick", "log", "concrete"] as const)[i % 3]);
-  for (let i = styleBag.length - 1; i > 0; i--) {
-    const j = Math.floor(rng() * (i + 1));
-    [styleBag[i], styleBag[j]] = [styleBag[j], styleBag[i]];
-  }
-  let si = 0;
 
   // Which wall (0=+z,1=-z,2=+x,3=-x) faces direction (dx,dz).
   const sideFacing = (dx: number, dz: number): 0 | 1 | 2 | 3 =>
@@ -2535,23 +4303,129 @@ function planLayout(rng: () => number): Layout {
   });
   pads.push([0, 0, 6.8, 5.8]);
 
+  // How a cluster arranges itself. Every settlement used to be one straight
+  // street with lots alternating sides, which is why villages 200m apart read
+  // as the same village: the plan, not the palette, is what you recognise.
+  //   street  ribbon development along an axis, lots alternating sides
+  //   green   lots ringing the clearing, all fronts turned in on it
+  //   cluster grown-not-planned: an organic scatter with jittered frontage
+  //   grid    surveyed: everything square to one axis, in rows — industry
+  type PlanKind = "street" | "green" | "cluster" | "grid";
   interface Anchor {
-    type: "village" | "hamlet" | "farm";
+    type: "village" | "hamlet" | "farm" | "industrial";
     x: number;
     z: number;
     axis: number;
     count: number;
+    plan: PlanKind;
   }
+  // --- Settlement archetype -------------------------------------------------
+  // Climate decides what a place is BUILT of. This decides what KIND of place
+  // it is, and it is the thing that was missing: every map ran the same
+  // skeleton — one central village, five flag hamlets, farms sprinkled between
+  // — so no amount of palette, architecture or vegetation work could stop two
+  // maps reading as the same level. Now the macro composition itself changes.
+  interface SettlementPlan {
+    name: string;
+    village: number; // lots in the central village; 0 means no centre at all
+    villagePlan: PlanKind;
+    worksCap: number; // how many flag zones may be industrial
+    worksP: number;
+    flagCount: [number, number]; // lots per flag settlement [base, spread]
+    freeHamlets: [number, number];
+    farms: [number, number];
+    lotTarget: number; // how many lots the top-up pass fills toward
+    bias: PlanKind | null; // forces outlying plans, for the shapeliest archetypes
+  }
+  const SETTLEMENTS: readonly SettlementPlan[] = [
+    // A proper market town: a big plaza-centred core, modest outskirts.
+    {
+      name: "market town",
+      village: 16,
+      villagePlan: "green",
+      worksCap: 1,
+      worksP: 0.3,
+      flagCount: [7, 4],
+      freeHamlets: [2, 2],
+      farms: [5, 4],
+      lotTarget: 54,
+      bias: null,
+    },
+    // No centre worth the name — holdings scattered across open country.
+    {
+      name: "scattered holdings",
+      village: 5,
+      villagePlan: "cluster",
+      worksCap: 1,
+      worksP: 0.25,
+      flagCount: [6, 3],
+      freeHamlets: [6, 3],
+      farms: [9, 4],
+      lotTarget: 58,
+      bias: null,
+    },
+    // Heavy industry: works on most flags, hard right angles everywhere.
+    {
+      name: "industrial belt",
+      village: 8,
+      villagePlan: "street",
+      worksCap: 4,
+      worksP: 0.8,
+      flagCount: [9, 4],
+      freeHamlets: [2, 2],
+      farms: [3, 3],
+      lotTarget: 56,
+      bias: null,
+    },
+    // Everything strung along tracks: long, thin, linear fights.
+    {
+      name: "ribbon settlement",
+      village: 13,
+      villagePlan: "street",
+      worksCap: 2,
+      worksP: 0.4,
+      flagCount: [8, 3],
+      freeHamlets: [4, 3],
+      farms: [6, 4],
+      lotTarget: 56,
+      bias: "street",
+    },
+    // One dense, walled core and very little else — an urban crush.
+    {
+      name: "stronghold",
+      village: 20,
+      villagePlan: "green",
+      worksCap: 1,
+      worksP: 0.3,
+      flagCount: [8, 3],
+      freeHamlets: [1, 2],
+      farms: [4, 3],
+      lotTarget: 52,
+      bias: "cluster",
+    },
+  ];
+  const SETTLEMENT = SETTLEMENTS[Math.floor(rng() * SETTLEMENTS.length)];
 
-  // One village near the center; hamlets and farms in mirrored pairs so the
-  // flags (and the cover around them) are fair by construction.
+  const rollPlan = (): PlanKind => {
+    if (SETTLEMENT.bias) return SETTLEMENT.bias;
+    const r = rng();
+    return r < 0.45 ? "street" : r < 0.75 ? "green" : "cluster";
+  };
+
+  // One village near the center; hamlets and farms placed freely around it.
   const anchors: Anchor[] = [
     {
       type: "village",
-      x: (rng() * 2 - 1) * 5,
+      // Set down on the far side of the duel lane, not on the map's centre.
+      // The village ring is 20-28 across and the lane corridor rolls anywhere
+      // from 15 to 37 out, so a centred village was bisected by dead ground
+      // about half the time — it was placing three lots in sixteen and on some
+      // seeds none at all, which is most of why the maps read as all hamlets.
+      x: -Math.sign(DUEL_LANE_X) * (12 + rng() * 12),
       z: -4 + (rng() * 2 - 1) * 6,
       axis: rng() < 0.5 ? 0 : Math.PI / 2,
-      count: 8 + Math.floor(rng() * 3),
+      count: SETTLEMENT.village,
+      plan: SETTLEMENT.villagePlan,
     },
   ];
   // Hamlet greens carry the conquest flags, so they must sit on genuinely dry
@@ -2563,47 +4437,140 @@ function planLayout(rng: () => number): Layout {
     if (Math.abs(x - DUEL_LANE_X) < 13 && Math.abs(z) < 52) return false;
     return anchors.every((a) => Math.hypot(a.x - x, a.z - z) >= minD);
   };
-  // The first two pairs carry the four outer conquest flags (A/C, D/E).
-  // Twins sit NEAR the 180° mirror of each other with a few metres of drift —
-  // organic rather than copy-pasted, but each team's flag distances stay
-  // within a hand-off of fair. Flags also keep real breathing room: at least
-  // 46m from every other flag (including B at the center house).
+  // --- The four outer conquest flags (A/C, D/E): asymmetric by position,
+  // balanced by measurement.
+  //
+  // These used to be two 180°-mirrored pairs, which bought fairness cheaply
+  // but made every map read as a rotated copy of itself. A map doesn't need
+  // mirrored geometry to be fair — it needs each team's PUSH to cost the same.
+  // So greens now land wherever the ground allows, and a candidate set is
+  // accepted only if measured approach costs come out level:
+  //   · each team is cheapest to exactly two of the four (no 3–1 carve-up),
+  //   · ranked by depth, flags pair off ACROSS teams within DEPTH_TOL — one
+  //     team's deep flag is about as deep as the other's, while sitting
+  //     nowhere near its mirror position,
+  //   · and the net advantage over the whole set stays under NET_TOL.
+  // Flags also keep real breathing room: at least 46m from every other flag
+  // (including B at the center house).
   const FLAG_MIN_DIST = 46;
-  const hamletPairs: Array<[Anchor, Anchor]> = [];
-  for (let pair = 0; pair < 2; pair++) {
-    // Flags already placed (for spacing): B, then both zones of prior pairs.
-    const flagPts: Array<[number, number]> = [[0, 0]];
-    for (const [pa, pb] of hamletPairs) flagPts.push([pa.x, pa.z], [pb.x, pb.z]);
-    const flagRoom = (px: number, pz: number): boolean =>
-      flagPts.every(([fx, fz]) => Math.hypot(fx - px, fz - pz) >= FLAG_MIN_DIST);
-    for (let attempt = 0; attempt < 40; attempt++) {
-      const ang = rng() * Math.PI * 2;
-      const rad = 48 + rng() * 40;
-      const x = Math.cos(ang) * rad;
-      const z = Math.sin(ang) * rad;
-      // The twin drifts off the exact mirror point.
-      const bx = -x + (rng() * 2 - 1) * 7;
-      const bz = -z + (rng() * 2 - 1) * 7;
-      if (!anchorClear(x, z, 36, 68, 0.04) || !anchorClear(bx, bz, 36, 68, 0.04)) continue;
-      if (!flagRoom(x, z) || !flagRoom(bx, bz)) continue;
-      const axis = rng() * Math.PI;
-      const count = 5 + Math.floor(rng() * 2);
-      const a: Anchor = { type: "hamlet", x, z, axis, count };
-      const b: Anchor = {
-        type: "hamlet",
-        x: bx,
-        z: bz,
-        axis: axis + (rng() * 2 - 1) * 0.4,
-        count,
-      };
-      anchors.push(a, b);
-      hamletPairs.push([a, b]);
-      break;
+  const NET_TOL = 14; // metres of net approach cost across all four greens
+  const RAW_TOL = 22; // same, on bare distance — a check on the cost proxy
+  const DEPTH_TOL = 26; // metres between rank-paired opposing greens
+  // Approach cost: the straight run from a spawn, surcharged for fords and
+  // climbs. Not a pathfind — a cheap stand-in for how hard the push is, and
+  // enough to stop one team from owning the whole easy half of the map.
+  const approachCost = (sx: number, sz: number, px: number, pz: number): number => {
+    const dist = Math.hypot(px - sx, pz - sz);
+    const n = 10;
+    let mult = 0;
+    for (let k = 0; k < n; k++) {
+      const t = (k + 0.5) / n;
+      const x = sx + (px - sx) * t;
+      const z = sz + (pz - sz) * t;
+      const wet = waterCarveAt(x, z) > 0.1 ? 0.35 : 0;
+      mult += 1 + wet + Math.max(0, terrainBase(x, z) - 1.2) * 0.1;
     }
+    return (dist * mult) / n;
+  };
+  // adv > 0 means team 0 (the south spawn) gets there cheaper. `raw` is the
+  // same measure on bare distance: the surcharges above are a coarse proxy, so
+  // the set has to look level on plain metres too before we trust them.
+  interface Green {
+    x: number;
+    z: number;
+    adv: number;
+    raw: number;
+  }
+  const advOf = (px: number, pz: number): number =>
+    approachCost(0, 100, px, pz) - approachCost(0, -100, px, pz);
+  const rawOf = (px: number, pz: number): number =>
+    Math.hypot(px, pz - 100) - Math.hypot(px, pz + 100);
+
+  // Sample a pool of legal greens once, then search sets within it — far
+  // cheaper than re-rolling positions for every candidate set.
+  const pool: Green[] = [];
+  for (let i = 0; i < 600 && pool.length < 96; i++) {
+    const ang = rng() * Math.PI * 2;
+    const rad = 46 + rng() * 42;
+    const x = Math.cos(ang) * rad;
+    const z = Math.sin(ang) * rad;
+    if (Math.hypot(x, z) < FLAG_MIN_DIST) continue; // B holds the origin
+    if (!anchorClear(x, z, 36, 68, 0.04)) continue;
+    pool.push({ x, z, adv: advOf(x, z), raw: rawOf(x, z) });
+  }
+  const spread = (set: readonly Green[]): boolean =>
+    set.every((g, i) =>
+      set.every((h, j) => j <= i || Math.hypot(g.x - h.x, g.z - h.z) >= FLAG_MIN_DIST),
+    );
+  // Deepest-first for the south pool, deepest-first for the north pool.
+  const southPool = pool.filter((g) => g.adv > 0);
+  const northPool = pool.filter((g) => g.adv < 0);
+  // Draw two distinct entries, deeper one first.
+  const drawPair = (arr: Green[], deeper: (g: Green) => number): [Green, Green] => {
+    const i = Math.floor(rng() * arr.length);
+    let j = Math.floor(rng() * (arr.length - 1));
+    if (j >= i) j++;
+    return deeper(arr[i]) >= deeper(arr[j]) ? [arr[i], arr[j]] : [arr[j], arr[i]];
+  };
+  let bestSet: Green[] | null = null;
+  let bestErr = Infinity;
+  if (southPool.length >= 2 && northPool.length >= 2) {
+    for (let attempt = 0; attempt < 400; attempt++) {
+      const [sDeep, sNear] = drawPair(southPool, (g) => g.adv);
+      const [nDeep, nNear] = drawPair(northPool, (g) => -g.adv);
+      const set = [sDeep, sNear, nDeep, nNear];
+      if (!spread(set)) continue;
+      // Rank-paired depth error, plus the net tilt of the whole set.
+      const deepErr = Math.max(0, Math.abs(sDeep.adv + nDeep.adv) - DEPTH_TOL);
+      const nearErr = Math.max(0, Math.abs(sNear.adv + nNear.adv) - DEPTH_TOL);
+      const net = sDeep.adv + sNear.adv + nDeep.adv + nNear.adv;
+      const netErr = Math.max(0, Math.abs(net) - NET_TOL);
+      const rawNet = sDeep.raw + sNear.raw + nDeep.raw + nNear.raw;
+      const rawErr = Math.max(0, Math.abs(rawNet) - RAW_TOL);
+      const err = deepErr + nearErr + netErr + rawErr;
+      if (err < bestErr) {
+        bestErr = err;
+        bestSet = set;
+        if (err === 0) break; // inside every tolerance; stop looking
+      }
+    }
+  }
+  // Every accepted green becomes a hamlet anchor; sizes vary per green now
+  // that twins no longer have to match each other.
+  // Not every flag is a village green. Some are WORKS — a surveyed yard of
+  // steel sheds, silos and tanks behind a fence. Fighting over a grid of hard
+  // right angles and hard cover plays nothing like fighting over a green, and
+  // it is the clearest signal that two flags on one map are different places.
+  // Capped at two so a map never reads as all industry.
+  const flagAnchors: Anchor[] = [];
+  let works = 0;
+  for (const g of bestSet ?? []) {
+    const industrial = works < SETTLEMENT.worksCap && rng() < SETTLEMENT.worksP;
+    if (industrial) works++;
+    const a: Anchor = industrial
+      ? {
+          type: "industrial",
+          x: g.x,
+          z: g.z,
+          // Works are surveyed: everything squares to one bearing.
+          axis: rng() * Math.PI,
+          count: SETTLEMENT.flagCount[0] + Math.floor(rng() * SETTLEMENT.flagCount[1]),
+          plan: "grid",
+        }
+      : {
+          type: "hamlet",
+          x: g.x,
+          z: g.z,
+          axis: rng() * Math.PI,
+          count: SETTLEMENT.flagCount[0] + Math.floor(rng() * SETTLEMENT.flagCount[1]),
+          plan: rollPlan(),
+        };
+    anchors.push(a);
+    flagAnchors.push(a);
   }
   // Free hamlets and farms land wherever they land — no mirroring. The map
   // is random; only the flag greens above are (nearly) fair-by-position.
-  const nFreeHamlets = 3 + Math.floor(rng() * 2);
+  const nFreeHamlets = SETTLEMENT.freeHamlets[0] + Math.floor(rng() * SETTLEMENT.freeHamlets[1]);
   for (let i = 0; i < nFreeHamlets; i++) {
     for (let attempt = 0; attempt < 40; attempt++) {
       const ang = rng() * Math.PI * 2;
@@ -2616,12 +4583,13 @@ function planLayout(rng: () => number): Layout {
         x,
         z,
         axis: rng() * Math.PI,
-        count: 5 + Math.floor(rng() * 2),
+        count: 5 + Math.floor(rng() * 4),
+        plan: rollPlan(),
       });
       break;
     }
   }
-  const nFarms = 4 + Math.floor(rng() * 3);
+  const nFarms = SETTLEMENT.farms[0] + Math.floor(rng() * SETTLEMENT.farms[1]);
   for (let i = 0; i < nFarms; i++) {
     for (let attempt = 0; attempt < 30; attempt++) {
       const ang = rng() * Math.PI * 2;
@@ -2635,7 +4603,8 @@ function planLayout(rng: () => number): Layout {
         x,
         z,
         axis: rng() * Math.PI,
-        count: 1 + (rng() < 0.55 ? 1 : 0),
+        count: 2 + (rng() < 0.55 ? 1 : 0),
+        plan: "street", // a farmyard is a barn and a house facing a track
       });
       break;
     }
@@ -2645,7 +4614,8 @@ function planLayout(rng: () => number): Layout {
     nodes.push([a.x, a.z]);
     // A clearing pad keeps the cluster centre open and flat (plaza / green /
     // yard) — pads also zero the water carve, so every green is dry.
-    const clearR = a.type === "village" ? 7 : a.type === "hamlet" ? 5 : 3.5;
+    const clearR =
+      a.type === "village" ? 7 : a.type === "industrial" ? 8 : a.type === "hamlet" ? 5 : 3.5;
     pads.push([a.x, a.z, clearR, clearR]);
     if (a.type === "farm") farms.push([a.x, a.z, a.axis]);
   }
@@ -2868,85 +4838,368 @@ function planLayout(rng: () => number): Layout {
     return true;
   };
 
-  // --- Lots along each cluster's street, alternating sides. Villages get the
-  // big landmarks (and sometimes a watchtower); hamlets carry the odd ruin;
-  // farms lean on barns.
+  // --- Lots, laid out by each cluster's own plan (street / green / cluster).
+  // Kind comes first — what the building is FOR — then the climate bends its
+  // material, roof, height and proportions. Villages get the big landmarks
+  // (and sometimes a watchtower); hamlets carry the odd ruin; farms lean on
+  // barns; and every climate rolls its own specials from CLIMATE_TRAITS.
   const localStreets: Array<[number, number, number, number]> = [];
   let towerPlaced = false;
+  // Re-site the village before anything is built. It is the only anchor that
+  // was never validated — hamlets and farms get anchorClear(), the village was
+  // simply dropped near the middle — and between the duel-lane corridor, the
+  // roads that converge on the centre and open water it routinely landed
+  // somewhere that could not hold it. It wants sixteen lots and was placing
+  // three, and on some seeds none, which is why every map read as hamlets and
+  // farms with no town in it. Score candidates by the only thing that matters:
+  // how many of its ring slots are actually buildable.
+  {
+    const v = anchors[0];
+    const probeR = Math.max(13, (v.count * 13) / (2 * Math.PI) + 6);
+    // Scored the way the village will actually be laid out. A ring probe is
+    // the wrong question for a ribbon village, and the street-plan ones were
+    // being sited on a criterion that had nothing to do with where their lots
+    // would go — one map ended up with no town at all.
+    const vdx = Math.cos(v.axis);
+    const vdz = Math.sin(v.axis);
+    const vspan = Math.max(v.count - 1, 0.6) * 8.5;
+    const score = (vx: number, vz: number): number => {
+      let ok = 0;
+      for (let k = 0; k < v.count; k++) {
+        if (v.plan === "street") {
+          const along = (v.count === 1 ? 0 : k / (v.count - 1) - 0.5) * vspan;
+          const off = (k % 2 === 0 ? 1 : -1) * 8; // nominal setback + half depth
+          const cx = vx + vdx * along - vdz * off;
+          const cz = vz + vdz * along + vdx * off;
+          if (lotClear(cx, cz, 10, 8)) ok++;
+          continue;
+        }
+        const ang = (k / v.count) * Math.PI * 2;
+        const ca = Math.cos(ang);
+        const sa = Math.sin(ang);
+        // A green rings a fixed radius (the retry spiral reaches the outer
+        // rank); a cluster scatters through the whole disc.
+        const radii = v.plan === "green" ? [probeR + 4, probeR + 13] : [11, 18, 25];
+        for (const r of radii) {
+          if (lotClear(vx + ca * r, vz + sa * r, 10, 8)) {
+            ok++;
+            break;
+          }
+        }
+      }
+      return ok;
+    };
+    let best = score(v.x, v.z);
+    const consider = (cx: number, cz: number): void => {
+      const sc = score(cx, cz);
+      if (sc > best) {
+        best = sc;
+        v.x = cx;
+        v.z = cz;
+      }
+    };
+    for (let t = 0; t < 60 && best < v.count; t++) {
+      // Off the duel lane by construction, and kept near enough to the middle
+      // that the town is still the map's centre of gravity.
+      consider(-Math.sign(DUEL_LANE_X) * (10 + rng() * 26), (rng() * 2 - 1) * 30);
+    }
+    // Some maps have no room at all on the preferred side — water, or the road
+    // net, or both. Rather than leave the map with no town, widen the search to
+    // the whole playable middle. Off-centre beats absent.
+    for (let t = 0; t < 90 && best < 4; t++) {
+      consider((rng() * 2 - 1) * (half - 46), (rng() * 2 - 1) * 46);
+    }
+  }
+  // Weighted draw from the climate's material bag, so a snow map is timber and
+  // a desert map is mud brick without either being monotonous.
+  const climateStyle = (): BuildingStyle =>
+    TRAITS.styleMix[Math.floor(rng() * TRAITS.styleMix.length)];
+  VILLAGE_LOTS_STAT = [0, anchors[0].count];
   for (const a of anchors) {
     const dir: [number, number] = [Math.cos(a.axis), Math.sin(a.axis)];
     const perp: [number, number] = [-dir[1], dir[0]];
     const spacing = 8.5;
     const spanLen = Math.max(a.count - 1, 0.6) * spacing;
+
+    // --- Works yard. Nothing here shares the town code path: the structures
+    // are different (sheds, silos, tanks), the arrangement is a surveyed grid
+    // rather than anything organic, and every one of them squares to the same
+    // bearing. That regularity IS the read — you know a works from a hamlet at
+    // a glance, before you can make out a single building.
+    if (a.type === "industrial") {
+      const COL = 17; // bay pitch across the yard
+      const ROW = 15; // and along it
+      const cols = 3;
+      let put = 0;
+      for (let i = 0; i < a.count * 6 && put < a.count; i++) {
+        // Walk the grid by CELL. This used to index by attempt, so a bay the
+        // terrain rejected consumed a grid position outright; with the yard
+        // also capped at four rows every works ran out of cells after eight
+        // tries and finished with two sheds and nothing else.
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        if (row > 5) break;
+        const along = (row - 2) * ROW;
+        const across = (col - 1) * COL;
+        // Big halls first, then the vessels that serve them. Any bay past the
+        // second may be a vessel — gated on put === 2 exactly, a silo needed
+        // the third bay specifically to land, and across eleven maps one did.
+        const kind: LotKind =
+          put < 2 ? "shed" : rng() < 0.45 ? "silo" : rng() < 0.5 ? "tank" : "shed";
+        const w = kind === "shed" ? 13 + rng() * 4 : kind === "silo" ? 5.5 : 6.5 + rng() * 1.5;
+        const d = kind === "shed" ? 9 + rng() * 3 : kind === "silo" ? 5.5 : 6.5 + rng() * 1.5;
+        const cx = a.x + dir[0] * along + perp[0] * across;
+        const cz = a.z + dir[1] * along + perp[1] * across;
+        if (!lotClear(cx, cz, w, d)) continue;
+        lots.push({
+          cx,
+          cz,
+          w,
+          d,
+          // Everything faces the same way — that is what surveyed means.
+          front: sideFacing(-perp[0], -perp[1]),
+          stories: kind === "silo" ? 4 : kind === "tank" ? 1 : 2,
+          style: "concrete",
+          roof: "flat",
+          ladder: kind !== "tank",
+          kind,
+        });
+        pads.push([cx, cz, w / 2 + 1.2, d / 2 + 1.2]);
+        put++;
+      }
+      // A haul road straight through the yard, on the survey bearing.
+      localStreets.push([
+        a.x - dir[0] * 38,
+        a.z - dir[1] * 38,
+        a.x + dir[0] * 42,
+        a.z + dir[1] * 42,
+      ]);
+      continue;
+    }
+    // Ring radius for the "green" plan: big enough that count lots fit around
+    // it shoulder to shoulder, and never tighter than the clearing pad.
+    // A green's circumference has to hold the lots themselves, not just their
+    // centres. At the 8.5m street pitch a sixteen-house village needed about
+    // 180m of ring and was given 150, so it saturated after three or four
+    // buildings and then spent every remaining retry failing — the single
+    // biggest reason villages came out as hamlets.
+    const ringR = Math.max(a.type === "village" ? 13 : 10, (a.count * 13) / (2 * Math.PI) + 6);
+    const ringPhase = rng() * Math.PI * 2;
     let placed = 0;
     for (let i = 0; i < a.count * 8 && placed < a.count; i++) {
-      const slot = a.count === 1 ? 0 : placed / (a.count - 1) - 0.5;
-      // Retries wander further and flip sides, so a road or a neighbor's pad
-      // in the way costs one slot position, not the whole lot.
-      const along = slot * spanLen + (rng() - 0.5) * (3 + i * 0.7);
-      const sideSign = (placed + i) % 2 === 0 ? 1 : -1;
       const big = a.type === "village" && placed < 3;
       let kind: LotKind = "house";
-      if (a.type === "village" && !towerPlaced && placed === 3 && rng() < 0.65) kind = "tower";
-      else if (a.type === "farm" && placed === 0 && rng() < 0.6) kind = "barn";
+      // The one landmark. Bounded by attempt count as well as by slot: a 7x7
+      // tower that will not fit used to re-ask for the same blocked spot every
+      // retry — one village burned 56 of them and got no tower AND no house.
+      if (a.type === "village" && !towerPlaced && placed === 3 && i - placed < 10 && rng() < 0.65) {
+        kind = "tower";
+      } else if (a.type === "farm" && placed === 0 && rng() < 0.6) kind = "barn";
       else if (a.type === "hamlet" && rng() < 0.12) kind = "ruin";
-      const w =
-        kind === "tower"
-          ? 7
-          : kind === "barn"
-            ? 10 + rng() * 3
-            : Math.min(13, (big ? 9.5 : 6.5) + rng() * 4);
-      const d =
-        kind === "tower"
-          ? 7
-          : kind === "barn"
-            ? 7.5 + rng() * 2
-            : Math.min(11, 6 + rng() * (big ? 4.5 : 3));
-      const setback = a.type === "farm" ? 3 + rng() * 6 : 1.0 + rng() * 1.5;
-      const off = 2 + setback + d / 2;
-      const cx = a.x + dir[0] * along + perp[0] * off * sideSign;
-      const cz = a.z + dir[1] * along + perp[1] * off * sideSign;
+      else if (!big && rng() < TRAITS.specialP) {
+        kind = TRAITS.specialKinds[Math.floor(rng() * TRAITS.specialKinds.length)];
+      }
+      // Footprint. Houses take the climate's elongation (long timber halls in
+      // the cold, compact blocks in the sand); the purpose-built kinds keep
+      // their own proportions, because a granary is a granary anywhere.
+      let w: number;
+      let d: number;
+      if (kind === "tower") {
+        // Narrow and tall. At 7x7 over three storeys the village's one landmark
+        // came out wider than it was high — a block, not a watchtower, and
+        // invisible from anywhere you would actually want to see it from.
+        w = 5.2;
+        d = 5.2;
+      } else if (kind === "barn") {
+        w = 10 + rng() * 3;
+        d = 7.5 + rng() * 2;
+      } else if (kind === "longhouse") {
+        w = 15 + rng() * 5;
+        d = 6 + rng() * 1.5;
+      } else if (kind === "granary") {
+        w = 5 + rng() * 1.5;
+        d = 5 + rng() * 1.5;
+      } else if (kind === "compound") {
+        w = 10 + rng() * 3;
+        d = 9.5 + rng() * 2.5;
+      } else if (kind === "roundhut") {
+        // Round: one diameter, no frontage to elongate.
+        w = 6.5 + rng() * 2.5;
+        d = w;
+      } else if (kind === "stilt") {
+        w = 7.5 + rng() * 2.5;
+        d = 6.5 + rng() * 2;
+      } else {
+        const base = (big ? 9.5 : 6.5) + rng() * 4;
+        w = Math.min(14, base * TRAITS.elongation);
+        d = Math.min(11, (6 + rng() * (big ? 4.5 : 3)) / Math.sqrt(TRAITS.elongation));
+      }
+
+      // Where the lot sits, and which way it faces — the plan decides both.
+      let cx: number;
+      let cz: number;
+      let faceX: number;
+      let faceZ: number;
+      if (a.plan === "green") {
+        // Ring the clearing, fronts turned in. Retries nudge along the ring
+        // AND push outward: pinned to one radius, the village lost every slot
+        // a road or the duel lane happened to cross, and the main village was
+        // placing three lots out of sixteen. Walking out in a spiral lets it
+        // thicken into a second rank instead of giving the slot up.
+        const tries = i - placed;
+        const ang = ringPhase + ((placed + tries * 0.37) / a.count) * Math.PI * 2;
+        const rad = ringR + d / 2 + (rng() - 0.5) * 2.5 + Math.min(tries, 26) * 0.55;
+        cx = a.x + Math.cos(ang) * rad;
+        cz = a.z + Math.sin(ang) * rad;
+        faceX = a.x - cx;
+        faceZ = a.z - cz;
+      } else if (a.plan === "cluster") {
+        // Grown, not planned: scattered inside a loose disc, each building
+        // roughly facing the centre but free to sit askew.
+        const ang = rng() * Math.PI * 2;
+        const rad = 8 + rng() * (a.type === "village" ? 18 : 13);
+        cx = a.x + Math.cos(ang) * rad;
+        cz = a.z + Math.sin(ang) * rad;
+        const turn = (rng() - 0.5) * 1.8;
+        faceX = (a.x - cx) * Math.cos(turn) - (a.z - cz) * Math.sin(turn);
+        faceZ = (a.x - cx) * Math.sin(turn) + (a.z - cz) * Math.cos(turn);
+      } else {
+        // Ribbon along the axis, alternating sides. Retries wander further and
+        // flip sides, so a road or a neighbor's pad in the way costs one slot
+        // position, not the whole lot.
+        const slot = a.count === 1 ? 0 : placed / (a.count - 1) - 0.5;
+        const along = slot * spanLen + (rng() - 0.5) * (3 + i * 0.7);
+        const sideSign = (placed + i) % 2 === 0 ? 1 : -1;
+        const setback = a.type === "farm" ? 3 + rng() * 6 : 1.0 + rng() * 1.5;
+        const off = 2 + setback + d / 2;
+        cx = a.x + dir[0] * along + perp[0] * off * sideSign;
+        cz = a.z + dir[1] * along + perp[1] * off * sideSign;
+        faceX = -perp[0] * sideSign;
+        faceZ = -perp[1] * sideSign;
+      }
       if (!lotClear(cx, cz, w, d)) continue;
       if (kind === "tower") towerPlaced = true;
-      const front = sideFacing(-perp[0] * sideSign, -perp[1] * sideSign);
-      const stories =
-        kind === "tower"
-          ? 3
-          : kind === "barn"
-            ? 2
-            : kind === "ruin"
-              ? 1
-              : big
-                ? 2 + (rng() < 0.5 ? 1 : 0)
-                : rng() < 0.5
-                  ? 1
-                  : rng() < 0.82
-                    ? 2
-                    : 3;
-      lots.push({
-        cx,
-        cz,
-        w,
-        d,
-        front,
-        stories,
-        style:
-          kind === "barn"
+      const front = sideFacing(faceX, faceZ);
+
+      // Height. Purpose fixes some kinds outright; the rest take the climate's
+      // story bias — stacked flat-roofed blocks in arid country, low halls
+      // under snow.
+      let stories: number;
+      if (kind === "tower") stories = 5;
+      // A hut is one drum and a stilt house is one raised room — both are
+      // single-storey by definition, and their generators assume it.
+      else if (kind === "roundhut" || kind === "stilt") stories = 1;
+      else if (kind === "barn" || kind === "compound") stories = 2;
+      else if (kind === "ruin") stories = 1;
+      else if (kind === "granary") stories = 3;
+      else if (kind === "longhouse") stories = rng() + TRAITS.storyBias < 0.75 ? 1 : 2;
+      else if (big) stories = 2 + (rng() + TRAITS.storyBias < 0.5 ? 0 : 1);
+      else {
+        const r = rng() - TRAITS.storyBias;
+        stories = r < 0.5 ? 1 : r < 0.82 ? 2 : 3;
+      }
+
+      // Material. Towers and barns are what the settlement could afford to
+      // build them from; everything else draws the climate's mix.
+      const style: BuildingStyle =
+        kind === "barn"
+          ? TRAITS.styleMix.includes("log")
             ? "log"
-            : kind === "tower"
-              ? rng() < 0.5
-                ? "brick"
-                : "concrete"
-              : styleBag[si++ % styleBag.length],
-        roof:
-          kind === "tower" ? "flat" : kind === "barn" ? "gable" : rng() < 0.5 ? "gable" : "flat",
-        ladder: kind === "tower" ? true : rng() < 0.5,
-        kind,
-      });
-      pads.push([cx, cz, w / 2 + 0.9, d / 2 + 0.9]);
+            : "brick"
+          : kind === "tower"
+            ? rng() < 0.5
+              ? "brick"
+              : "concrete"
+            : kind === "compound"
+              ? "adobe"
+              : climateStyle();
+
+      // Roof. Snow and rain force a pitch; arid country roofs flat and uses
+      // the space. Barns and longhouses are always gabled, towers always flat.
+      const roof: "flat" | "gable" =
+        kind === "roundhut" || kind === "stilt"
+          ? "gable" // both carry their own roof; the field is unused
+          : kind === "tower" || kind === "compound"
+            ? "flat"
+            : kind === "barn" || kind === "longhouse"
+              ? "gable"
+              : rng() < TRAITS.flatRoofP
+                ? "flat"
+                : "gable";
+
+      // Massing. A house that is one box reads as one box however good its
+      // roof is; real vernacular grows a lower wing off the main block, and
+      // the stepped ridge is most of what makes a village skyline. Split the
+      // lot ACROSS its long axis rather than growing it — the pad below is
+      // derived from w/d, and widening a footprint moves the heightfield,
+      // which would invalidate every baked spawn-cover repair.
+      const wingable =
+        (kind === "house" || kind === "barn") && stories === 2 && Math.max(w, d) > 9.5;
+      // Kept deliberately low: a wing is a whole second envelope, and brick
+      // walls cost ~9.6 panels per square metre, so this rate is what fits the
+      // panel budget on the densest temperate seeds.
+      const wing = wingable && rng() < 0.28;
+      if (wing) {
+        const alongX = w >= d;
+        const span = alongX ? w : d;
+        const mainL = span * (0.58 + rng() * 0.08);
+        const wingL = span - mainL;
+        // Main block keeps the storeys and the ridge; the wing is a single
+        // storey under its own lower roof, flush against the party wall.
+        const off = (span - mainL) / 2;
+        lots.push({
+          cx: cx + (alongX ? -off : 0),
+          cz: cz + (alongX ? 0 : -off),
+          w: alongX ? mainL : w,
+          d: alongX ? d : mainL,
+          front,
+          stories,
+          style,
+          roof,
+          ladder: rng() < 0.5,
+          kind,
+        });
+        // The wing abuts the main block on one face — putting its door there
+        // would open it into a wall, so a door that lands on the party side
+        // moves to the opposite face.
+        const party = alongX ? 3 : 1;
+        lots.push({
+          cx: cx + (alongX ? (span - wingL) / 2 : 0),
+          cz: cz + (alongX ? 0 : (span - wingL) / 2),
+          w: alongX ? wingL : w * (0.72 + rng() * 0.16),
+          d: alongX ? d * (0.72 + rng() * 0.16) : wingL,
+          front: front === party ? (((party + 2) % 4) as 0 | 1 | 2 | 3) : front,
+          stories: 1,
+          style,
+          roof,
+          ladder: false,
+          kind: "house",
+        });
+      } else {
+        lots.push({
+          cx,
+          cz,
+          w,
+          d,
+          front,
+          stories,
+          style,
+          roof,
+          ladder: kind === "tower" || kind === "granary" ? true : rng() < 0.5,
+          kind,
+        });
+      }
+      // A compound reserves its whole walled yard: neighbours keep out, and
+      // the ground inside is flattened like the courtyard it is. COURTYARD_PAD
+      // must stay above the widest setback courtyard() can roll.
+      const yard = kind === "compound" ? COURTYARD_PAD : 0.9;
+      pads.push([cx, cz, w / 2 + yard, d / 2 + yard]);
       placed++;
+      if (a.type === "village") VILLAGE_LOTS_STAT[0]++;
     }
-    if (a.count >= 2) {
+    // Only ribbon plans get a street through them; greens and clusters are
+    // reached by the road network at their anchor node.
+    if (a.plan === "street" && a.count >= 2) {
       localStreets.push([
         a.x - dir[0] * spanLen * 0.55,
         a.z - dir[1] * spanLen * 0.55,
@@ -2964,13 +5217,15 @@ function planLayout(rng: () => number): Layout {
   // Top-up: crowded seeds (rivers, hills, roads in all the wrong places) can
   // starve the clusters — back-fill outlying lots around the hamlets until
   // the settlement is worth fighting over.
-  for (let i = 0; i < 160 && lots.length < 26; i++) {
+  // This cap, not the panel budget, was what actually pinned every map to
+  // roughly forty buildings — most maps finish 6-18k panels under budget.
+  for (let i = 0; i < 420 && lots.length < SETTLEMENT.lotTarget; i++) {
     const a = anchors[i % anchors.length];
     if (a.type === "farm") continue;
     const ang = rng() * Math.PI * 2;
     const dist = 10 + rng() * 14;
-    const w = 6.5 + rng() * 4;
-    const d = 6 + rng() * 3;
+    const w = Math.min(14, (6.5 + rng() * 4) * TRAITS.elongation);
+    const d = (6 + rng() * 3) / Math.sqrt(TRAITS.elongation);
     const cx = a.x + Math.cos(ang) * dist;
     const cz = a.z + Math.sin(ang) * dist;
     if (!lotClear(cx, cz, w, d)) continue;
@@ -2980,9 +5235,9 @@ function planLayout(rng: () => number): Layout {
       w,
       d,
       front: sideFacing(a.x - cx, a.z - cz),
-      stories: rng() < 0.5 ? 1 : 2,
-      style: styleBag[si++ % styleBag.length],
-      roof: rng() < 0.5 ? "gable" : "flat",
+      stories: rng() - TRAITS.storyBias < 0.5 ? 1 : 2,
+      style: climateStyle(),
+      roof: rng() < TRAITS.flatRoofP ? "flat" : "gable",
       ladder: rng() < 0.5,
       kind: "house",
     });
@@ -3136,13 +5391,15 @@ function planLayout(rng: () => number): Layout {
   ROAD_SEGS = roads;
   rebuildRoadGrid();
 
-  // Conquest zones: the center house plus the four mirrored hamlet greens —
-  // fair by construction, always on flat dry clearing pads. (With fewer than
-  // two hamlet pairs — vanishingly rare — mirrored fallback flags fill in.)
-  const zonePos: Array<[number, number]> = [];
-  for (const [a, b] of hamletPairs.slice(0, 2)) {
-    zonePos.push([a.x, a.z], [b.x, b.z]);
-  }
+  // Conquest zones: the center house plus the four balanced hamlet greens,
+  // always on flat dry clearing pads. (If the pool couldn't seat four —
+  // vanishingly rare — mirrored fallback flags fill in.)
+  const zonePos: Array<[number, number]> = flagAnchors
+    .slice(0, 4)
+    // Ring order, counter-clockwise from due east, so a letter always means
+    // "roughly over there" even though the greens no longer mirror.
+    .sort((a, b) => Math.atan2(a.z, a.x) - Math.atan2(b.z, b.x))
+    .map((a): [number, number] => [a.x, a.z]);
   while (zonePos.length < 4) {
     // Mirrored fallback pairs, far apart from each other and from B.
     const x = 54 + zonePos.length * 6;
@@ -3150,8 +5407,7 @@ function planLayout(rng: () => number): Layout {
     zonePos.push([-x, -z], [x, z]);
     pads.push([-x, -z, 5, 5], [x, z, 5, 5]);
   }
-  // Stable lettering: A/C the pair nearer the west–east axis ends, D/E the
-  // other — keeps the HUD's letters meaning "roughly where" across seeds.
+  // Stable lettering around that ring.
   const zones = [
     { letter: "A", x: zonePos[0][0], z: zonePos[0][1], r: 12 },
     { letter: "B", x: 0, z: 0, r: 12 },
@@ -3185,12 +5441,38 @@ function validateSpawnCover(): void {
   }
 }
 
+// Set only by curateSpawnRepairs(), so the search sees the raw heightfield
+// instead of one the previous table has already fixed.
+let SKIP_BAKED_REPAIRS = false;
+
 // Build-time helper for curating map seeds. Runtime clients and servers use
 // the baked repair stamps below and never execute the expensive ray marcher.
 export function validateCuratedSpawnCover(): boolean {
   const firstRepair = HILLS.length;
   validateSpawnCover();
   return HILLS.length === firstRepair;
+}
+
+// Build-time: run the repair search on a seed with no baked stamps and hand
+// back what it added, ready to paste into CURATED_SPAWN_REPAIRS. Re-run
+// scripts/curate-map-seeds.ts whenever anything moves the heightfield —
+// including the settlement layout, since lot pads flatten terrain through
+// shapeFade.
+export function curateSpawnRepairs(): Array<[number, number, number, number]> {
+  // Rebuild the world WITHOUT this seed's existing baked stamps first. A
+  // caller has necessarily already built the map to look at it, which pushed
+  // the old table into HILLS; searching from there finds an already-sealed map,
+  // reports "nothing to add", and bakes an empty table that unseals it for
+  // real. `npm run test:map-seeds` catches that, but only after the fact.
+  SKIP_BAKED_REPAIRS = true;
+  try {
+    rebuildMap();
+    const firstRepair = HILLS.length;
+    validateSpawnCover();
+    return HILLS.slice(firstRepair).map(([x, z, r, a]) => [x, z, r, a]);
+  } finally {
+    SKIP_BAKED_REPAIRS = false;
+  }
 }
 
 // One full greedy pass; true = no leaks remain.
@@ -3232,6 +5514,7 @@ function validateSpawnCoverPass(): boolean {
   }
 
   const refreshPatch = (hx: number, hz: number, r: number): void => {
+    invalidateBaseHeightPatch(hx, hz, r); // the stamp just changed this ground
     const i0 = Math.max(0, Math.floor((hx - r + R) / cell));
     const i1 = Math.min(N - 1, Math.ceil((hx + r + R) / cell));
     const j0 = Math.max(0, Math.floor((hz - r + R) / cell));
@@ -3399,10 +5682,15 @@ function buildMap(): MapDef {
   FLAT_PADS = [];
   ROAD_SEGS = [];
   ROAD_GRID = new Map();
-  // Seed-derived planning, in fixed order: noise permutation, water, hills,
-  // then the settlement layout (which bakes the roads), then the terrain-only
-  // sightline guarantee — all BEFORE any structure is seated, so everything
-  // lands on the final ground.
+  // Seed-derived planning, in fixed order: climate, noise permutation, water,
+  // hills, then the settlement layout (which bakes the roads), then the
+  // terrain-only sightline guarantee — all BEFORE any structure is seated, so
+  // everything lands on the final ground. Climate goes first: water frequency,
+  // biome mix and relief character all read it.
+  planClimate();
+  // Landform reads TRAITS (island odds are per climate) and is read by the
+  // water carve, so it sits between climate and water.
+  planLandform(mulberry32(subSeed(0x33)));
   terrainNoise2D = createNoise2D(mulberry32(SEED ^ 0x5eed));
   planWater(mulberry32(subSeed(0x11)));
   planHills(mulberry32(subSeed(0x22)));
@@ -3414,7 +5702,7 @@ function buildMap(): MapDef {
   // timer keeps players in (see sim/client). The layout fills FLAT_PADS +
   // ROAD_SEGS before any geometry is seated on the terrain.
   LAYOUT = planLayout(rng);
-  const repairs = CURATED_SPAWN_REPAIRS[SEED];
+  const repairs = SKIP_BAKED_REPAIRS ? undefined : CURATED_SPAWN_REPAIRS[SEED];
   if (repairs) {
     for (const [x, z, radius, amplitude] of repairs) HILLS.push([x, z, radius, amplitude]);
   }
@@ -3432,24 +5720,69 @@ function buildMap(): MapDef {
       ruin(g, lot.cx, lot.cz, lot.w, lot.d, rng);
       return;
     }
+    // Works structures have nothing in common with the house generator.
+    if (lot.kind === "shed") {
+      shed(g, lot.cx, lot.cz, lot.w, lot.d, f, lot.stories, rng);
+      return;
+    }
+    if (lot.kind === "silo") {
+      silo(g, lot.cx, lot.cz, rng, lot.stories);
+      return;
+    }
+    if (lot.kind === "tank") {
+      tank(g, lot.cx, lot.cz, lot.w, rng);
+      return;
+    }
+    // Neither of these is a box with a roof on it, so neither goes through
+    // building() — the whole point is that they don't share its silhouette.
+    if (lot.kind === "roundhut") {
+      roundHut(g, lot.cx, lot.cz, lot.w, f, lot.style, rng);
+      return;
+    }
+    if (lot.kind === "stilt") {
+      stiltHouse(g, lot.cx, lot.cz, lot.w, lot.d, f, lot.style, rng);
+      return;
+    }
     const doorSides: Array<0 | 1 | 2 | 3> = [f];
     if (!fixedCenter) {
-      if (rng() < 0.78) doorSides.push(((f + 2) % 4) as 0 | 1 | 2 | 3); // opposite
-      if (rng() < 0.45) doorSides.push(((f + 1) % 4) as 0 | 1 | 2 | 3); // a side
-      if (rng() < 0.22) doorSides.push(((f + 3) % 4) as 0 | 1 | 2 | 3); // the other side
+      // A granary is a store: one door, blank walls, and that's the point —
+      // it reads as a solid block of cover you have to walk around.
+      const through = lot.kind === "granary" ? 0.15 : 0.78;
+      if (rng() < through) doorSides.push(((f + 2) % 4) as 0 | 1 | 2 | 3); // opposite
+      if (lot.kind !== "granary") {
+        if (rng() < 0.45) doorSides.push(((f + 1) % 4) as 0 | 1 | 2 | 3); // a side
+        if (rng() < 0.22) doorSides.push(((f + 3) % 4) as 0 | 1 | 2 | 3); // the other side
+      }
     }
+    // A longhouse is one hall end to end, like a barn — but with a normal
+    // doorway rather than a wagon door, so it takes the barn interior only
+    // when it's big enough to be worth hollowing out.
+    const openHall = lot.kind === "barn" || (lot.kind === "longhouse" && lot.stories === 1);
     building(g, lot.cx, lot.cz, lot.w, lot.d, {
+      kind: lot.kind,
       stories: lot.stories,
       style: lot.style,
       doorSides,
       roof: lot.roof,
       ladder: lot.ladder,
       rng,
-      barn: lot.kind === "barn",
-      parapet: lot.kind === "tower" || (lot.roof === "flat" && !fixedCenter && rng() < 0.4),
-      porch: lot.kind === "house" && !fixedCenter && lot.stories <= 2 && rng() < 0.4,
-      chimney: lot.kind === "house" && lot.style === "brick" && rng() < 0.55,
+      barn: openHall,
+      wagonDoor: lot.kind === "barn",
+      parapet:
+        lot.kind === "tower" ||
+        lot.kind === "compound" ||
+        (lot.roof === "flat" && !fixedCenter && rng() < TRAITS.parapetP),
+      porch:
+        (lot.kind === "house" || lot.kind === "longhouse") &&
+        !fixedCenter &&
+        lot.stories <= 2 &&
+        rng() < TRAITS.porchP,
+      chimney: lot.kind !== "granary" && lot.kind !== "tower" && rng() < TRAITS.chimneyP,
     });
+    // Arid settlements build behind a wall: the compound's courtyard is a
+    // real piece of level geometry, not a texture — chest-high cover with one
+    // gateway, so pushing a desert hamlet plays differently from a snow one.
+    if (lot.kind === "compound") courtyard(g, lot.cx, lot.cz, lot.w, lot.d, lot.front, rng);
   });
 
   // Procedural scatter for everything else, rejected against keep-outs.
@@ -3530,17 +5863,18 @@ function buildMap(): MapDef {
   // inside tree(). Capped hard: trees are the panel budget's biggest
   // customer.
   const treeRng = mulberry32(subSeed(0x7e));
-  const TREE_CAP = 170; // trimmed a touch: the denser settlement takes the panels
+  const TREE_CAP = 210;
   const treeBias = [-0.14, 0.2, -0.08, -0.02]; // meadow, forest, rocky, marsh
+  const climTree = TRAITS.treeDensity; // jungles close in, dune seas thin out
   let treeCount = 0;
-  for (let i = 0; i < 2600 && treeCount < TREE_CAP; i++) {
+  for (let i = 0; i < 3400 && treeCount < TREE_CAP; i++) {
     const x = (treeRng() * 2 - 1) * (half - 6);
     const z = (treeRng() * 2 - 1) * (half - 6);
     const keepCoreOpen = treeRng();
     const loneRoll = treeRng();
     if (Math.hypot(x, z) < 26 && keepCoreOpen < 0.7) continue; // the plaza approach stays readable
     const b = biomeAt(x, z);
-    const density = fbm2(x + 5200, z + 5200, 3, 1 / 52) * 0.5 + 0.5 + treeBias[b];
+    const density = fbm2(x + 5200, z + 5200, 3, 1 / 52) * 0.5 + 0.5 + treeBias[b] + climTree;
     if (density < 0.46) continue;
     if (density < 0.56 && loneRoll > 0.12) continue; // lone field trees only
     const spacing = density > 0.72 ? 2.1 : 3.1;
@@ -3550,9 +5884,12 @@ function buildMap(): MapDef {
     treeCount++;
   }
 
-  // Boulder clusters — most live on the rocky high ground.
+  // Boulder clusters — most live on the rocky high ground. Bare climates strew
+  // more of them (they are the only cover a dune sea or a mesa field has);
+  // jungle floors bury them under canopy instead.
   const rockRng = mulberry32(subSeed(0x5c));
-  for (let i = 0; i < 56; i++) {
+  const ROCK_CLUSTERS = Math.round(74 * TRAITS.rockDensity);
+  for (let i = 0; i < ROCK_CLUSTERS; i++) {
     for (let attempt = 0; attempt < 20; attempt++) {
       const x = (rockRng() * 2 - 1) * (half - 5);
       const z = (rockRng() * 2 - 1) * (half - 5);
@@ -3604,8 +5941,9 @@ function buildMap(): MapDef {
   }
 
   // Hedgerows: field boundaries lacing the open meadows (woods and rocky
-  // ground grow their own cover).
-  for (let i = 0; i < 22; i++) {
+  // ground grow their own cover). Farmed country only — see hedgeDensity.
+  const HEDGES = Math.round(30 * TRAITS.hedgeDensity);
+  for (let i = 0; i < HEDGES; i++) {
     for (let attempt = 0; attempt < 24; attempt++) {
       const x = (rng() * 2 - 1) * (half - 10);
       const z = (rng() * 2 - 1) * (half - 10);
@@ -3758,6 +6096,41 @@ export const MAP: MapDef = {
 // Rebuild the world from `seed`. Idempotent per seed: reconnecting clients
 // call it on every welcome and only pay when the seed actually changed.
 // Craters reset with the rebuild — destruction state arrives separately.
+// The client draws these four materials with a mesh that is NOT a unit cube,
+// so ex/ey/ez — which IS the collider, and the only thing pieceAt() and the
+// merged slab bodies ever see — has to be the mesh's true world AABB.
+// Measured, not guessed: foliage overshot its box by 39% across (you could see
+// leaves a bullet flew straight through) and a conifer bough underfilled it by
+// 13% (you could hit a cone that was not there).
+//
+// Each number is the unit geometry's own AABB. The client scales every one of
+// them by the inverse so the mesh lands exactly on the unit box, and asserts
+// that it did — so the two halves cannot drift apart silently.
+export const MESH_FIT: Readonly<Record<string, readonly [number, number, number]>> = {
+  // Foliage and rock are spun about Y per piece, so their horizontal bound is
+  // the swept radius rather than the resting box.
+  canopy: [1.389, 1.22, 1.389],
+  rock: [1.201, 0.981, 1.201],
+  bough: [0.866, 1, 1],
+  frond: [1, 1, 0.836],
+};
+
+// Applied AFTER generation on purpose. Every overlap, clearance and contact
+// decision upstream is about where the leaves are DRAWN, which is the question
+// those decisions are actually asking; only the collider needs the true bound.
+function fitOrganicColliders(panels: PanelDef[]): void {
+  for (const p of panels) {
+    const f = MESH_FIT[p.material];
+    // An oriented piece's box is already a rotated bound, so scaling its world
+    // axes would mean nothing. Those are fitted at emission instead, where the
+    // mesh's own local dimensions are still in hand.
+    if (!f || p.rot) continue;
+    p.ex *= f[0];
+    p.ey *= f[1];
+    p.ez *= f[2];
+  }
+}
+
 export function initMap(seed: number): void {
   const s = seed >>> 0;
   if (s === SEED && MAP.panels.length > 0) return;
@@ -3769,6 +6142,7 @@ function rebuildMap(): void {
   baseHeightCache = null;
   resetCraters();
   const def = buildMap();
+  fitOrganicColliders(def.panels);
   MAP.statics = def.statics;
   MAP.panels = def.panels;
   MAP.buildings = def.buildings;

@@ -186,10 +186,23 @@ export interface FallingChunk {
   body: Body;
   calmTicks: number;
   bornTick: number;
+  radius: number; // crush footprint about the chunk's centre of mass
+  crushed: Set<number>; // players already hit by THIS chunk
 }
 
 const FALLING_CAP = 24; // concurrent chunks (each may hold dozens of pieces)
 const FALL_TIMEOUT_TICKS = 6 * TICK_RATE;
+
+// A falling chunk this size or larger, moving this fast, hurts what it lands
+// on. Below the speed gate a chunk that is merely settling or nudging along
+// the ground is harmless, which is what keeps rubble from being a minefield.
+const CRUSH_MIN_SPEED = 4.2; // m/s
+const CRUSH_MIN_PIECES = 3;
+const CRUSH_MAX_DAMAGE = 92; // a full storey landing on you is near-lethal
+// Above this, a released cluster is split into several tumbling chunks. One
+// rigid body holding a whole building neither reads as a collapse nor
+// simulates well — real structures come apart as they come down.
+const MAX_CHUNK_PIECES = 28;
 
 // Conquest zone state, parallel to map.ZONES. v in [-100, 100]: negative is
 // team 0's side, positive team 1's; owner flips at the poles and neutralizes
@@ -248,6 +261,13 @@ const RUBBLE_CHANCE: Partial<Record<PanelMaterial, number>> = {
   metal: 0.5,
 };
 const RUBBLE_CAP = 1200; // mirrors the client's instanced rubble pool
+// Ceiling on ALL persistent runtime pieces, settled collapse debris included.
+// Every settled piece is a permanent static body on the server and an instanced
+// slot on the client, and neither shrinks — without this a match that levels
+// enough buildings walks the body count up until the client falls out of its
+// pools into one mesh per piece (and, eventually, the physics world gives up).
+// Must stay at or under the client's looseBoxes pool.
+const BUILT_PANEL_CAP = 2400;
 
 // The entire game state and every gameplay rule, deterministic given the
 // seed and the input stream. The server owns connections, input buffering,
@@ -590,7 +610,7 @@ export class GameSim {
     victim: SimPlayer,
     dmg: number,
     attacker: SimPlayer,
-    weapon: "rifle" | "grenade" | "melee",
+    weapon: "rifle" | "grenade" | "melee" | "crush",
   ): void {
     if (SANDBOX) return;
     if (victim.dead || this.tick < victim.protectUntilTick || this.phase !== "playing") return;
@@ -767,7 +787,22 @@ export class GameSim {
       else clusters.set(root, [batch[i]]);
     }
 
-    for (const pieces of clusters.values()) {
+    // Break any cluster too big to be one believable rigid body into spatially
+    // contiguous sub-chunks (sorted bottom-up, so a collapsing wall shears into
+    // courses rather than tipping over as a single slab).
+    const groups: PanelDef[][] = [];
+    for (const cluster of clusters.values()) {
+      if (cluster.length <= MAX_CHUNK_PIECES) {
+        groups.push(cluster);
+        continue;
+      }
+      const sorted = [...cluster].sort((a, b) => a.y - b.y || a.x - b.x || a.z - b.z);
+      const parts = Math.ceil(sorted.length / MAX_CHUNK_PIECES);
+      const size = Math.ceil(sorted.length / parts);
+      for (let i = 0; i < sorted.length; i += size) groups.push(sorted.slice(i, i + size));
+    }
+
+    for (const pieces of groups) {
       const id = this.nextBuiltPanelId++;
       let ox = 0;
       let oy = 0;
@@ -793,6 +828,14 @@ export class GameSim {
         const kick = Math.min(7, 11 / (1 + d)) / Math.max(1, Math.sqrt(pieces.length / 4));
         vel = [(dx / d) * kick, Math.abs(dy / d) * kick * 0.5 + 1.5, (dz / d) * kick];
       }
+      let far = 0;
+      for (const p of pieces) {
+        far = Math.max(
+          far,
+          Math.hypot(p.x - origin[0], p.y - origin[1], p.z - origin[2]) +
+            Math.max(p.ex, p.ey, p.ez) / 2,
+        );
+      }
       this.falling.set(id, {
         id,
         origin,
@@ -800,6 +843,8 @@ export class GameSim {
         body: createFallingChunkBody(this.gw, id, origin, pieces, vel),
         calmTicks: 0,
         bornTick: this.tick,
+        radius: far,
+        crushed: new Set(),
       });
       this.outbox.push({ type: "fall", chunkId: id, origin, pieces });
     }
@@ -819,6 +864,7 @@ export class GameSim {
       }
       const v = f.body.linearVelocity();
       const w = f.body.angularVelocity();
+      this.crushUnder(f, pos, Math.hypot(v.x, v.y, v.z));
       const calm = Math.hypot(v.x, v.y, v.z) < 0.18 && Math.hypot(w.x, w.y, w.z) < 0.3;
       f.calmTicks = calm ? f.calmTicks + 1 : 0;
       if (f.calmTicks < 8 && this.tick - f.bornTick < FALL_TIMEOUT_TICKS) continue;
@@ -852,12 +898,53 @@ export class GameSim {
           seed: p.seed,
         };
         if (def.y < -1) continue;
+        // Over the ceiling the piece still FELL — it just doesn't persist
+        // where it landed. Dropping the tail of a huge collapse costs a pile
+        // of debris; keeping it costs the frame rate for the rest of the match.
+        if (this.builtPanels.size >= BUILT_PANEL_CAP) continue;
         addPanelBody(this.gw, def);
         this.builtPanels.set(def.id, def);
         settled.push(def);
       }
       if (settled.length > 0) this.navRevision++;
       this.outbox.push({ type: "settle", chunkId: f.id, pieces: settled });
+    }
+  }
+
+  // Masonry coming down hurts. A chunk only crushes once per player — it is a
+  // falling wall, not a damage-over-time field — and only while it is genuinely
+  // moving, so debris settling around someone's ankles is harmless.
+  private crushUnder(
+    f: FallingChunk,
+    pos: { x: number; y: number; z: number },
+    speed: number,
+  ): void {
+    if (speed < CRUSH_MIN_SPEED || f.pieces.length < CRUSH_MIN_PIECES) return;
+    for (const p of this.players) {
+      if (!p || p.dead || f.crushed.has(p.idx)) continue;
+      readChar(p.body, p.state);
+      const dx = p.state.x - pos.x;
+      const dy = p.state.y + PLAYER_HALF_HEIGHT - pos.y;
+      const dz = p.state.z - pos.z;
+      if (Math.hypot(dx, dy, dz) > f.radius + PLAYER_HALF_HEIGHT) continue;
+      f.crushed.add(p.idx);
+      // Scales with how much is falling and how fast — a shed roof bruises, a
+      // two-storey brick wall does not.
+      const mass = Math.min(1, f.pieces.length / MAX_CHUNK_PIECES);
+      const force = Math.min(1, (speed - CRUSH_MIN_SPEED) / 9);
+      const dmg = Math.round(CRUSH_MAX_DAMAGE * (0.28 + 0.72 * mass) * (0.35 + 0.65 * force));
+      // Nobody gets the kill: the building did it. Self-attribution keeps it
+      // out of the killfeed as someone else's frag.
+      this.damagePlayer(p, dmg, p, "crush");
+      if (!p.dead) {
+        // Knocked off your feet and shoved clear of the pile.
+        const n = 1 / (Math.hypot(dx, dz) || 1);
+        p.body.setLinearVelocity(
+          p.state.vx + dx * n * 3.5,
+          p.state.vy + 2.5,
+          p.state.vz + dz * n * 3.5,
+        );
+      }
     }
   }
 
@@ -897,8 +984,26 @@ export class GameSim {
       const gone = b.wallPanelIds.filter((id) => this.destroyedPanels.has(id)).length;
       if (gone >= Math.ceil(b.wallPanelIds.length * b.collapseFraction)) {
         this.collapseBuilding(buildingId);
+      } else if (this.postsFailed(b)) {
+        this.collapseBuilding(buildingId);
       }
     }
+  }
+
+  // Load-bearing failure, separate from the wall-fraction trigger. Posts are
+  // what a stilt house STANDS on — you can leave every wall untouched, cut the
+  // legs, and the whole thing should come down. Chewing through 45% of the
+  // masonry to fell a building you could drop by shooting four posts made the
+  // structure of these buildings a lie.
+  private postsFailed(b: (typeof MAP.buildings)[number]): boolean {
+    let posts = 0;
+    let lost = 0;
+    for (const id of b.wallPanelIds) {
+      if ((panelById.get(id) ?? this.builtPanels.get(id))?.material !== "post") continue;
+      posts++;
+      if (this.destroyedPanels.has(id)) lost++;
+    }
+    return posts >= 3 && lost >= Math.ceil(posts * 0.6);
   }
 
   private maybeLeaveRubble(src: PanelDef): void {
@@ -941,8 +1046,26 @@ export class GameSim {
       for (const id of [...b.wallPanelIds, ...b.roofPanelIds]) this.releasePiece(id);
       return;
     }
-    // Buildings implode: the dramatic full-structure drop with a rubble mound.
-    for (const id of [...b.wallPanelIds, ...b.roofPanelIds]) this.destroyPanel(id, false);
+    // Buildings come DOWN. Deleting the pieces and dropping a rubble mound in
+    // their place made the most dramatic moment in the game the one place the
+    // physics was switched off — the structure simply blinked out. Instead
+    // release what is still standing so it falls, tumbles and settles like any
+    // other cascade, bottom courses first so the thing pancakes onto its own
+    // footprint. Releases are budgeted per tick, so a big building comes apart
+    // over about a second rather than in one frame.
+    const standing = [...b.wallPanelIds, ...b.roofPanelIds].filter(
+      (id) => !this.destroyedPanels.has(id),
+    );
+    standing.sort((p, q) => {
+      const a = panelById.get(p) ?? this.builtPanels.get(p);
+      const c = panelById.get(q) ?? this.builtPanels.get(q);
+      return (a?.y ?? 0) - (c?.y ?? 0);
+    });
+    for (let i = 0; i < standing.length; i += MAX_CHUNK_PIECES) {
+      this.queueRelease(standing.slice(i, i + MAX_CHUNK_PIECES));
+    }
+    // The mound still goes in: it guarantees the footprint stays walkable even
+    // when the release budget or the falling-chunk cap eats part of the drop.
     addRubbleBody(this.gw, b, RUBBLE_HEIGHT);
   }
 

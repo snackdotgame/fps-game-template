@@ -31,6 +31,14 @@ for local development, checks, builds, and upload-oriented publishing workflows.
 - After updating the project-local Snack CLI dependency, run `snack scaffold upgrade` from a clean
   Git worktree to refresh Snack-owned project infrastructure, generated types, and generated skills.
 
+## MCP Server
+
+- Generated projects include `.mcp.json` (Claude Code) and `opencode.json` (OpenCode), so both
+  automatically discover the Snack MCP server.
+- Codex users can register it with `codex mcp add snack -- <runner> snack mcp`, where
+  `<runner>` is the project package manager's runner: `bunx`, `npx`, `pnpm exec`, or `yarn exec`.
+- The server exposes tools for validating, pushing, and publishing the game.
+
 ## Runtime Contract
 
 - Client code imports `client` from `snack:client`.
@@ -40,6 +48,8 @@ for local development, checks, builds, and upload-oriented publishing workflows.
 - Route human-visible player chat through `client.chat` and `server.chat`, not gameplay datagrams or
   streams. Clients send only to the authoritative server; only server code selects recipients with
   `server.chat.send(..., { only, except })`.
+- Set `server.persistence` to `true` in `snack.json` before using `server.localDb`. Access throws
+  when the project has not opted in.
 - Do not use callback-style receive handlers or raw WebTransport/postMessage plumbing.
 - Keep authoritative multiplayer state in server code. Treat browser state as display/input state.
 - Validate network messages before trusting them.
@@ -69,8 +79,9 @@ Load only the skill needed for the current task:
   chat using `client.chat` and `server.chat`.
 - `snack-build-multiplayer` to select and implement turn-based, snapshot interpolation, client
   prediction, rollback, or lag compensation.
-- `snack-3d-physics` for 3D physics, rigid bodies, collision, character movement, or any physical
-  simulation via `jolt-ts`; load it alongside `snack-build-multiplayer` for deterministic networked
+- `snack-3d-physics` for 3D physics, rigid bodies, collision, or physical character movement via
+  `jolt-ts`; use its `jolt-ts-character-controller` guidance for walking, running, jumping, and
+  moving platforms, and load it alongside `snack-build-multiplayer` for deterministic networked
   simulation.
 - `snack-design-binary-protocol` for binary wire formats, bitpacking, quantization, delta
   compression, priority accumulators, and the ~1,000-byte datagram budget; load it alongside the

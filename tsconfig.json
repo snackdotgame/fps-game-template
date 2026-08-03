@@ -5,7 +5,8 @@
     "moduleResolution": "Bundler",
     "strict": true,
     "noEmit": true,
-    "types": ["vite/client", "./.snack/types/client", "./.snack/types/server"]
+    "types": ["vite/client", "./.snack/types/client", "./.snack/types/server"],
+    "skipLibCheck": true
   },
   "include": ["src/**/*.ts", ".snack/types/**/*.d.ts"]
 }

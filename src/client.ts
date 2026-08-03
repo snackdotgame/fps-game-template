@@ -30,6 +30,9 @@ import {
   BIOME_MARSH,
   BIOME_ROCKY,
   chunksTouching,
+  climate,
+  CLIMATE_NAMES,
+  climateName,
   craterList,
   heightAt,
   inEnemyBase,
@@ -48,11 +51,18 @@ import {
   terrainChunkMesh,
   WATER_SURFACE_Y,
   ZONES,
+  MESH_FIT,
 } from "./shared/map.js";
 import { RUBBLE_HEIGHT } from "./shared/constants.js";
 import { RoundedBoxGeometry } from "three/examples/jsm/geometries/RoundedBoxGeometry.js";
 import { mergeGeometries } from "three/examples/jsm/utils/BufferGeometryUtils.js";
-import { parseServerMsg, SPAWN_AUTO, SPAWN_HQ, type PlayerInfo } from "./shared/messages.js";
+import {
+  DEV_CLIMATE_RANDOM,
+  parseServerMsg,
+  SPAWN_AUTO,
+  SPAWN_HQ,
+  type PlayerInfo,
+} from "./shared/messages.js";
 import {
   decodeSnapshot,
   encodeInputs,
@@ -144,9 +154,340 @@ document.body.style.cssText =
   "margin:0;overflow:hidden;background:#0c0f14;touch-action:none;overscroll-behavior:none;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;";
 document.body.appendChild(renderer.domElement);
 
+// ---------------------------------------------------------------------------
+// Climate presentation.
+//
+// The generator picks one climate per seed (a Whittaker temperature/moisture
+// roll — see map.ts) and expresses the four biome ROLES differently in each.
+// This table is the other half of that: what a climate changes about how the
+// world LOOKS — ground, foliage, stone and water.
+//
+// Atmosphere is deliberately NOT in here. Sky, fog and lighting stay fixed
+// across every climate (see SKY_COLOR): re-lighting per biome shifted target
+// contrast and silhouette readability, which is a gameplay property, not a
+// cosmetic one. Climate lives in the surfaces instead.
+//
+// Canopy and rock use INDEX tables: the generator picks a band index and this
+// resolves it against the active climate's row, so nothing extra crosses the
+// wire and a temperate birch and a snowfield aspen are the same two bits.
+interface ClimateTheme {
+  // Ground, blended by colorTerrainFace.
+  grassA: number;
+  grassB: number;
+  grassC: number;
+  dry: number;
+  high: number;
+  rock: number;
+  rockHi: number;
+  sand: number;
+  scorch: number; // crater burn
+  bed: number; // riverbed silt
+  roadDirt: number;
+  roadCobble: number;
+  // Per-biome-role ground casts, lerped over the base (strength in `castK`).
+  forestCast: number;
+  rockyCast: number;
+  marshCast: number;
+  castK: [number, number, number]; // forest, rocky, marsh
+  // Foliage: 8 canopy bands, index 5 is always this climate's needle form.
+  canopy: number[][];
+  // Trunk bark as [hue, sat, light] bases: default, needle, pale, oddity.
+  bark: [number, number, number][];
+  // Rock strata as [hue, sat, light] bases, 4 entries.
+  stone: [number, number, number][];
+  // Water: shallow, deep, foam (rgb 0..1 triples for the shader).
+  wShallow: [number, number, number];
+  wDeep: [number, number, number];
+  wFoam: [number, number, number];
+}
+
+const CLIMATE_THEMES: ClimateTheme[] = [
+  // 0 Temperate — the original palette, unchanged.
+  {
+    grassA: 0x5a8746,
+    grassB: 0x6f9850,
+    grassC: 0x466e3b,
+    dry: 0x8d934f,
+    high: 0x96a76a,
+    rock: 0x6b6256,
+    rockHi: 0x847b6d,
+    sand: 0xb6a578,
+    scorch: 0x4f463b,
+    bed: 0x6a6f52,
+    roadDirt: 0x7a6446,
+    roadCobble: 0x8a857d,
+    forestCast: 0x42632f,
+    rockyCast: 0x7d7a5e,
+    marshCast: 0x4c5c33,
+    castK: [0.42, 0.4, 0.5],
+    canopy: [
+      [0x4e8a3c, 0x5f9c46, 0x3f7a34, 0x6fae52], // 0 summer green
+      [0x356f30, 0x2f6a2c, 0x428039], // 1 deep lush
+      [0x7a9a3e, 0x8aa84a, 0x6e8c34], // 2 yellow-green
+      [0xc8862f, 0xd89a3a, 0xb87328], // 3 autumn gold
+      [0xb04e2a, 0xc25a30, 0x9a3f24], // 4 autumn red
+      [0x2c5733, 0x244c2c, 0x35663b], // 5 conifer
+      [0x8a8a4a, 0x9a9656, 0x7c7c40], // 6 dry olive
+      [0x6e5a3a, 0x7a6440, 0x5e4c30], // 7 dead brown
+    ],
+    bark: [
+      [0.072, 0.42, 0.24],
+      [0.055, 0.45, 0.3],
+      [0.1, 0.06, 0.7],
+      [0.08, 0.12, 0.42],
+    ],
+    stone: [
+      [0.085, 0.04, 0.42],
+      [0.09, 0.17, 0.44],
+      [0.62, 0.05, 0.26],
+      [0.26, 0.16, 0.34],
+    ],
+    wShallow: [0.32, 0.55, 0.57],
+    wDeep: [0.05, 0.19, 0.34],
+    wFoam: [0.9, 0.95, 0.97],
+  },
+  // 1 Snowfield — snow over everything, a low blue-white sun, and haze that
+  // closes the map down. Exposed rock and the odd bare trunk are the only
+  // things left with a hue.
+  {
+    grassA: 0xd6e2ec,
+    grassB: 0xe9eff5,
+    grassC: 0xc0cedb,
+    dry: 0xb6c2cb,
+    high: 0xeff5f9,
+    rock: 0x6d7280,
+    rockHi: 0x8d929e,
+    sand: 0xdde5ec,
+    scorch: 0x5b5f68,
+    bed: 0x93a4b0,
+    roadDirt: 0x9aa3ab,
+    roadCobble: 0xa8b0b8,
+    forestCast: 0xb8c6d3,
+    rockyCast: 0x98a3b0,
+    marshCast: 0xa9bec9,
+    castK: [0.36, 0.44, 0.5],
+    canopy: [
+      [0x5c7f5a, 0x6a8c66, 0x4e7150], // 0 frosted green
+      [0x2f4f3a, 0x28462f, 0x385a42], // 1 deep spruce
+      [0x8fa39a, 0x9db0a6, 0x83968e], // 2 pale sage
+      [0xa88b5e, 0xb89a6c, 0x967a50], // 3 rare rust
+      [0xd4e0e6, 0xe2ecf0, 0xc4d2da], // 4 frost white
+      [0x35503f, 0x2b4534, 0x40604a], // 5 snow-laden spruce
+      [0x76867c, 0x849388, 0x687870], // 6 grey-green
+      [0xb8c4cc, 0xc6d0d6, 0xaab6c0], // 7 bare snowy branches
+    ],
+    bark: [
+      [0.07, 0.16, 0.2],
+      [0.05, 0.28, 0.22],
+      [0.11, 0.04, 0.76],
+      [0.6, 0.03, 0.16],
+    ],
+    stone: [
+      [0.6, 0.05, 0.46],
+      [0.09, 0.1, 0.5],
+      [0.62, 0.06, 0.24],
+      [0.55, 0.04, 0.62],
+    ],
+    wShallow: [0.55, 0.68, 0.74],
+    wDeep: [0.11, 0.26, 0.38],
+    wFoam: [0.95, 0.98, 1.0],
+  },
+  // 2 Desert — ochre sand, a hard high sun and clean air that lets you see
+  // right across the map. The only green left is around water.
+  {
+    grassA: 0xc6a668,
+    grassB: 0xd9bd82,
+    grassC: 0xb08e56,
+    dry: 0xdbc68e,
+    high: 0xe2cf9c,
+    rock: 0x9a7d55,
+    rockHi: 0xb79c72,
+    sand: 0xe3ce99,
+    scorch: 0x6b563c,
+    bed: 0xa89163,
+    roadDirt: 0xb0946a,
+    roadCobble: 0xb0a184,
+    forestCast: 0xb69c68,
+    rockyCast: 0xa88c5f,
+    marshCast: 0x7f8c56,
+    castK: [0.3, 0.38, 0.55],
+    canopy: [
+      [0x7f8f5a, 0x8c9b66, 0x73834e], // 0 dusty green
+      [0x4f7a44, 0x5a884e, 0x456d3c], // 1 palm green
+      [0x9aa06a, 0xa8ad78, 0x8c9260], // 2 pale sage
+      [0xc9a860, 0xd6b76e, 0xbb9a54], // 3 sun-bleached
+      [0xb08a4a, 0xbe9856, 0xa27c40], // 4 ochre
+      [0x5e6b45, 0x53603c, 0x69764e], // 5 desert scrub needle
+      [0x8f8a4e, 0x9d975a, 0x817c44], // 6 dry olive
+      [0x7a6642, 0x88724c, 0x6c5a38], // 7 dead brown
+    ],
+    bark: [
+      [0.09, 0.14, 0.38],
+      [0.06, 0.25, 0.32],
+      [0.1, 0.05, 0.74],
+      [0.08, 0.3, 0.36],
+    ],
+    stone: [
+      [0.09, 0.24, 0.5],
+      [0.075, 0.3, 0.46],
+      [0.06, 0.12, 0.3],
+      [0.11, 0.14, 0.56],
+    ],
+    wShallow: [0.3, 0.63, 0.6],
+    wDeep: [0.05, 0.3, 0.38],
+    wFoam: [0.92, 0.96, 0.94],
+  },
+  // 3 Tropical — saturated wet greens under a humid haze that closes sightlines
+  // right down. The shortest view distance of any climate: fights are close.
+  {
+    grassA: 0x3d6b2e,
+    grassB: 0x4e8137,
+    grassC: 0x2e5525,
+    dry: 0x6d7f3a,
+    high: 0x5b8040,
+    rock: 0x5a5947,
+    rockHi: 0x74705c,
+    sand: 0xc9b98a,
+    scorch: 0x3e3a2c,
+    bed: 0x4f5a3a,
+    roadDirt: 0x6b563c,
+    roadCobble: 0x7c7a6e,
+    forestCast: 0x26461d,
+    rockyCast: 0x53603f,
+    marshCast: 0x33502a,
+    castK: [0.5, 0.38, 0.52],
+    canopy: [
+      [0x3f8a34, 0x4a9b3d, 0x35782c], // 0 vivid green
+      [0x1f5a26, 0x1a5021, 0x27682e], // 1 deep jungle
+      [0x6fa73a, 0x7cb646, 0x639832], // 2 new growth
+      [0xc4453f, 0xd25349, 0xb03a36], // 3 flowering red
+      [0xd8823a, 0xe49246, 0xc67232], // 4 flowering orange
+      [0x214d2c, 0x1b4326, 0x2a5a34], // 5 emergent dark
+      [0x6f8a44, 0x7c9850, 0x627c3a], // 6 olive
+      [0x5e5236, 0x6a5d40, 0x52472e], // 7 leaf litter brown
+    ],
+    bark: [
+      [0.08, 0.3, 0.2],
+      [0.07, 0.35, 0.18],
+      [0.12, 0.1, 0.6],
+      [0.1, 0.22, 0.44],
+    ],
+    // Volcanic: this is an island arc, so the bedrock is basalt, not the
+    // limestone-and-moss of a temperate wood. Everything sits well below the
+    // lightness of the other climates' stone, which is the whole point — dark
+    // rock against saturated green is what makes the tropics read as tropics.
+    stone: [
+      [0.62, 0.07, 0.16], // 0 basalt, blue-black
+      [0.09, 0.09, 0.21], // 1 weathered basalt, rust-stained
+      [0.68, 0.1, 0.12], // 2 fresh lava, near-black and glassy
+      [0.3, 0.24, 0.2], // 3 moss over basalt
+    ],
+    wShallow: [0.24, 0.6, 0.54],
+    wDeep: [0.03, 0.22, 0.28],
+    wFoam: [0.88, 0.95, 0.92],
+  },
+  // 4 Savanna — bleached golden grass, flat-crowned thorn trees, dusty light.
+  {
+    grassA: 0xa89550,
+    grassB: 0xc0af66,
+    grassC: 0x8b7a40,
+    dry: 0xcaba74,
+    high: 0xccbd80,
+    rock: 0x8a7a5c,
+    rockHi: 0xa5957c,
+    sand: 0xd3c092,
+    scorch: 0x5a4c36,
+    bed: 0x8a8258,
+    roadDirt: 0x9a7e54,
+    roadCobble: 0x9a9484,
+    forestCast: 0x87874a,
+    rockyCast: 0x998a64,
+    marshCast: 0x6e7a42,
+    castK: [0.34, 0.38, 0.5],
+    canopy: [
+      [0x6f8c42, 0x7d9a4e, 0x627e38], // 0 dusty green
+      [0x3f6a34, 0x487a3c, 0x365c2c], // 1 deep acacia
+      [0xa8b054, 0xb5bd62, 0x9aa248], // 2 yellow-green
+      [0xc9a63e, 0xd6b34a, 0xbb9834], // 3 golden
+      [0xb0763a, 0xbe8446, 0xa26a30], // 4 rust
+      [0x40563a, 0x374b32, 0x4a6142], // 5 dark thorn
+      [0x9a9450, 0xa8a25c, 0x8c8644], // 6 dry olive
+      [0x7c6842, 0x8a744c, 0x6e5c38], // 7 dead brown
+    ],
+    bark: [
+      [0.08, 0.2, 0.26],
+      [0.06, 0.28, 0.24],
+      [0.11, 0.05, 0.72],
+      [0.05, 0.06, 0.14],
+    ],
+    stone: [
+      [0.09, 0.14, 0.46],
+      [0.08, 0.24, 0.48],
+      [0.6, 0.05, 0.26],
+      [0.16, 0.14, 0.36],
+    ],
+    wShallow: [0.34, 0.56, 0.5],
+    wDeep: [0.08, 0.24, 0.3],
+    wFoam: [0.9, 0.94, 0.9],
+  },
+  // 5 Badlands — cold arid rock, banded red and grey, scorched stumps.
+  {
+    grassA: 0x8a6a4e,
+    grassB: 0x9c7c5c,
+    grassC: 0x72543c,
+    dry: 0xa2835b,
+    high: 0xad916a,
+    rock: 0x7c5c46,
+    rockHi: 0x98765c,
+    sand: 0xbb9c74,
+    scorch: 0x4a3a2e,
+    bed: 0x7c6a4e,
+    roadDirt: 0x8a6a4a,
+    roadCobble: 0x8e857a,
+    forestCast: 0x6c5842,
+    rockyCast: 0x8a6850,
+    marshCast: 0x5e5a40,
+    castK: [0.3, 0.46, 0.45],
+    canopy: [
+      [0x6e7a4e, 0x7a865a, 0x626e44], // 0 scrub green
+      [0x4a5a3a, 0x415030, 0x536444], // 1 dark scrub
+      [0x8e8a62, 0x9a966e, 0x827e56], // 2 pale sage
+      [0xa87e46, 0xb68c52, 0x9a703c], // 3 rust gold
+      [0x9a6238, 0xa87044, 0x8c5630], // 4 red rust
+      [0x44503a, 0x3b4632, 0x4d5a42], // 5 dark scrub needle
+      [0x8a8250, 0x968e5c, 0x7e7644], // 6 dry olive
+      [0x6e5c40, 0x7a684a, 0x625036], // 7 dead brown
+    ],
+    bark: [
+      [0.07, 0.12, 0.28],
+      [0.05, 0.2, 0.24],
+      [0.1, 0.04, 0.78],
+      [0.04, 0.04, 0.12],
+    ],
+    stone: [
+      [0.05, 0.28, 0.42],
+      [0.07, 0.34, 0.38],
+      [0.6, 0.05, 0.24],
+      [0.1, 0.12, 0.52],
+    ],
+    wShallow: [0.36, 0.52, 0.5],
+    wDeep: [0.1, 0.22, 0.3],
+    wFoam: [0.9, 0.92, 0.9],
+  },
+];
+
+let THEME: ClimateTheme = CLIMATE_THEMES[0];
+
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0xb8cfe0);
-scene.fog = new THREE.Fog(0xb8cfe0, 90, 230);
+// One sky, one sun, every climate. Atmosphere deliberately does NOT vary:
+// re-lighting per biome changed how the whole game read — target contrast,
+// silhouette legibility, the lot — for a cosmetic win. Climate stays in the
+// ground, foliage, stone and water; the weather is always the same clear day.
+const SKY_COLOR = 0xb8cfe0;
+const FOG_COLOR = new THREE.Color(SKY_COLOR); // backdrop ring fades into this
+
+scene.background = new THREE.Color(SKY_COLOR);
+scene.fog = new THREE.Fog(SKY_COLOR, 90, 230);
 
 const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.08, 360);
 const hemi = new THREE.HemisphereLight(0xdcebfb, 0x5a6147, 0.62);
@@ -211,17 +552,160 @@ const MAT = {
   rubble: new THREE.MeshStandardMaterial({ color: 0x6e6a62, roughness: 1, flatShading: true }),
 };
 
+// A lumpy unit blob: an icosahedron with every vertex pushed along its own
+// normal by a position hash. Coincident vertices hash the same, so the hull
+// stays sealed. Nothing man-made should use one — but a leaf clump or a
+// boulder is not a box, and a faceted blob costs FEWER vertices than the
+// rounded box it replaces (60 vs 324 for foliage, 240 vs 900 for rock).
+function makeBlobGeo(detail: number, radius: number, jitter: number, salt: number) {
+  const geo = new THREE.IcosahedronGeometry(radius, detail);
+  const pos = geo.getAttribute("position") as THREE.BufferAttribute;
+  for (let i = 0; i < pos.count; i++) {
+    const x = pos.getX(i);
+    const y = pos.getY(i);
+    const z = pos.getZ(i);
+    const h = hash01(Math.round((x * 311 + y * 547 + z * 971) * 64), salt);
+    const k = 1 + (h - 0.5) * jitter;
+    pos.setXYZ(i, x * k, y * k, z * k);
+  }
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// One palm leaf, as a single low-poly mesh — the shape every stylized palm
+// uses, because a leaf is a blade and a blade cannot be built out of cubes.
+// It runs base(-X) to tip(+X) inside a unit box: tapering in width, folded
+// down the midrib into a shallow V (the fold is what catches the light and
+// keeps it from reading as a flat sticker), and arcing up then over into a
+// drooping tip. Instances scale it to a real length/width and turn it onto
+// its bearing.
+function makeFrondGeo(): THREE.BufferGeometry {
+  const SEGS = 7;
+  const pos: number[] = [];
+  // The rib only ever falls away from the stalk (the upward launch is the
+  // instance's pitch, not the mesh's). That monotonicity is a CONTRACT: it
+  // puts the stalk at the mesh's highest point, so normalizing y below lands
+  // the base at exactly local (-0.5, +0.5, 0) — which is where map.ts anchors
+  // the piece. Give the rib a rise and the anchor silently moves.
+  const rib = (t: number): number => -Math.pow(t, 1.9);
+  // Half-width swells past the stalk, then tapers to a point at the tip.
+  const halfW = (t: number): number =>
+    0.5 * Math.sin(Math.PI * Math.min(1, 0.2 + t * 0.8)) * (1 - t * 0.5);
+  // Fold depth down the midrib — the V that catches the light.
+  const fold = (t: number): number => 0.17 * (1 - t * 0.65);
+  const tri = (
+    a: [number, number, number],
+    b: [number, number, number],
+    c: [number, number, number],
+  ): void => void pos.push(...a, ...b, ...c);
+  for (let i = 0; i < SEGS; i++) {
+    const t0 = i / SEGS;
+    const t1 = (i + 1) / SEGS;
+    const y0 = rib(t0);
+    const y1 = rib(t1);
+    const w0 = halfW(t0);
+    const w1 = halfW(t1);
+    const f0 = fold(t0);
+    const f1 = fold(t1);
+    // Two panes per segment, meeting along the raised midrib.
+    for (const s of [-1, 1]) {
+      tri([t0 - 0.5, y0, 0], [t1 - 0.5, y1, 0], [t1 - 0.5, y1 - f1, w1 * s]);
+      tri([t0 - 0.5, y0, 0], [t1 - 0.5, y1 - f1, w1 * s], [t0 - 0.5, y0 - f0, w0 * s]);
+    }
+  }
+  // Fit the blade to the unit box: max y (the stalk) to +0.5, tip to -0.5.
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (let i = 1; i < pos.length; i += 3) {
+    lo = Math.min(lo, pos[i]);
+    hi = Math.max(hi, pos[i]);
+  }
+  for (let i = 1; i < pos.length; i += 3) pos[i] = (pos[i] - lo) / (hi - lo) - 0.5;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// Land a geometry exactly on the unit box, so ex/ey/ez is BOTH the drawn size
+// and the collider. `fit` is the factor the raw geometry is off by; the
+// generator pre-multiplies its extents by the same number, so scaling here by
+// the inverse leaves the mesh exactly the size it always was while the box
+// underneath it becomes the truth. The check is the point: change a radius or
+// a jitter and MESH_FIT goes stale, which would silently put the hitbox back
+// where the leaves are not.
+function fitUnitBox(
+  geo: THREE.BufferGeometry,
+  fit: readonly [number, number, number],
+  spun: boolean,
+  name: string,
+): THREE.BufferGeometry {
+  geo.scale(1 / fit[0], 1 / fit[1], 1 / fit[2]);
+  geo.computeVertexNormals(); // the scale above is non-uniform
+  if (import.meta.env.DEV) {
+    const pos = geo.getAttribute("position") as THREE.BufferAttribute;
+    let hx = 0;
+    let hy = 0;
+    let hz = 0;
+    for (let i = 0; i < pos.count; i++) {
+      const x = pos.getX(i);
+      const y = pos.getY(i);
+      const z = pos.getZ(i);
+      hy = Math.max(hy, Math.abs(y));
+      // A piece spun about Y sweeps its horizontal radius into both axes.
+      if (spun) {
+        const r = Math.hypot(x, z);
+        hx = Math.max(hx, r);
+        hz = Math.max(hz, r);
+      } else {
+        hx = Math.max(hx, Math.abs(x));
+        hz = Math.max(hz, Math.abs(z));
+      }
+    }
+    for (const [axis, h] of [
+      ["x", hx],
+      ["y", hy],
+      ["z", hz],
+    ] as const) {
+      if (Math.abs(h - 0.5) > 0.005) {
+        console.error(
+          `[mesh-fit] ${name}.${axis} half-extent ${h.toFixed(4)} != 0.5 — ` +
+            `MESH_FIT.${name} in map.ts is stale, so colliders no longer match this mesh`,
+        );
+      }
+    }
+  }
+  return geo;
+}
+
 // Unit geometries, scaled per instance to each piece's extents: beveled boxes
-// for masonry (the bevel catches light, so every brick reads as a brick) and
-// foliage clumps, faceted cylinders for logs and trunks, soft-cornered lumps
-// for rocks.
+// for masonry (the bevel catches light, so every brick reads as a brick),
+// faceted cylinders for logs and trunks, and hashed blobs for the two things
+// that have no straight edges in nature — foliage and stone.
 const GEO = {
   box: new THREE.BoxGeometry(1, 1, 1),
   bevel: new RoundedBoxGeometry(1, 1, 1, 1, 0.055),
-  rock: new RoundedBoxGeometry(1, 1, 1, 2, 0.2),
+  // Foliage still spills well past the clump it grows on — that is what keeps a
+  // canopy from reading as beads on a wire — but the COLLIDER now spills with
+  // it (MESH_FIT.canopy), instead of ending 39% short of the visible leaves.
+  foliage: fitUnitBox(makeBlobGeo(0, 0.62, 0.34, 11), MESH_FIT.canopy, true, "canopy"),
+  rock: fitUnitBox(makeBlobGeo(1, 0.53, 0.42, 23), MESH_FIT.rock, true, "rock"),
   cyl: new THREE.CylinderGeometry(0.5, 0.5, 1, 7),
+  frond: fitUnitBox(makeFrondGeo(), MESH_FIT.frond, false, "frond"),
+  // A conifer tier. Six sides is enough to read as a needle skirt and costs
+  // 36 vertices against the 324 of the beveled box it replaces.
+  cone: fitUnitBox(new THREE.ConeGeometry(0.5, 1, 6), MESH_FIT.bough, false, "bough"),
   decal: new THREE.PlaneGeometry(1, 1),
 };
+
+// A leaf has no thickness, so it has to be lit from both sides.
+const frondMat = new THREE.MeshStandardMaterial({
+  color: 0xffffff,
+  roughness: 0.9,
+  metalness: 0,
+  flatShading: true,
+  side: THREE.DoubleSide,
+});
 
 // How each piece material renders: shape + debris color.
 const PIECE_STYLE: Record<
@@ -229,11 +713,12 @@ const PIECE_STYLE: Record<
   { geo: THREE.BufferGeometry; mat: THREE.Material; debris: number }
 > = {
   brick: { geo: GEO.bevel, mat: voxelMat, debris: 0xa66045 },
+  adobe: { geo: GEO.bevel, mat: voxelMat, debris: 0xc2a172 },
   log: { geo: GEO.cyl, mat: voxelMat, debris: 0x6e5439 },
   plank: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a7a52 },
   post: { geo: GEO.bevel, mat: voxelMat, debris: 0x6e5439 },
   trunk: { geo: GEO.cyl, mat: voxelMat, debris: 0x6e5439 },
-  canopy: { geo: GEO.bevel, mat: voxelMat, debris: 0x4d7a3a },
+  canopy: { geo: GEO.foliage, mat: voxelMat, debris: 0x4d7a3a },
   crate: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a7a52 },
   sandbag: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a8f72 },
   rock: { geo: GEO.rock, mat: voxelMat, debris: 0x8d8a84 },
@@ -242,6 +727,8 @@ const PIECE_STYLE: Record<
   rubble: { geo: GEO.bevel, mat: voxelMat, debris: 0x847d72 },
   metal: { geo: GEO.bevel, mat: voxelMat, debris: 0x8a949e },
   stone: { geo: GEO.bevel, mat: voxelMat, debris: 0x9a958c },
+  frond: { geo: GEO.frond, mat: frondMat, debris: 0x4d7a3a },
+  bough: { geo: GEO.cone, mat: voxelMat, debris: 0x35633a },
   stair: { geo: GEO.bevel, mat: voxelMat, debris: 0x6e5d49 },
 };
 
@@ -250,17 +737,35 @@ const PIECE_STYLE: Record<
 // same offset, so the surface stays sealed). Three deterministic variants;
 // fragments pick one by palette seed.
 function makeFractureGeo(variant: number): THREE.BufferGeometry {
-  const geo = new THREE.BoxGeometry(1, 1, 1, 2, 2, 2);
+  const geo = new THREE.BoxGeometry(1, 1, 1, 3, 3, 3);
   const pos = geo.getAttribute("position") as THREE.BufferAttribute;
+  // The cut plane. Tilting it is what turns a half-box into a WEDGE: real
+  // brittle fragments are chisel-shaped, and a squared-off one reads as a
+  // voxel that fell off rather than a piece that broke.
+  const tiltY = 0.34 - variant * 0.26;
+  const tiltZ = -0.2 + variant * 0.3;
   for (let i = 0; i < pos.count; i++) {
     const x = pos.getX(i);
-    if (x < 0.1) continue; // keep the intact half pristine
     const y = pos.getY(i);
     const z = pos.getZ(i);
-    const h = hash01(Math.round((y + 2 * z) * 97) + variant * 7919, 41);
-    const h2 = hash01(Math.round((y - z) * 131) + variant * 104729, 42);
-    pos.setX(i, x - 0.12 - h * 0.3);
-    if (Math.abs(y) < 0.49) pos.setY(i, y + (h2 - 0.5) * 0.12);
+    // Where this vertex sits relative to the cut. Everything outboard of it
+    // gets pulled back to the break face; the rest is original surface and
+    // stays pristine, so the fragment still reads as part of what it came off.
+    const cut = 0.06 + tiltY * y + tiltZ * z;
+    if (x < cut) continue;
+    // Two octaves: coarse conchoidal steps, then a fine grit that keeps the
+    // face from looking machined. Coincident vertices hash identically, so
+    // the surface stays sealed however hard it is displaced.
+    const key = Math.round((y + 2 * z) * 97) + variant * 7919;
+    const coarse = hash01(key, 41);
+    const fine = hash01(Math.round((y * 7 - z * 5) * 211) + variant * 104729, 43);
+    pos.setX(i, cut - coarse * 0.34 - fine * 0.09);
+    // Nick the rim where the break meets the original faces — a clean edge is
+    // the tell that a fragment was modelled rather than shattered.
+    const rim = hash01(Math.round((x + y - z) * 173) + variant * 15485863, 44);
+    if (Math.abs(y) > 0.49) pos.setY(i, y - Math.sign(y) * rim * 0.1);
+    if (Math.abs(z) > 0.49) pos.setZ(i, z - Math.sign(z) * rim * 0.08);
+    else pos.setZ(i, z + (hash01(key, 42) - 0.5) * 0.14);
   }
   const out = geo.toNonIndexed();
   out.computeVertexNormals();
@@ -272,16 +777,6 @@ const FRACTURE_GEOS = [makeFractureGeo(0), makeFractureGeo(1), makeFractureGeo(2
 // Canopy palettes by "band" (species/season). A tree tags every clump with a
 // seed whose low 3 bits pick the band, so a whole tree shares a species/season
 // while each clump still varies — see pieceColor("canopy").
-const CANOPY_BANDS: number[][] = [
-  [0x4e8a3c, 0x5f9c46, 0x3f7a34, 0x6fae52], // 0 summer green (broadleaf)
-  [0x356f30, 0x2f6a2c, 0x428039], // 1 deep lush green
-  [0x7a9a3e, 0x8aa84a, 0x6e8c34], // 2 yellow-green / late summer
-  [0xc8862f, 0xd89a3a, 0xb87328], // 3 autumn gold/orange
-  [0xb04e2a, 0xc25a30, 0x9a3f24], // 4 autumn red/rust
-  [0x2c5733, 0x244c2c, 0x35663b], // 5 dark conifer
-  [0x8a8a4a, 0x9a9656, 0x7c7c40], // 6 dry olive
-  [0x6e5a3a, 0x7a6440, 0x5e4c30], // 7 dead brown
-];
 
 // The palette: deterministic per-piece color so a wall is a thousand subtly
 // different bricks, not a flat sheet.
@@ -299,6 +794,14 @@ function pieceColor(def: PanelDef, out: THREE.Color): THREE.Color {
       else if (h2 > 0.94) out.multiplyScalar(1.28); // and the odd pale one
       return out;
     }
+    case "adobe": {
+      // Mud block: pale, dusty, and mottled by the straw and the weather.
+      // Much flatter in tone than fired brick, which is what sells the
+      // material difference at a distance.
+      out.setHSL(0.088 + h1 * 0.02, 0.26 + h2 * 0.1, 0.56 + h1 * 0.13);
+      if (h2 < 0.1) out.multiplyScalar(0.82); // a block that took the rain
+      return out;
+    }
     case "log":
       return out.setHSL(0.07 + h1 * 0.02, 0.38 + h2 * 0.1, 0.33 + h1 * 0.1);
     case "plank":
@@ -306,16 +809,21 @@ function pieceColor(def: PanelDef, out: THREE.Color): THREE.Color {
     case "post":
       return out.setHSL(0.07 + h1 * 0.015, 0.38, 0.27 + h1 * 0.06);
     case "trunk": {
-      // Low 2 bits of the seed pick the bark: oak (grey-brown), pine (red-brown), birch (pale).
-      const bark = basis & 3;
+      // Low 2 bits of the seed pick the bark SLOT — default / needle / pale /
+      // the climate's oddity. What each slot looks like is the climate's:
+      // slot 2 is birch in the temperate, aspen under snow, ghost gum on the
+      // savanna; slot 3 is palm, driftwood or charred stump.
+      const [bh, bs, bl] = THEME.bark[basis & 3];
       const t1 = hash01(basis >> 2, 1);
-      if (bark === 2) return out.setHSL(0.1, 0.06, 0.7 + t1 * 0.12); // birch
-      if (bark === 1) return out.setHSL(0.055 + t1 * 0.01, 0.45, 0.3 + t1 * 0.08); // pine
-      return out.setHSL(0.072 + t1 * 0.015, 0.42, 0.24 + t1 * 0.09); // oak
+      return out.setHSL(bh + t1 * 0.015, bs, bl + t1 * 0.1);
     }
+    case "frond":
+    case "bough":
     case "canopy": {
-      // Low 3 bits of the seed pick the species/season band; the rest varies per clump.
-      const band = CANOPY_BANDS[basis & 7];
+      // Low 3 bits pick the crown band; the rest varies per clump. The band is
+      // an index into the ACTIVE climate's row, so the same two trees are
+      // autumn oak in one world and snow-laden spruce in another.
+      const band = THEME.canopy[basis & 7];
       const v = hash01(basis >> 3, 2);
       out.setHex(band[Math.floor(v * band.length) % band.length]);
       return out.multiplyScalar(0.86 + hash01(basis >> 3, 4) * 0.28);
@@ -325,15 +833,13 @@ function pieceColor(def: PanelDef, out: THREE.Color): THREE.Color {
     case "sandbag":
       return out.setHSL(0.112 + h1 * 0.012, 0.2 + h2 * 0.06, 0.5 + h1 * 0.12);
     case "rock": {
-      // Low 2 bits pick rock type: granite (grey), sandstone (tan), basalt
-      // (dark), mossy (green-grey). The rest drives strata lightness.
-      const kind = basis & 3;
+      // Low 2 bits pick the strata slot; the climate decides what stone that
+      // is — grey granite and moss in the temperate, sandstone and caliche in
+      // the desert, frost-split grey under snow, banded red in the badlands.
+      const [sh, ss, sl] = THEME.stone[basis & 3];
       const r1 = hash01(basis >> 2, 1);
       const r2 = hash01(basis >> 2, 2);
-      if (kind === 1) return out.setHSL(0.09, 0.17, 0.44 + r1 * 0.16); // sandstone
-      if (kind === 2) return out.setHSL(0.62, 0.05, 0.26 + r1 * 0.12); // basalt
-      if (kind === 3) return out.setHSL(0.26, 0.16, 0.34 + r1 * 0.14); // mossy
-      return out.setHSL(0.085 + r1 * 0.02, 0.04 + r2 * 0.05, 0.42 + r1 * 0.2); // granite
+      return out.setHSL(sh + r2 * 0.015, ss, sl + r1 * 0.16);
     }
     case "concrete":
       return out.setHSL(0.58 + h1 * 0.02, 0.02 + h2 * 0.03, 0.54 + h1 * 0.12);
@@ -377,8 +883,8 @@ class LoosePool {
   private readonly free: number[] = [];
   constructor(private readonly cap: number) {}
 
-  rebuild(geo: THREE.BufferGeometry, parent: THREE.Group): void {
-    this.mesh = new THREE.InstancedMesh(geo, voxelMat, this.cap);
+  rebuild(geo: THREE.BufferGeometry, parent: THREE.Group, mat: THREE.Material = voxelMat): void {
+    this.mesh = new THREE.InstancedMesh(geo, mat, this.cap);
     this.mesh.castShadow = true;
     this.mesh.receiveShadow = true;
     this.mesh.frustumCulled = false; // instances span the map; sphere test is useless
@@ -409,9 +915,28 @@ class LoosePool {
   }
 }
 
-const looseBoxes = new LoosePool(1500);
+// Sized against the sim's BUILT_PANEL_CAP: collapse debris settles into this
+// pool, and overflowing it means one draw call per piece.
+const looseBoxes = new LoosePool(2400);
 const looseCyls = new LoosePool(300);
+// Organic pieces need their own pools, or a felled tree snaps back into blocks
+// the moment it stops moving: chunks in flight render through PIECE_STYLE, but
+// once they settle they claim a pool slot, and a pool has exactly one shape.
+const looseFoliage = new LoosePool(700);
+const looseBoughs = new LoosePool(250);
+const looseFronds = new LoosePool(250);
+const looseRocks = new LoosePool(300);
 const fracturePools = [new LoosePool(450), new LoosePool(450), new LoosePool(450)];
+// Every pool a runtime piece can be claimed from, for returning slots.
+const LOOSE_POOLS = [
+  looseBoxes,
+  looseCyls,
+  looseFoliage,
+  looseBoughs,
+  looseFronds,
+  looseRocks,
+  ...fracturePools,
+];
 
 const _m4 = new THREE.Matrix4();
 const _q = new THREE.Quaternion();
@@ -424,7 +949,7 @@ const Z_AXIS = new THREE.Vector3(0, 0, 1);
 const ZERO_SCALE = new THREE.Matrix4().makeScale(0, 0, 0);
 
 // Logs lie on their side (cylinder axis along the wall), trunks stand up,
-// canopy cubes and rocks get a per-piece twist so they don't read as tiled.
+// foliage and rocks get a per-piece twist so they don't read as tiled.
 const _qDef = new THREE.Quaternion();
 
 function pieceMatrix(def: PanelDef): THREE.Matrix4 {
@@ -441,7 +966,10 @@ function pieceMatrix(def: PanelDef): THREE.Matrix4 {
       _scl.set(def.ex, def.ez, def.ey);
     } else {
       _q.copy(_qDef);
-      _scl.set(def.ex, def.ey, def.ez);
+      // `vis` present: the mesh is not the shape of the box. Scale the mesh by
+      // what it actually is and let ex/ey/ez stay the collider's world bounds.
+      if (def.vis) _scl.set(def.vis[0], def.vis[1], def.vis[2]);
+      else _scl.set(def.ex, def.ey, def.ez);
     }
     return _m4.compose(_pos, _q, _scl);
   }
@@ -453,6 +981,9 @@ function pieceMatrix(def: PanelDef): THREE.Matrix4 {
     _scl.set(def.ex, def.ez, def.ey);
   } else {
     if (def.material === "canopy" || def.material === "rubble") {
+      // Foliage and rubble are the same blob/box repeated thousands of times;
+      // spinning each one hides that, and on a hashed blob it also decorrelates
+      // the facets so a stand of trees doesn't shimmer with one lump pattern.
       _q.setFromAxisAngle(Y_AXIS, (def.id % 7) * 0.9);
     } else if (def.material === "rock") {
       _q.setFromAxisAngle(Y_AXIS, (hash01(def.id, 3) - 0.5) * 0.7);
@@ -477,6 +1008,10 @@ const terrainMat = new THREE.MeshStandardMaterial({
 });
 // Richer ground palette: several greens/browns plus rock + sand, blended by
 // macro color-noise, slope, height, shoreline and roads (see colorTerrainFace).
+// Every entry is restated from the active climate's theme by
+// applyClimateTheme() — the objects are reused so nothing downstream has to
+// know the palette moved. Initialized to temperate; the first map build
+// overwrites them before any face is colored.
 const T_GRASS_A = new THREE.Color(0x5a8746);
 const T_GRASS_B = new THREE.Color(0x6f9850);
 const T_GRASS_C = new THREE.Color(0x466e3b);
@@ -489,10 +1024,37 @@ const TERRAIN_SCORCH = new THREE.Color(0x4f463b);
 const TERRAIN_BED = new THREE.Color(0x6a6f52); // silty riverbed
 const ROAD_DIRT = new THREE.Color(0x7a6446);
 const ROAD_COBBLE = new THREE.Color(0x8a857d);
-// Biome ground casts (lerped over the base grass so borders stay soft).
-const T_FOREST_FLOOR = new THREE.Color(0x42632f); // darker, richer woodland
-const T_ROCKY_GROUND = new THREE.Color(0x7d7a5e); // thin bleached highland turf
-const T_MARSH = new THREE.Color(0x4c5c33); // wet olive bog
+// Biome-role ground casts (lerped over the base so borders stay soft). What
+// each means is the climate's business: woodland floor / snow-shadowed drift /
+// oasis green, highland turf / bare ice / mesa dust, bog / slush / mangrove.
+const T_FOREST_FLOOR = new THREE.Color(0x42632f);
+const T_ROCKY_GROUND = new THREE.Color(0x7d7a5e);
+const T_MARSH = new THREE.Color(0x4c5c33);
+
+// Point every live palette object, light and material at the seed's climate.
+// Called from applyMapSeed, BEFORE buildWorlds bakes terrain/piece colors.
+function applyClimateTheme(): void {
+  THEME = CLIMATE_THEMES[climate()] ?? CLIMATE_THEMES[0];
+  T_GRASS_A.setHex(THEME.grassA);
+  T_GRASS_B.setHex(THEME.grassB);
+  T_GRASS_C.setHex(THEME.grassC);
+  T_DRY.setHex(THEME.dry);
+  T_HIGH.setHex(THEME.high);
+  T_ROCK.setHex(THEME.rock);
+  T_ROCK_HI.setHex(THEME.rockHi);
+  T_SAND.setHex(THEME.sand);
+  TERRAIN_SCORCH.setHex(THEME.scorch);
+  TERRAIN_BED.setHex(THEME.bed);
+  ROAD_DIRT.setHex(THEME.roadDirt);
+  ROAD_COBBLE.setHex(THEME.roadCobble);
+  T_FOREST_FLOOR.setHex(THEME.forestCast);
+  T_ROCKY_GROUND.setHex(THEME.rockyCast);
+  T_MARSH.setHex(THEME.marshCast);
+  const wu = waterMat.uniforms as Record<string, { value: unknown }>;
+  wu.uShallow.value = new THREE.Vector3(...THEME.wShallow);
+  wu.uDeep.value = new THREE.Vector3(...THEME.wDeep);
+  wu.uFoam.value = new THREE.Vector3(...THEME.wFoam);
+}
 
 function smoothstep01(x: number, a: number, b: number): number {
   const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
@@ -594,9 +1156,10 @@ function colorTerrainFace(c: THREE.Color, cx: number, cy: number, cz: number, ny
   // go wet olive. Borders are already noise-warped map-side, so a flat lerp
   // per face reads as organic transition.
   const biome = biomeAt(cx, cz);
-  if (biome === BIOME_FOREST) c.lerp(T_FOREST_FLOOR, 0.42);
-  else if (biome === BIOME_ROCKY) c.lerp(T_ROCKY_GROUND, 0.4);
-  else if (biome === BIOME_MARSH) c.lerp(T_MARSH, 0.5);
+  const k = THEME.castK;
+  if (biome === BIOME_FOREST) c.lerp(T_FOREST_FLOOR, k[0]);
+  else if (biome === BIOME_ROCKY) c.lerp(T_ROCKY_GROUND, k[1]);
+  else if (biome === BIOME_MARSH) c.lerp(T_MARSH, k[2]);
   c.lerp(T_HIGH, Math.max(0, Math.min(1, (cy - 0.4) / 1.2)) * 0.4);
   const slope = 1 - ny;
   const rock = smoothstep01(slope, 0.3, 0.6);
@@ -692,6 +1255,11 @@ const waterMat = new THREE.ShaderMaterial({
       uTime: { value: 0 },
       uSurfaceY: { value: WATER_SURFACE_Y },
       uHalf: { value: MAP.size / 2 },
+      // Restated per climate by applyClimateTheme: an oasis reads turquoise,
+      // a jungle river near-black green, meltwater pale blue.
+      uShallow: { value: new THREE.Vector3(0.32, 0.55, 0.57) },
+      uDeep: { value: new THREE.Vector3(0.05, 0.19, 0.34) },
+      uFoam: { value: new THREE.Vector3(0.9, 0.95, 0.97) },
     },
   ]),
   vertexShader: `
@@ -710,6 +1278,9 @@ const waterMat = new THREE.ShaderMaterial({
     uniform float uTime;
     uniform float uSurfaceY;
     uniform float uHalf;
+    uniform vec3 uShallow;
+    uniform vec3 uDeep;
+    uniform vec3 uFoam;
     uniform sampler2D uHeight;
     varying vec3 vWorld;
     float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7)))*43758.5453); }
@@ -724,9 +1295,7 @@ const waterMat = new THREE.ShaderMaterial({
       float depth = uSurfaceY - ground;
       if (depth <= 0.002) discard; // dry land
       depth = clamp(depth, 0.0, 1.3);
-      vec3 shallow = vec3(0.32, 0.55, 0.57);
-      vec3 deep = vec3(0.05, 0.19, 0.34);
-      vec3 col = mix(shallow, deep, smoothstep(0.0, 1.0, depth));
+      vec3 col = mix(uShallow, uDeep, smoothstep(0.0, 1.0, depth));
       float t = uTime;
       float n = noise(vWorld.xz * 0.6 + vec2(0.0, t * 0.45)) * 0.5
               + noise(vWorld.xz * 1.7 - vec2(t * 0.6, 0.0)) * 0.5;
@@ -735,7 +1304,7 @@ const waterMat = new THREE.ShaderMaterial({
       float fres = pow(1.0 - max(V.y, 0.0), 3.0);
       col = mix(col, vec3(0.62, 0.72, 0.82), fres * 0.5);
       float foam = smoothstep(0.24, 0.0, depth) * (0.5 + 0.5 * noise(vWorld.xz * 2.6 + t * 1.2));
-      col = mix(col, vec3(0.90, 0.95, 0.97), foam * 0.6);
+      col = mix(col, uFoam, foam * 0.6);
       float alpha = smoothstep(0.0, 0.14, depth) * 0.86 + foam * 0.3;
       gl_FragColor = vec4(col, clamp(alpha, 0.0, 0.95));
       #include <fog_fragment>
@@ -806,7 +1375,7 @@ function makeRingVisual(inner: number, outer: number, cell: number, fade: boolea
   const norm = geo.getAttribute("normal");
   const colors: number[] = [];
   const c = new THREE.Color();
-  const fogCol = new THREE.Color(0xb8cfe0);
+  const fogCol = FOG_COLOR;
   for (let f = 0; f < pos.count; f += 3) {
     const cx = (pos.getX(f) + pos.getX(f + 1) + pos.getX(f + 2)) / 3;
     const cy = (pos.getY(f) + pos.getY(f + 1) + pos.getY(f + 2)) / 3;
@@ -1102,6 +1671,10 @@ function buildMapVisuals(): void {
 
   looseBoxes.rebuild(GEO.bevel, mapGroup);
   looseCyls.rebuild(GEO.cyl, mapGroup);
+  looseFoliage.rebuild(GEO.foliage, mapGroup);
+  looseBoughs.rebuild(GEO.cone, mapGroup);
+  looseFronds.rebuild(GEO.frond, mapGroup, frondMat);
+  looseRocks.rebuild(GEO.rock, mapGroup);
   for (let i = 0; i < fracturePools.length; i++) {
     fracturePools[i].rebuild(FRACTURE_GEOS[i], mapGroup);
   }
@@ -1116,12 +1689,26 @@ function addBuiltPanelVisual(p: PanelDef): void {
   markShadowsDirty();
   panelDefs.set(p.id, p);
   const cyl = p.material === "log" || p.material === "trunk";
+  // Shape first, damage state second. Foliage keeps its own silhouette however
+  // it came to rest — a settled frond is still a frond. Stone is the exception:
+  // a broken rock really is a shard, so it keeps the fracture geometry.
+  const organic =
+    p.material === "canopy"
+      ? looseFoliage
+      : p.material === "bough"
+        ? looseBoughs
+        : p.material === "frond"
+          ? looseFronds
+          : p.material === "rock" && !p.broken
+            ? looseRocks
+            : null;
   const pool =
-    p.broken && !cyl
+    organic ??
+    (p.broken && !cyl
       ? fracturePools[(p.seed ?? p.id) % fracturePools.length]
       : cyl
         ? looseCyls
-        : looseBoxes;
+        : looseBoxes);
   const slot = pool.claim(p);
   if (slot) {
     panelSlots.set(p.id, slot);
@@ -1219,10 +1806,10 @@ function removePanelVisual(id: number, withDebris: boolean): void {
     slot.mesh.setMatrixAt(slot.index, ZERO_SCALE);
     slot.mesh.instanceMatrix.needsUpdate = true;
     panelSlots.delete(id);
-    if (!looseBoxes.release(slot) && !looseCyls.release(slot)) {
-      for (const fp of fracturePools) {
-        if (fp.release(slot)) break;
-      }
+    // Every pool that can claim a slot must be offered it back, or its
+    // freelist drains and later pieces silently fall through to one mesh each.
+    for (const pool of LOOSE_POOLS) {
+      if (pool.release(slot)) break;
     }
   } else {
     const mesh = builtMeshes.get(id);
@@ -1477,7 +2064,9 @@ hud.innerHTML = `
           <div id="introClasses"></div>
         </div>
         <div class="ipcol">
-          <div class="mapcap">pick a spawn point — your HQ or any flag your team holds</div>
+          <div class="mapcap" id="introMapCap">
+            pick a spawn point — your HQ or any flag your team holds
+          </div>
           <div id="introMap"></div>
           <div id="introKeys"></div>
         </div>
@@ -1960,6 +2549,7 @@ function footstepFamilyAt(x: number, y: number, z: number): string {
   }
   if (
     material === "brick" ||
+    material === "adobe" ||
     material === "concrete" ||
     material === "metal" ||
     material === "rock" ||
@@ -2673,6 +3263,10 @@ function applyMapSeed(seed: number): void {
   const mapBuildStartedAt = performance.now();
   initMap(seed);
   recordBootStage("applyMapSeed:map", mapBuildStartedAt);
+  // The seed decides the climate, and the climate decides every palette, light
+  // and fog value the scene build is about to bake in. Must run before the
+  // height grid warms and before buildWorlds().
+  applyClimateTheme();
   baseHGrid = null;
   mmBase = null;
   const heightGridStartedAt = performance.now();
@@ -2826,8 +3420,14 @@ function handleServerMsg(msg: NonNullable<ReturnType<typeof parseServerMsg>>): v
       break;
     }
     case "kill": {
-      if (msg.weapon === "oob") {
-        feed(`${teamSpan(msg.victim)} ⚠ left the battlefield`);
+      // Crushed and out-of-bounds are both deaths with no killer — the
+      // building did it, so nobody gets a frag banner for it.
+      if (msg.weapon === "oob" || msg.weapon === "crush") {
+        feed(
+          msg.weapon === "crush"
+            ? `${teamSpan(msg.victim)} 🧱 crushed`
+            : `${teamSpan(msg.victim)} ⚠ left the battlefield`,
+        );
         bumpKd(msg.victim, "d");
         if (msg.victim === selfIdx) sounds.death();
         else {
@@ -5280,12 +5880,17 @@ function minimapBase(): HTMLCanvasElement {
   canvas.height = MM_N;
   const ctx = canvas.getContext("2d")!;
   const img = ctx.createImageData(MM_N, MM_N);
-  const lo = new THREE.Color(0x4a7440);
-  const hi = new THREE.Color(0x93a464);
-  const water = new THREE.Color(0x2a5a74);
-  const mmForest = new THREE.Color(0x3c5a2c);
-  const mmRocky = new THREE.Color(0x77745c);
-  const mmMarsh = new THREE.Color(0x4a5a34);
+  // Derived from the climate's ground palette rather than fixed greens, so the
+  // minimap of a snowfield isn't a temperate map's colors. Darkened a touch
+  // against the terrain values: the map is read at a glance over bright HUD.
+  const lo = new THREE.Color(THEME.grassC).multiplyScalar(0.92);
+  const hi = new THREE.Color(THEME.high).multiplyScalar(0.9);
+  const water = new THREE.Color().setRGB(...THEME.wDeep).multiplyScalar(1.15);
+  const mmForest = new THREE.Color(THEME.forestCast).multiplyScalar(0.85);
+  const mmRocky = new THREE.Color(THEME.rockyCast).multiplyScalar(0.9);
+  const mmMarsh = new THREE.Color(THEME.marshCast).multiplyScalar(0.9);
+  const roadCobble = new THREE.Color(THEME.roadCobble).getHex();
+  const roadDirt = new THREE.Color(THEME.roadDirt).getHex();
   const c = new THREE.Color();
   for (let j = 0; j < MM_N; j++) {
     const z = -PLAY_HALF + ((j + 0.5) / MM_N) * 2 * PLAY_HALF;
@@ -5301,7 +5906,7 @@ function minimapBase(): HTMLCanvasElement {
         else if (biome === BIOME_ROCKY) c.lerp(mmRocky, 0.4);
         else if (biome === BIOME_MARSH) c.lerp(mmMarsh, 0.5);
         const road = roadAt(x, z);
-        if (road.w > 0.4) c.setHex(road.cobble ? 0x8a857d : 0x7a6446);
+        if (road.w > 0.4) c.setHex(road.cobble ? roadCobble : roadDirt);
       }
       const o = (j * MM_N + i) * 4;
       img.data[o] = c.r * 255;
@@ -5425,8 +6030,122 @@ function refreshMinimaps(): void {
   for (const m of minimaps) m.refresh();
 }
 
+// --- Dev biome picker -------------------------------------------------------
+// On under `npm run dev`, gone from `vite build`. import.meta.env.DEV is a
+// literal Vite substitutes at build time, so Rollup drops this whole section
+// from a shipped bundle — there is no flag to flip and none to forget.
+//
+// It lives INSIDE the settings panel, collapsed, next to sensitivity and mute,
+// rather than as a floating panel of its own: a dev affordance shouldn't take
+// up screen or sit in front of the thing it's meant to help you look at.
+// Picking a climate ends the current round onto a map of that climate — a real
+// restart through the normal phase/mapSeed path, so it exercises exactly what
+// players get.
+const DEV_TOOLS = import.meta.env.DEV;
+
+const devClimateBtns: HTMLButtonElement[] = [];
+let devNowLabel: HTMLElement | null = null;
+
+// Markup AND styles are created here rather than living in the HUD template,
+// so a production bundle carries no dev DOM, no dev CSS, and no way to send
+// the request — not just a hidden panel.
+const DEV_TOOLS_CSS = `
+  #devWorld { border:1px solid rgba(255,255,255,.1); border-radius:8px; background:rgba(255,255,255,.035); overflow:hidden; }
+  #devWorld > summary { display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:42px;
+    box-sizing:border-box; padding:9px 10px; cursor:pointer; list-style:none;
+    color:rgb(245,245,245); font-size:13px; font-weight:650; }
+  #devWorld > summary::-webkit-details-marker { display:none; }
+  #devWorld > summary .dt-now { color:#8fd0ff; font-weight:650; }
+  #devWorld > summary::after { content:"›"; color:rgba(255,255,255,.45); font-size:15px; transition:transform 120ms ease; }
+  #devWorld[open] > summary::after { transform:rotate(90deg); }
+  #devWorld .dt-body { padding:2px 10px 10px; }
+  #devWorld .dt-grid { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
+  #devWorld .dt-f { margin-top:8px; font-size:11px; color:rgba(255,255,255,.4); }
+  #devWorld button { padding:7px 8px; cursor:pointer; color:rgb(240,240,240);
+    background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.12); border-radius:7px;
+    font:650 12px inherit; transition:background 100ms ease,border-color 100ms ease; }
+  #devWorld button:hover:not(:disabled) { background:rgba(255,255,255,.16); }
+  #devWorld button:disabled { opacity:.45; cursor:default; }
+  #devWorld button.on { border-color:#8fd0ff; color:#8fd0ff; background:rgba(143,208,255,.12); }
+`;
+
+function buildDevTools(): void {
+  if (!DEV_TOOLS || devClimateBtns.length > 0) return;
+  const settings = document.getElementById("audioPanel");
+  if (!settings) return;
+  const style = document.createElement("style");
+  style.textContent = DEV_TOOLS_CSS;
+  document.head.appendChild(style);
+
+  const sep = document.createElement("div");
+  sep.className = "audio-separator";
+  settings.appendChild(sep);
+
+  // <details> so the section collapses natively — no toggle state to own.
+  const box = document.createElement("details");
+  box.id = "devWorld";
+  const summary = document.createElement("summary");
+  summary.append("World");
+  devNowLabel = document.createElement("span");
+  devNowLabel.className = "dt-now";
+  devNowLabel.textContent = "—";
+  summary.appendChild(devNowLabel);
+  box.appendChild(summary);
+
+  const body = document.createElement("div");
+  body.className = "dt-body";
+  const grid = document.createElement("div");
+  grid.className = "dt-grid";
+  body.appendChild(grid);
+  const foot = document.createElement("div");
+  foot.className = "dt-f";
+  foot.textContent = "Restarts the round on a map of that climate.";
+  body.appendChild(foot);
+  box.appendChild(body);
+  settings.appendChild(box);
+
+  const send = (c: number): void => {
+    void client.streams.send({ type: "devmap", climate: c }).catch(() => {});
+    for (const b of devClimateBtns) b.disabled = true;
+    // The round restart arrives as a phase message; re-enable then. This is
+    // only a double-click guard, so a generous timeout is the whole fix.
+    setTimeout(() => {
+      for (const b of devClimateBtns) b.disabled = false;
+    }, 2500);
+  };
+  const addBtn = (label: string, c: number): void => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.textContent = label;
+    b.dataset.climate = String(c);
+    b.addEventListener("click", () => send(c));
+    grid.appendChild(b);
+    devClimateBtns.push(b);
+  };
+  CLIMATE_NAMES.forEach((name, c) => addBtn(name, c));
+  addBtn("Random", DEV_CLIMATE_RANDOM);
+}
+
+// Reflect the climate the server actually gave us — the picker is a request,
+// not a promise, since an uncurated seed may be the only match.
+function refreshDevTools(): void {
+  if (!DEV_TOOLS) return;
+  if (devNowLabel) devNowLabel.textContent = climateName();
+  for (const b of devClimateBtns) {
+    b.classList.toggle("on", b.dataset.climate === String(climate()));
+  }
+}
+
 function ensureMapUi(): void {
   ensureZoneHud();
+  buildDevTools();
+  refreshDevTools();
+  // Name the world above the minimap. Every seed rolls its own climate, so
+  // this is the one place a player is told which one they landed in.
+  const cap = document.getElementById("introMapCap");
+  if (cap) {
+    cap.textContent = `${climateName().toLowerCase()} — pick a spawn point: your HQ or any flag your team holds`;
+  }
   if (mapUiInitialized) return;
   makeMinimap(el.introMap);
   makeMinimap(el.respawnMap);
