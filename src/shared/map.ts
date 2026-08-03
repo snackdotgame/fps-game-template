@@ -2093,17 +2093,30 @@ function building(g: Gen, cx: number, cz: number, w: number, d: number, o: Build
   const roofIds: number[] = [];
   const roofExit = stories > 1 && !gable;
   const flights = stories > 1 ? stories - 1 + (roofExit ? 1 : 0) : 0;
+  // Ten risers per storey, so the rise stays a walkable WALL_HEIGHT/10 whatever
+  // else changes. The RUN is derived, because the flight has to fit the
+  // building it is in: pinned at 0.42 it needed 6.6m of depth, and in anything
+  // shallower — the tower, most granaries — the treads ran out through the back
+  // wall with no floor left to step onto at the top.
+  const STAIR_TREADS = 10;
+  const STAIR_RISE = WALL_HEIGHT / STAIR_TREADS;
+  const LANDING = 1.15; // clear floor at the foot and the head of the flight
+  const runRoom = d - unit.t - 2 * LANDING;
+  const STAIR_RUN = Math.min(0.42, Math.max(0.26, runRoom / (STAIR_TREADS - 1)));
+  const runLen = (STAIR_TREADS - 1) * STAIR_RUN;
+  // Centred, so the landing at the head matches the one at the foot.
+  const zFoot = cz - runLen / 2;
   const stairHole: GapRect | null =
-    stories > 1 ? { lo: x0 + 0.55, hi: x0 + 2.85, y0: z0 + 1.0, y1: z0 + 5.35 } : null;
-  const STAIR_RISE = WALL_HEIGHT / 10;
-  const STAIR_RUN = 0.42;
+    stories > 1
+      ? { lo: x0 + 0.55, hi: x0 + 2.85, y0: zFoot - 0.55, y1: zFoot + runLen + 0.55 }
+      : null;
   for (let flight = 0; flight < flights; flight++) {
     const flightFirst = nextPanelId;
     const baseY = flight * WALL_HEIGHT;
     const up = flight % 2 === 0; // alternate direction AND lane per flight
     const laneX = x0 + (up ? 1.12 : 2.27);
-    for (let k = 0; k < 10; k++) {
-      const z = up ? z0 + 1.3 + k * STAIR_RUN : z0 + 5.05 - k * STAIR_RUN;
+    for (let k = 0; k < STAIR_TREADS; k++) {
+      const z = up ? zFoot + k * STAIR_RUN : zFoot + runLen - k * STAIR_RUN;
       roofIds.push(nextPanelId);
       g.panels.push({
         id: nextPanelId++,
@@ -5005,11 +5018,13 @@ function planLayout(rng: () => number): Layout {
       let w: number;
       let d: number;
       if (kind === "tower") {
-        // Narrow and tall. At 7x7 over three storeys the village's one landmark
-        // came out wider than it was high — a block, not a watchtower, and
-        // invisible from anywhere you would actually want to see it from.
-        w = 5.2;
-        d = 5.2;
+        // Tall comes from the STOREYS, not from a narrow footprint. Squeezed to
+        // 5.2m the tower had no room to climb: the stair hall takes the west
+        // 3.4m of any multi-storey plan and a flight needs about 6.6m of depth,
+        // so the landings vanished and the treads ended inside the back wall.
+        // Five storeys of this is 12.5m over 7m — still unmistakably a tower.
+        w = 7;
+        d = 7;
       } else if (kind === "barn") {
         w = 10 + rng() * 3;
         d = 7.5 + rng() * 2;
