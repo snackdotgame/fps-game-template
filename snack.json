@@ -27,10 +27,14 @@
     "name": "Flag Conquest",
     "titleImage": "assets/breachpoint-cover.webp",
     "genre": "shooter",
-    "platforms": ["desktop", "phone", "tablet"],
+    "platforms": [
+      "desktop",
+      "phone",
+      "tablet"
+    ],
     "visibility": "public",
     "slug": "breachpoint",
     "id": "dfcbff67-a970-4e0e-b355-557d9770b1a4",
-    "versionId": "48a9c58a-4ba0-4a3a-9b91-24505485ccf4"
+    "versionId": "4f042d38-4bf0-4a03-86ee-55734513e045"
   }
 }
