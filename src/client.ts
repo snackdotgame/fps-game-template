@@ -2050,7 +2050,7 @@ hud.innerHTML = `
   <div id="feed"></div>
   <div id="overlay"><div class="panel" id="overlaypanel"></div></div>
   <div id="board"></div>
-  <div id="hint" class="sh">click to play — WASD move · shift sprint · Ctrl crouch · space jump · LMB fire · 1/2 weapons · R reload · G grenade · F sledge · Q build cover · Tab scores</div>
+  <div id="hint" class="sh">click to play — WASD move · shift sprint · C crouch · space jump · LMB fire · 1/2 weapons · R reload · G grenade · F sledge · Q build cover · Tab scores</div>
   <div id="netinfo" class="sh"></div>
   <div id="intro">
     <div class="ip">
@@ -2693,6 +2693,7 @@ const GAME_KEY_CODES = new Set([
   "ShiftRight",
   "ControlLeft",
   "ControlRight",
+  "KeyC",
   "Space",
   "KeyR",
   "KeyG",
@@ -2761,9 +2762,18 @@ window.addEventListener("blur", () => {
   scopeActive = false;
   document.getElementById("b-crouch")?.classList.remove("pressed"); // touch crouch toggle
 });
+// Ctrl+W is browser-reserved on Windows/Linux — preventDefault cannot stop it,
+// so a Ctrl-croucher strafing forward would close the tab, and Ctrl+R can slip
+// through whenever pointer lock drops. While in a live match, turn those into a
+// leave-site confirmation instead of an instant disconnect.
+window.addEventListener("beforeunload", (e) => {
+  if (connected && !introVisible) e.preventDefault();
+});
 
+// C is the safe crouch bind: Ctrl works too, but on Windows/Linux the browser
+// owns Ctrl+W (close tab) outright and we can only ask, not block (below).
 function isCrouchHeld(): boolean {
-  return keys.has("ControlLeft") || keys.has("ControlRight");
+  return keys.has("KeyC") || keys.has("ControlLeft") || keys.has("ControlRight");
 }
 
 function localCrouchActive(): boolean {
