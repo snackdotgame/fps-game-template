@@ -2,3 +2,6 @@ node_modules
 .snack/cache
 .snack/deploy
 dist
+scripts/entity-review/
+.snack/dev/
+.turbo/

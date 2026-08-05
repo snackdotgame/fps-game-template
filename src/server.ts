@@ -17,6 +17,8 @@ import {
   TICK_MS,
 } from "./shared/constants.js";
 import {
+  CLIMATE_NAMES,
+  climateForSeed,
   craterList,
   CURATED_MAP_SEEDS,
   DEFAULT_MAP_SEED,
@@ -26,7 +28,12 @@ import {
   PLAY_HALF,
   ZONES,
 } from "./shared/map.js";
-import { parseClientMsg, type PlayerInfo, type ServerMsg } from "./shared/messages.js";
+import {
+  DEV_CLIMATE_RANDOM,
+  parseClientMsg,
+  type PlayerInfo,
+  type ServerMsg,
+} from "./shared/messages.js";
 import {
   decodeInputs,
   encodeSnapshot,
@@ -144,6 +151,24 @@ let botNav: BotNav | null = null;
 function pickMapSeed(): number {
   if (SANDBOX) return DEFAULT_MAP_SEED;
   return CURATED_MAP_SEEDS[Math.floor(Math.random() * CURATED_MAP_SEEDS.length)];
+}
+
+// Dev tools only. A seed whose Whittaker roll lands on `climate`, preferring a
+// CURATED seed so the map keeps its baked spawn-cover repairs. All six
+// climates currently have one, so the fallback scan below only fires if the
+// rotation shrinks — an uncurated seed is playable and correct, but has no
+// spawn-sightline guarantee, which is why this stays a dev affordance and not
+// a room setting.
+// climateForSeed is two hashes and a table read, so the scan is microseconds.
+function seedForClimate(climate: number): { seed: number; curated: boolean } {
+  for (const seed of CURATED_MAP_SEEDS) {
+    if (climateForSeed(seed) === climate) return { seed, curated: true };
+  }
+  for (let i = 1; i <= 200000; i++) {
+    const seed = (Math.imul(i, 0x9e3779b9) >>> 0) ^ 0x5eed17;
+    if (climateForSeed(seed >>> 0) === climate) return { seed: seed >>> 0, curated: false };
+  }
+  return { seed: pickMapSeed(), curated: true };
 }
 
 const players = new Map<string, Player>(); // by connection id, or "bot:<n>"
@@ -840,6 +865,25 @@ function handleClientMsg(event: StreamEvent): void {
   if (msg.type === "spawnat") sim.setSpawnZone(p.slot, msg.zone);
   else if (msg.type === "deploy") sim.requestDeploy(p.slot);
   else if (msg.type === "class") sim.setClass(p.slot, msg.cls);
+  else if (msg.type === "devmap") {
+    // Dev biome picker. The MENU is gated by Vite (import.meta.env.DEV), so it
+    // exists only under `npm run dev` and is dropped from a shipped bundle —
+    // no published client can reach this. The Snack server runtime isn't built
+    // by Vite, so this handler has no equivalent compile-time signal and stays
+    // live; a hand-crafted client could therefore restart a hosted round. That
+    // is a deliberate trade for having no dev flag to forget. Gate it on a
+    // server config field if this game ever runs somewhere that matters.
+    if (msg.climate === DEV_CLIMATE_RANDOM) {
+      void resetRound();
+      return;
+    }
+    if (msg.climate < 0 || msg.climate >= CLIMATE_NAMES.length) return;
+    const { seed, curated } = seedForClimate(msg.climate);
+    console.log(
+      `[dev] map -> ${CLIMATE_NAMES[msg.climate]} seed=${seed}${curated ? "" : " (uncurated: no spawn-cover repairs)"}`,
+    );
+    void resetRound(seed);
+  }
 }
 
 function drainInputs(): void {
@@ -919,9 +963,11 @@ async function stepPhase(): Promise<void> {
   }
 }
 
-async function resetRound(): Promise<void> {
+// `forcedSeed` is the dev biome picker's entry point; normal round flow leaves
+// it undefined and rolls a fresh curated seed.
+async function resetRound(forcedSeed?: number): Promise<void> {
   mapEpoch++;
-  mapSeed = pickMapSeed();
+  mapSeed = forcedSeed ?? pickMapSeed();
   initMap(mapSeed); // a brand-new level; sim.reset() rebuilds physics from it
   await sim.reset();
   botNav = null;

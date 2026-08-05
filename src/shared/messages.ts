@@ -30,7 +30,12 @@ export type ServerMsg =
     }
   | { type: "join"; player: PlayerInfo }
   | { type: "leave"; idx: number }
-  | { type: "kill"; killer: number; victim: number; weapon: "rifle" | "grenade" | "melee" | "oob" }
+  | {
+      type: "kill";
+      killer: number;
+      victim: number;
+      weapon: "rifle" | "grenade" | "melee" | "oob" | "crush";
+    }
   | { type: "destroy"; panelIds: number[] }
   | { type: "panelhp"; updates: Array<[number, number]> } // [panelId, hp]
   | { type: "collapse"; buildingId: number }
@@ -73,21 +78,34 @@ export function parseServerMsg(data: unknown): ServerMsg | null {
 export const SPAWN_AUTO = -1; // server picks (base or a random safe flag)
 export const SPAWN_HQ = -2; // always the team base
 
+// Sentinel for devmap.climate: end the round onto a randomly picked map,
+// letting the seed's own Whittaker roll decide the climate.
+export const DEV_CLIMATE_RANDOM = -1;
+
 export type ClientMsg =
   | { type: "spawnat"; zone: number }
   // Deploy request while dead: humans respawn only when they ask (once the
   // respawn timer allows), never automatically.
   | { type: "deploy" }
   // Class pick (CLASSES index); takes effect at the next spawn.
-  | { type: "class"; cls: number };
+  | { type: "class"; cls: number }
+  // Dev-only: restart the round on a map of this climate. The sender is the
+  // dev biome picker, which Vite strips from production client bundles.
+  // The server ignores it entirely unless dev tools are compiled in, so this
+  // arriving from a hostile client in production is a no-op.
+  | { type: "devmap"; climate: number };
 
 export function parseClientMsg(data: unknown): ClientMsg | null {
   if (typeof data !== "object" || data === null || Array.isArray(data)) return null;
-  const m = data as { type?: unknown; zone?: unknown; cls?: unknown };
+  const m = data as { type?: unknown; zone?: unknown; cls?: unknown; climate?: unknown };
   if (m.type === "deploy") return { type: "deploy" };
   if (m.type === "class") {
     if (typeof m.cls !== "number" || !Number.isFinite(m.cls)) return null;
     return { type: "class", cls: Math.round(m.cls) };
+  }
+  if (m.type === "devmap") {
+    if (typeof m.climate !== "number" || !Number.isFinite(m.climate)) return null;
+    return { type: "devmap", climate: Math.round(m.climate) };
   }
   if (m.type !== "spawnat" || typeof m.zone !== "number" || !Number.isFinite(m.zone)) return null;
   return { type: "spawnat", zone: Math.round(m.zone) };

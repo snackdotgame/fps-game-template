@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "snack": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["snack", "mcp"]
+    }
+  }
+}
