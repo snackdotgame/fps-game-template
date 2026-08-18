@@ -39,7 +39,7 @@
     "@gltf-transform/core": "^4.4.1",
     "@gltf-transform/extensions": "^4.4.1",
     "@gltf-transform/functions": "^4.4.1",
-    "@snack-game/cli": "0.1.21",
+    "@snack-game/cli": "0.1.23",
     "@types/three": "^0.184.1",
     "@typescript/native-preview": "7.0.0-dev.20260513.1",
     "esbuild": "0.27.3",
