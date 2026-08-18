@@ -18,7 +18,8 @@
 - `game.id`: hosted game identity; first push may create it.
 - `game.versionId`: default version selected by publish.
 - `game.versionName`: name applied to the next push.
-- `game.titleImage`: required image under `assets/` for push and directory presentation.
+- `game.titleImage`: creator-provided image under `assets/`, required for push and directory
+  presentation. The scaffold intentionally provides no stock title art.
 - `game.genre`: required before previewing or launching a hosted server.
 - `game.maxPlayers`: supported room-capacity range.
 - `game.serverConfigSchema`: optional per-session settings consumed through `server.config`.

@@ -60,9 +60,9 @@ For multiplayer games:
   determinism, and rewind needs, then use `snack-build-multiplayer` to select it
 - use the selected Snack multiplayer leaf skill for transport, prediction, snapshots, or rollback
 
-Hosted creator state is session-local and ephemeral. Do not design durable inventories, accounts,
-meta-progression, or cross-session saves unless a real project-owned service exists outside the
-current Snack creator runtime. Outbound `fetch` and a Snack persistence API are not available today.
+Keep active match state in memory. Use `snack-use-database-persistence` when inventories, progress,
+worlds, or other saved-game state must survive server restarts. A saved-game database is not a
+global account database across separate saves, and outbound `fetch` is not available by default.
 End a completed hosted match with `server.end()` only after final results have had a bounded delivery
 window.
 

@@ -232,8 +232,9 @@ All server and per-connection channels support:
 
 The server also exposes `config`, `running`, `sleep(ms)`, `elapsedMs()`, and `end()`. Call
 `server.end()` after the game has reached its final state and clients have had a bounded opportunity
-to receive the result. Hosted state is ephemeral; there is no creator persistence API or outbound
-`fetch` capability today.
+to receive the result. Keep active match state in memory. `server.localDb` is always available for
+session-local data. When database data must survive a server restart, set `server.persistence` and
+use the `snack-use-database-persistence` workflow. Outbound `fetch` is not available by default.
 
 Server `send()` and `broadcast()` are fire-and-forget after validation/enqueue. They do not confirm
 peer delivery or application processing.

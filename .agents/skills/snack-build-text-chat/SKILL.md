@@ -41,7 +41,9 @@ channels, recipient selection, or lifecycle policy. Start from
    write, not proof that the server accepted or delivered the message.
 4. Receive through one owner of `server.chat`. Relay the received `ServerChatMessage` object to
    preserve Snack's trusted player attribution. Passing only its payload would create a
-   server-authored message.
+   server-authored message. Persisted replay is always a new server-authored history message; store
+   the trusted sender data needed for its label and do not present replay as a live host-attributed
+   player message.
 5. Derive recipients from authoritative game state and current server connections. Use `only` or
    `except` on `server.chat.send()`; never let browser payloads supply final recipient ids.
 6. Receive host-delivered messages through one owner of `client.chat`. Use Snack's `sender`,
@@ -64,9 +66,10 @@ channels, recipient selection, or lifecycle policy. Start from
   preserves host-owned player attribution.
 - Use `client.chat.maxTextLength`, `client.chat.maxStructuredPayloadBytes`, and their server
   equivalents rather than hard-coding platform limits. A game may enforce smaller semantic limits.
-- Do not invent platform moderation, block, report, audit, history, or persistence APIs. Game-owned
-  channels and local presentation mutes are allowed, but label them accurately and do not infer
-  recipients removed by opaque platform policy.
+- Do not invent platform moderation, block, report, audit, or platform-managed history APIs.
+  Game-owned channels, local presentation mutes, and persistent history built with `server.localDb`
+  are allowed; use `snack-use-database-persistence` for that database workflow and label the
+  behavior accurately.
 - Do not retry a send blindly. The server may have accepted the original even though the client
   lacks an application acknowledgement. Add a separate idempotent acknowledgement protocol only
   when the product genuinely requires delivery confirmation.

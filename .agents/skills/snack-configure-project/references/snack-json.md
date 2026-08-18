@@ -5,15 +5,16 @@ reference explains how the fields participate in Snack workflows.
 
 ## Top-Level Contract
 
-| Field              | Meaning                                                                                   |
-| ------------------ | ----------------------------------------------------------------------------------------- |
-| `$schema`          | Editor validation against the project-local CLI package.                                  |
-| `version`          | Snack config schema version. Generated projects use `1`; it is not a pushed game version. |
-| `game`             | Hosted game identity, public metadata, capacity, and room configuration.                  |
-| `server.entry`     | Restricted-runtime entrypoint. It must exist and export `main()`.                         |
-| `client.entry`     | Browser entrypoint. Keep it aligned with the Vite config.                                 |
-| `assets.directory` | Root static asset directory. The generated scaffold requires `assets`.                    |
-| `dev`              | Optional local Snack host-shell and Vite client ports.                                    |
+| Field                | Meaning                                                                                                                      |
+| -------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `$schema`            | Editor validation against the project-local CLI package.                                                                     |
+| `version`            | Snack config schema version. Generated projects use `1`; it is not a pushed game version.                                    |
+| `game`               | Hosted game identity, public metadata, capacity, and room configuration.                                                     |
+| `server.entry`       | Restricted-runtime entrypoint. It must exist and export `main()`.                                                            |
+| `server.persistence` | Makes `server.localDb` durable across sessions and enables saved-game UI. Missing or false keeps the database session-local. |
+| `client.entry`       | Browser entrypoint. Keep it aligned with the Vite config.                                                                    |
+| `assets.directory`   | Root static asset directory. The generated scaffold requires `assets`.                                                       |
+| `dev`                | Optional local Snack host-shell and Vite client ports.                                                                       |
 
 The JSON Schema rejects unknown properties in editors and schema-aware tools. The CLI currently
 parses the manifest as JSON and validates the fields used by each command; do not assume every
@@ -65,8 +66,9 @@ defensively in gameplay code.
 
 ## Assets And Discovery Metadata
 
-- `game.titleImage` is required for push. Point it to an image under `assets/` using a safe relative
-  path such as `title.svg` or `assets/title.svg`.
+- The scaffold intentionally provides no stock title art. Create original art for this game under
+  `assets/`, then set `game.titleImage` to its safe relative path before push, such as `title.png`
+  or `assets/title.svg`.
 - `game.genre` is required before launching a hosted preview/server. Read the schema for the current
   enum.
 - `game.platforms` contains `desktop`, `phone`, and/or `tablet`. Claim phone or tablet only after
@@ -85,6 +87,14 @@ support must match the game.
   Vite setup loads that file.
 - Keep `assets.directory` as `assets`; local dev and build/push copy and serve this root directory.
 - Keep publishable assets as regular files rather than symlinks.
+
+## Persistence
+
+Set `server.persistence` to `true` only when server database data must survive the current game
+server and appear in saved-game UI. `server.localDb` is always available; without the field, its
+database is discarded when the server exits and is never replicated to S3. New projects can request
+the complete Drizzle setup with `snack new --persistence` or `snack init --persistence`. Use the
+bundled `snack-use-database-persistence` skill for schema, query, and migration work.
 
 ## Dev Ports
 

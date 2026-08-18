@@ -43,7 +43,8 @@ Check:
 - `@snack-game/cli` is a project dev dependency
 - client/server entrypoints and `assets/` still match the scaffold
 - `game.maxPlayers` matches intended room capacity
-- `game.titleImage` points to an image under `assets/`
+- original title art created for this game exists under `assets/` and `game.titleImage` points to
+  it; do not use generic placeholder art
 - `game.genre` is set before previewing
 - `game.platforms` claims only tested device classes
 - publishable assets are regular files rather than symlinks

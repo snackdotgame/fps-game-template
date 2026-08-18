@@ -48,8 +48,9 @@ for local development, checks, builds, and upload-oriented publishing workflows.
 - Route human-visible player chat through `client.chat` and `server.chat`, not gameplay datagrams or
   streams. Clients send only to the authoritative server; only server code selects recipients with
   `server.chat.send(..., { only, except })`.
-- Set `server.persistence` to `true` in `snack.json` before using `server.localDb`. Access throws
-  when the project has not opted in.
+- `server.localDb` is always available. Set `server.persistence` to `true` in `snack.json` when its
+  data must survive the game server and appear as a saved game; otherwise the database is
+  session-local and discarded when the server exits.
 - Do not use callback-style receive handlers or raw WebTransport/postMessage plumbing.
 - Keep authoritative multiplayer state in server code. Treat browser state as display/input state.
 - Validate network messages before trusting them.
@@ -73,6 +74,8 @@ for local development, checks, builds, and upload-oriented publishing workflows.
 Load only the skill needed for the current task:
 
 - `snack-configure-project` for `snack.json`, scripts, entrypoints, and server config.
+- `snack-use-database-persistence` for saved-game data, `server.localDb`, Drizzle schemas, and
+  generated migrations.
 - `snack-design-gameplay` for mechanics, rules, progression, encounters, and the playable loop.
 - `snack-design-game-ux` for HUDs, menus, responsive layout, controls, and accessibility.
 - `snack-build-text-chat` for human-visible global, team, proximity, lobby, spectator, or system
@@ -105,8 +108,9 @@ Load only the skill needed for the current task:
   `snack-game-publish` skill before running commands.
 - Use `snack auth whoami` to check authentication and `snack auth login` when credentials are
   missing.
-- Configure public game metadata in `snack.json`, including `game.maxPlayers`, required
-  `game.titleImage`, `game.versionId` written by `snack push`, optional `game.versionName` for the
-  next pushed version, `game.genre` before previewing or launching hosted servers, optional
-  `game.platforms` for supported device classes, and optional `game.serverConfigSchema` for server
-  config fields.
+- Configure public game metadata in `snack.json`, including `game.maxPlayers`, `game.versionId`
+  written by `snack push`, optional `game.versionName` for the next pushed version, `game.genre`
+  before previewing or launching hosted servers, optional `game.platforms` for supported device
+  classes, and optional `game.serverConfigSchema` for server config fields. Before push, create
+  original title art under `assets/` and set required `game.titleImage`; the scaffold intentionally
+  provides no stock title image.

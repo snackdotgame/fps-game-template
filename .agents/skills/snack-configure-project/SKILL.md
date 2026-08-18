@@ -36,6 +36,9 @@ Place code according to its execution environment:
 Read [references/server-runtime.md](references/server-runtime.md) before adding a server dependency,
 moving code across an environment boundary, or fixing a server bundle/runtime error.
 
+Load `snack-use-database-persistence` for saved-game data, `server.localDb`, Drizzle schemas, or
+migrations. That skill owns the persistence workflow; this skill owns only the manifest boundary.
+
 ## Change `snack.json` Safely
 
 1. Preserve fields unrelated to the request.

@@ -1,6 +1,6 @@
 ---
 name: snack-3d-physics
-description: Add 3D physics to a generated Snack.Game project with jolt-ts, the TypeScript wrapper for Jolt Physics WASM. Use when a game needs rigid bodies, collision, character movement, vehicles, ragdolls, or any 3D physical simulation — and always before hand-rolling integration, collision math, or a custom physics loop. Covers deterministic setup for multiplayer rollback, fixed-timestep stepping, and state save/restore.
+description: Add or change 3D physics in a generated Snack.Game project with jolt-ts. Use for rigid bodies, collision shapes or queries, fixed-step worlds, physical character, vehicle, or ragdoll movement, deterministic rollback, and Jolt state save/restore. Use jolt-ts-character-controller for Ecctrl-style walking, running, jumping, moving platforms, and controller prediction. Do not use for 2D-only physics or rendering-only transforms.
 ---
 
 # Build 3D Physics With jolt-ts
@@ -14,6 +14,8 @@ compiled cross-platform deterministic — the property multiplayer rollback is b
 Read:
 
 - the `jolt-ts` README and its determinism guide for the current API surface
+- [references/character-controller.md](references/character-controller.md) when the game has a
+  walking, running, or jumping player character
 - [references/deterministic-simulation.md](references/deterministic-simulation.md) when the
   simulation is networked or needs save/restore
 - [`snack-build-multiplayer`](../snack-build-multiplayer/SKILL.md) to select the netcode approach
@@ -21,8 +23,9 @@ Read:
 
 ## Set Up The World
 
-- Add `jolt-ts` as a project dependency, and `jolt-ts-character-controller` when players walk,
-  run, or jump — use its `CharacterController` instead of hand-rolling capsule movement.
+- Add `jolt-ts` as a project dependency. When players walk, run, or jump, also add the pre-built
+  [`snackdotgame/jolt-ts-character-controller`](https://github.com/snackdotgame/jolt-ts-character-controller)
+  package and use its `CharacterController` instead of hand-rolling capsule movement.
 - Put world creation in one shared module (for example `src/shared/physics.ts`) imported by both
   `src/client.ts` and `src/server.ts`. Statically import and memoize the embedded initializer, then
   pass its resolved module as `raw`; omitting `raw` falls back to `jolt-ts`'s dynamic loader, which
